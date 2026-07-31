@@ -3,6 +3,9 @@ pub mod query;
 pub mod record;
 pub mod store;
 
+#[cfg(test)]
+mod tests;
+
 pub use arena::{Arena, ArenaBuilder, ArchivedArena};
 pub use query::Query;
 pub use record::{EntryFlags, FileRecord};

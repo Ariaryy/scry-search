@@ -29,6 +29,14 @@ impl Arena {
 }
 
 impl ArchivedArena {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     /// Reconstruct a full path by walking `parent` links. Only done lazily,
     /// on the results that actually get returned to a client — never during
     /// indexing or search.
