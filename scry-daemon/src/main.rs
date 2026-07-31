@@ -42,12 +42,13 @@ fn main() -> anyhow::Result<()> {
     {
         let store = store.clone();
         let volume = volume.clone();
-        let (tx, rx) = crossbeam::channel::unbounded();
+        let (tx, rx) = crossbeam::channel::bounded(16_384);
+        let watcher = scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx);
         // Leaked intentionally: the watcher runs for the daemon's whole
         // lifetime, same as the pipe server loop below never returning.
-        std::mem::forget(scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx));
+        let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
         std::thread::spawn(move || {
-            reindex_on_changes(volume, rx, store, auxiliary_marking_enabled)
+            reindex_on_changes(volume, rx, store, auxiliary_marking_enabled, watcher)
         });
     }
 
@@ -88,54 +89,78 @@ fn snapshot_path(volume: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("scry-index-{safe}.rkyv"))
 }
 
+/// Holds the state `is_real_change` needs to recognize the daemon's own
+/// snapshot writes: the name-based fallback set, and whether
+/// `FSCTL_MARK_HANDLE` auxiliary marking is active (in which case
+/// `is_auxiliary` is trusted over the heuristic).
+struct SelfWriteFilter {
+    snapshot_name: String,
+    snapshot_tmp_name: String,
+    self_frns: std::collections::HashSet<u64>,
+    use_auxiliary: bool,
+}
+
+impl SelfWriteFilter {
+    fn new(volume: &str, use_auxiliary: bool) -> Self {
+        let path = snapshot_path(volume);
+        let tmp_path = path.with_extension("tmp");
+        SelfWriteFilter {
+            snapshot_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            snapshot_tmp_name: tmp_path.file_name().unwrap().to_string_lossy().into_owned(),
+            self_frns: std::collections::HashSet::new(),
+            use_auxiliary,
+        }
+    }
+
+    fn is_own_name(&self, name: &str) -> bool {
+        name == self.snapshot_name || name == self.snapshot_tmp_name
+    }
+}
+
+// The snapshot file itself lives on the volume being watched, so writing it
+// produces USN events that would otherwise feed straight back into
+// `reindex_on_changes` — an infinite reindex loop that never settles. When
+// auxiliary marking is enabled, `is_auxiliary` alone identifies these
+// exactly. The name/FRN heuristic stays as a fallback for when
+// SeManageVolumePrivilege couldn't be enabled.
+fn is_real_change(ev: &scry_fsevents::ChangeEvent, state: &mut SelfWriteFilter) -> bool {
+    use scry_fsevents::ChangeEvent;
+
+    if ev.is_auxiliary() && state.use_auxiliary {
+        if let ChangeEvent::Deleted { frn, .. } = ev {
+            state.self_frns.remove(frn);
+        }
+        return false;
+    }
+    match ev {
+        ChangeEvent::Created { frn, name, .. } | ChangeEvent::Renamed { frn, name, .. } => {
+            if state.is_own_name(name) {
+                state.self_frns.insert(*frn);
+                false
+            } else {
+                true
+            }
+        }
+        // A data/metadata write cannot change the arena's shape: the index
+        // stores names, parent links and mtime only, and mtime isn't
+        // queryable. Reindexing on Modified is what made the daemon rebuild
+        // continuously on an active volume.
+        ChangeEvent::Modified { .. } => false,
+        ChangeEvent::Deleted { frn, .. } => {
+            let was_self = state.self_frns.remove(frn);
+            !was_self
+        }
+    }
+}
+
 fn reindex_on_changes(
     volume: String,
     rx: crossbeam::channel::Receiver<scry_fsevents::ChangeEvent>,
     store: SharedStore,
     auxiliary_marking_enabled: bool,
+    watcher: &scry_fsevents::JournalHandle,
 ) {
-    use scry_fsevents::ChangeEvent;
-
-    // The snapshot file itself lives on the volume being watched, so writing
-    // it produces USN events that would otherwise feed straight back into
-    // this function — an infinite reindex loop that never settles. When
-    // auxiliary marking is enabled, is_auxiliary alone identifies these
-    // exactly. The name/FRN heuristic below stays as a fallback for when
-    // SeManageVolumePrivilege couldn't be enabled.
-    let path = snapshot_path(&volume);
-    let tmp_path = path.with_extension("tmp");
-    let snapshot_name = path.file_name().unwrap().to_string_lossy().into_owned();
-    let snapshot_tmp_name = tmp_path.file_name().unwrap().to_string_lossy().into_owned();
-    let is_own_name = |name: &str| name == snapshot_name || name == snapshot_tmp_name;
-    let mut self_frns: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-    let is_real_change = |ev: &ChangeEvent, self_frns: &mut std::collections::HashSet<u64>| {
-        if ev.is_auxiliary() && auxiliary_marking_enabled {
-            if let ChangeEvent::Deleted { frn, .. } = ev {
-                self_frns.remove(frn);
-            }
-            return false;
-        }
-        match ev {
-            ChangeEvent::Created { frn, name, .. } | ChangeEvent::Renamed { frn, name, .. } => {
-                if is_own_name(name) {
-                    self_frns.insert(*frn);
-                    false
-                } else {
-                    true
-                }
-            }
-            // A data/metadata write cannot change the arena's shape: the index
-            // stores names, parent links and mtime only, and mtime isn't
-            // queryable. Reindexing on Modified is what made the daemon rebuild
-            // continuously on an active volume.
-            ChangeEvent::Modified { .. } => false,
-            ChangeEvent::Deleted { frn, .. } => {
-                let was_self = self_frns.remove(frn);
-                !was_self
-            }
-        }
-    };
+    let mut filter = SelfWriteFilter::new(&volume, auxiliary_marking_enabled);
 
     loop {
         // Block until something changes...
@@ -143,14 +168,19 @@ fn reindex_on_changes(
             eprintln!("scryd: journal watcher channel closed, live updates stopped");
             return;
         };
-        let mut triggered = is_real_change(&first, &mut self_frns);
+        let mut triggered = is_real_change(&first, &mut filter);
 
         // ...then absorb a short burst of further changes before paying for
         // a full reindex, so e.g. extracting a zip doesn't trigger thousands
         // of back-to-back rebuilds.
         while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            triggered |= is_real_change(&ev, &mut self_frns);
+            triggered |= is_real_change(&ev, &mut filter);
         }
+
+        // The channel filled up while we were mid-reindex; a structural
+        // event may have been dropped, so force a resync regardless of what
+        // the drained events looked like.
+        triggered |= watcher.take_overflow();
 
         if !triggered {
             continue;

@@ -454,6 +454,7 @@ fn watch(
     tx: &crossbeam::channel::Sender<ChangeEvent>,
     should_stop: &AtomicBool,
     watch_handle: &AtomicUsize,
+    overflowed: &AtomicBool,
 ) -> Result<(), WindowsBackendError> {
     let handle = open_volume(volume, ffi::FILE_FLAG_OVERLAPPED)?;
     watch_handle.store(handle as usize, Ordering::Release);
@@ -501,8 +502,18 @@ fn watch(
 
             for (header, name) in parse_usn_records(&out_buf, bytes_returned as usize) {
                 let event = classify(&header, name);
-                if tx.send(event).is_err() {
-                    return Ok(()); // receiver gone, nothing left to do
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                        return Ok(()); // receiver gone, nothing left to do
+                    }
+                    Err(crossbeam::channel::TrySendError::Full(_)) => {
+                        // The daemon is mid-reindex and can't keep up. Dropping
+                        // individual events would silently desync the index, so
+                        // instead record that a full resync is required; the
+                        // consumer treats the flag as "reindex regardless".
+                        overflowed.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -557,10 +568,18 @@ pub struct JournalHandle {
     // `ffi::Handle` (`*mut c_void`) so this struct stays `Send` without an
     // unsafe impl — see the same pattern in scry-ipc's `SecurityDescriptor`.
     watch_handle: Arc<AtomicUsize>,
+    overflowed: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<Result<(), WindowsBackendError>>>,
 }
 
 impl JournalHandle {
+    /// Returns whether the event channel filled up since the last call, and
+    /// resets the flag. Callers must treat a `true` result as "a structural
+    /// change may have been dropped" and force a full reindex.
+    pub fn take_overflow(&self) -> bool {
+        self.overflowed.swap(false, Ordering::Relaxed)
+    }
+
     pub fn stop(mut self) -> Result<(), WindowsBackendError> {
         self.stop.store(true, Ordering::Relaxed);
         let handle_val = self.watch_handle.load(Ordering::Acquire);
@@ -591,12 +610,16 @@ impl WindowsBackend {
         let stop_thread = stop.clone();
         let watch_handle = Arc::new(AtomicUsize::new(0));
         let watch_handle_thread = watch_handle.clone();
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let overflowed_thread = overflowed.clone();
         let volume = volume.to_string();
-        let join =
-            std::thread::spawn(move || watch(&volume, &tx, &stop_thread, &watch_handle_thread));
+        let join = std::thread::spawn(move || {
+            watch(&volume, &tx, &stop_thread, &watch_handle_thread, &overflowed_thread)
+        });
         JournalHandle {
             stop,
             watch_handle,
+            overflowed,
             join: Some(join),
         }
     }
