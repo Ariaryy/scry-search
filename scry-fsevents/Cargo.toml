@@ -7,6 +7,3 @@ edition.workspace = true
 scry-core = { path = "../scry-core" }
 crossbeam = { workspace = true }
 thiserror = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }

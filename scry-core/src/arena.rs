@@ -94,6 +94,13 @@ impl ArenaBuilder {
         self.records.len()
     }
 
+    /// Fix up a parent link after the fact. Needed because enumeration sources
+    /// like NTFS's USN journal yield records in MFT order, not tree order —
+    /// a child can easily be seen before its parent.
+    pub fn set_parent(&mut self, idx: u32, parent: u32) {
+        self.records[idx as usize].parent = parent;
+    }
+
     /// Finalize: build the sorted name-order permutation and produce the Arena.
     /// This is the only O(n log n) step; everything else in ingest is O(1) amortized.
     pub fn build(mut self) -> Arena {
