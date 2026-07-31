@@ -5,4 +5,4 @@
 pub mod windows;
 
 #[cfg(windows)]
-pub use windows::WindowsBackend;
+pub use windows::{ChangeEvent, JournalHandle, WindowsBackend, WindowsBackendError};
