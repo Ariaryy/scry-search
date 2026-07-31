@@ -1,14 +1,15 @@
 use crate::arena::ArchivedArena;
+use crate::ascii;
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
 #[derive(Debug, Clone)]
 pub enum Query {
-    /// Anchored prefix — hits the sorted name_order index via binary search, O(log n + k).
+    /// Anchored prefix — binary search over name-sorted records, O(log n + k).
     Prefix(String),
-    /// Unanchored substring — no index for this yet, linear scan over records.
-    /// Fine up to a few million entries on modern hardware; an n-gram inverted
-    /// index is the documented next step if this becomes the bottleneck.
+    /// Unanchored substring — linear scan; needle lowercased once before the loop.
+    /// An n-gram inverted index is the documented next step if this becomes the
+    /// bottleneck (plan 006).
     Substring(String),
     /// Wildcard (`*`/`?`) or regex, compiled to a DFA once and reused across the scan.
     Regex(String),
@@ -41,25 +42,22 @@ pub fn search(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
     match query {
         Query::Prefix(prefix) => {
             let range = arena.prefix_range(prefix);
-            range
-                .take(limit)
-                .map(|pos| arena.name_at_sorted(pos))
-                .collect()
+            range.take(limit).collect()
         }
         Query::Substring(needle) => {
-            let needle_lower = needle.to_ascii_lowercase();
-            arena
-                .records
-                .iter()
-                .enumerate()
-                .filter(|(_, rec)| {
-                    rec.name
-                        .to_ascii_lowercase()
-                        .contains(needle_lower.as_str())
-                })
-                .take(limit)
-                .map(|(i, _)| i as u32)
-                .collect()
+            // Lowercase once before the scan — not once per record.
+            let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            let mut results = Vec::new();
+            arena.for_each_name(|idx, name| {
+                if ascii::contains_ci(name, &needle_lower) {
+                    results.push(idx);
+                    if results.len() >= limit {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            results
         }
         Query::Regex(pattern) => {
             let re = match Regex::builder()
@@ -69,14 +67,17 @@ pub fn search(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
                 Ok(re) => re,
                 Err(_) => return Vec::new(),
             };
-            arena
-                .records
-                .iter()
-                .enumerate()
-                .filter(|(_, rec)| re.is_match(rec.name.as_str()))
-                .take(limit)
-                .map(|(i, _)| i as u32)
-                .collect()
+            let mut results = Vec::new();
+            arena.for_each_name(|idx, name| {
+                if re.is_match(name) {
+                    results.push(idx);
+                    if results.len() >= limit {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            results
         }
     }
 }

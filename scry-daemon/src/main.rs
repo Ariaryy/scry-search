@@ -333,7 +333,7 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
                 let rec = &archived.records[idx as usize];
                 ResultEntry {
                     path: archived.full_path(idx, '\\'),
-                    size: rec.size,
+                    size: 0, // format v2 drops the per-record size field; see docs/index-format.md
                     is_dir: rec.is_dir(),
                 }
             })
@@ -347,7 +347,6 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
 mod tests {
     use super::*;
     use scry_core::{
-        record::{EntryFlags, FileRecord},
         store::save,
         Arena,
     };
@@ -355,21 +354,10 @@ mod tests {
 
     fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<ArenaStore> {
         let mut b = Arena::builder();
-        let root = b.push(FileRecord {
-            parent: u32::MAX,
-            name: "C:".into(),
-            size: 0,
-            mtime: 0,
-            flags: EntryFlags::Directory,
-        });
+        let root = b.push("C:".into(), 0, true);
         for i in 0..n.saturating_sub(1) {
-            b.push(FileRecord {
-                parent: root,
-                name: format!("file{i}.txt"),
-                size: 0,
-                mtime: 0,
-                flags: EntryFlags::File,
-            });
+            let child = b.push(format!("file{i}.txt"), 0, false);
+            b.set_parent(child, root);
         }
         let arena = b.build();
         let path = dir.path().join(format!("index-{n}.rkyv"));

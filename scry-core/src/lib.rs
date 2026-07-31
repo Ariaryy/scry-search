@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod ascii;
 pub mod protocol;
 pub mod query;
 pub mod record;
@@ -10,5 +11,5 @@ mod tests;
 pub use arena::{ArchivedArena, Arena, ArenaBuilder};
 pub use protocol::{QueryKind, Request, ResultEntry};
 pub use query::Query;
-pub use record::{EntryFlags, FileRecord};
+pub use record::{filetime_to_secs, FileRecord, FORMAT_VERSION, BUCKET_SIZE, DIR_BIT, PARENT_NONE};
 pub use store::{ArenaStore, StoreError};

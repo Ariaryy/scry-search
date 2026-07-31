@@ -1,40 +1,113 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-/// One indexed filesystem entry. Kept small and flat — this is the unit
-/// that gets multiplied by millions, so every extra byte here is millions
-/// of bytes of daemon-visible working set.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+/// Format version stamped into every snapshot. `ArenaStore::open` rejects
+/// snapshots with a different version rather than parsing them leniently —
+/// a version bump is a breaking format change, not a migration.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Front-coding bucket size: every 32 records share a common-prefix table.
+/// Larger buckets compress better but increase random-access cost (up to
+/// BUCKET_SIZE sequential decode steps). 32 is empirically good for
+/// filename corpora.
+pub const BUCKET_SIZE: usize = 32;
+
+/// Bit 31 of `FileRecord::parent_and_flags` — set for directories.
+pub const DIR_BIT: u32 = 0x8000_0000;
+
+/// Sentinel parent index meaning "no parent" (volume root).
+/// Must not equal DIR_BIT; capped at 2^31 - 2 so it fits in 31 bits.
+pub const PARENT_NONE: u32 = 0x7FFF_FFFF;
+
+/// One indexed filesystem entry. Two fields, 8 bytes total — this is the
+/// unit multiplied by millions, so every byte here is megabytes of RSS.
+///
+/// Names are NOT stored here; they live in the front-coded `Arena.names`
+/// blob, indexed via `Arena.bucket_offsets`. This keeps the hot record
+/// array cache-friendly during scans.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[archive(check_bytes)]
 pub struct FileRecord {
-    /// Index into the arena's record vec, u32::MAX for "no parent" (volume root).
-    pub parent: u32,
-    /// Just the leaf name — full paths are reconstructed by walking `parent`.
-    pub name: String,
-    pub size: u64,
-    /// Windows FILETIME (100ns ticks since 1601-01-01), matches what NTFS gives us
-    /// natively so no conversion happens on the hot ingest path.
-    pub mtime: i64,
-    pub flags: EntryFlags,
-}
-
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[repr(u8)]
-pub enum EntryFlags {
-    File = 0,
-    Directory = 1,
+    /// Bit 31 = is_dir flag; bits 0..30 = parent record index.
+    /// Use the accessors rather than reading this field directly.
+    pub parent_and_flags: u32,
+    /// Seconds since 1601-01-01 UTC (FILETIME / 10_000_000), saturating.
+    /// Range: 0 (1601) to 2^32-1 (year ~2106+). USN records give 100ns
+    /// FILETIMEs; the narrower field saves 4 bytes per record vs i64.
+    pub mtime_secs: u32,
 }
 
 impl FileRecord {
     #[inline]
+    pub fn new(parent: u32, is_dir: bool, mtime_secs: u32) -> Self {
+        debug_assert!(parent <= PARENT_NONE, "parent index exceeds PARENT_NONE");
+        let flags = if is_dir { DIR_BIT } else { 0 };
+        FileRecord {
+            parent_and_flags: flags | parent,
+            mtime_secs,
+        }
+    }
+
+    #[inline]
+    pub fn parent(&self) -> u32 {
+        self.parent_and_flags & !DIR_BIT
+    }
+
+    #[inline]
     pub fn is_dir(&self) -> bool {
-        self.flags == EntryFlags::Directory
+        self.parent_and_flags & DIR_BIT != 0
     }
 }
 
 impl ArchivedFileRecord {
     #[inline]
+    pub fn parent(&self) -> u32 {
+        self.parent_and_flags & !DIR_BIT
+    }
+
+    #[inline]
     pub fn is_dir(&self) -> bool {
-        matches!(self.flags, ArchivedEntryFlags::Directory)
+        self.parent_and_flags & DIR_BIT != 0
+    }
+}
+
+/// Convert a Windows FILETIME (100ns ticks since 1601-01-01) to whole
+/// seconds, saturating rather than wrapping. USN records give FILETIMEs
+/// natively; 100ns precision is far more than a filename index needs.
+pub fn filetime_to_secs(ft: i64) -> u32 {
+    if ft <= 0 {
+        0
+    } else {
+        let secs = ft / 10_000_000;
+        secs.min(u32::MAX as i64) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_record_is_8_bytes() {
+        assert_eq!(std::mem::size_of::<FileRecord>(), 8);
+        assert_eq!(std::mem::size_of::<ArchivedFileRecord>(), 8);
+    }
+
+    #[test]
+    fn filetime_to_secs_boundary_cases() {
+        assert_eq!(filetime_to_secs(0), 0);
+        assert_eq!(filetime_to_secs(-1), 0);
+        assert_eq!(filetime_to_secs(10_000_000), 1);
+        assert_eq!(filetime_to_secs(i64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn parent_and_flags_round_trips() {
+        let r = FileRecord::new(42, true, 100);
+        assert!(r.is_dir());
+        assert_eq!(r.parent(), 42);
+
+        let r2 = FileRecord::new(PARENT_NONE, false, 0);
+        assert!(!r2.is_dir());
+        assert_eq!(r2.parent(), PARENT_NONE);
     }
 }

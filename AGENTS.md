@@ -8,9 +8,7 @@
 - `ArchivedArena` (the rkyv zero-copy view) and `Arena`/`FileRecord` (the builder-side owned types)
   are different generated types. Anything that needs to work on both (e.g. `is_dir()`) needs an impl
   on each — see `record.rs`.
-- Struct-of-arrays: `Arena.records` is a flat `Vec<FileRecord>`; `Arena.name_order` is a separately
-  sorted permutation of indices for binary-search prefix queries. Don't fold sorting into the record
-  struct itself.
+- `Arena` uses a format v2 index (8-byte records, name-sorted, front-coded names) rather than plain `String` fields, reducing snapshot size significantly.
 - The daemon's snapshot file (`%TEMP%\scry-index-<vol>.rkyv`) lives on the volume being watched.
   Any code that writes to disk from within the daemon must be accounted for in the USN-event filter
   in `reindex_on_changes` (`scry-daemon/src/main.rs`) or it'll retrigger its own reindex.
@@ -23,8 +21,7 @@
   layered on top of the base snapshot — worth doing once reindex latency on large volumes matters.
 - **Substring search is a linear scan.** Fine up to a few million entries; an n-gram index is the
   natural next step if that stops being true.
-- **No `size` field populated from MFT enumeration.** USN records don't carry file size; `FileRecord.size`
-  is currently always 0. Needs a lazy stat pass or `$STANDARD_INFORMATION`/`$DATA` attribute parsing.
+- **No `size` field.** USN records don't carry file size, and the format v2 compact index removed the size field entirely to keep records at 8 bytes. A lazy stat pass would be needed for sizes.
 - **Single volume per daemon instance**, chosen via argv. No multi-volume aggregation yet.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust
   consumers would need a `cdylib` shim over `scry-ipc`'s framing.

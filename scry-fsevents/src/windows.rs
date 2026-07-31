@@ -7,7 +7,8 @@
 //! overlapped I/O so the watcher thread blocks at 0% CPU when the volume is
 //! idle; `JournalHandle::stop` unblocks it deterministically via `CancelIoEx`.
 
-use scry_core::{ArenaBuilder, EntryFlags, FileRecord};
+use scry_core::ArenaBuilder;
+use scry_core::record::{filetime_to_secs, PARENT_NONE};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -99,17 +100,11 @@ impl WindowsBackend {
         let mut frn_to_idx: HashMap<u64, u32> = HashMap::with_capacity(entries.len());
 
         for e in &entries {
-            let idx = builder.push(FileRecord {
-                parent: u32::MAX, // resolved in the second pass below
-                name: e.name.clone(),
-                size: 0, // USN records don't carry size; left for a lazy stat pass
-                mtime: e.mtime,
-                flags: if e.is_dir {
-                    EntryFlags::Directory
-                } else {
-                    EntryFlags::File
-                },
-            });
+            let idx = builder.push(
+                e.name.clone(),
+                filetime_to_secs(e.mtime),
+                e.is_dir,
+            );
             frn_to_idx.insert(e.frn, idx);
         }
 
@@ -118,14 +113,8 @@ impl WindowsBackend {
         // otherwise contributes nothing to full_path() — every top-level
         // entry's parent chain would just stop, dropping the drive letter.
         // Give every "no real parent" entry an explicit volume-root node
-        // instead of `u32::MAX` so paths always start with e.g. `C:`.
-        let root_idx = builder.push(FileRecord {
-            parent: u32::MAX,
-            name: volume.to_string(),
-            size: 0,
-            mtime: 0,
-            flags: EntryFlags::Directory,
-        });
+        // so full_path() always includes the drive letter.
+        let root_idx = builder.push(volume.to_string(), 0, true);
 
         for (i, e) in entries.iter().enumerate() {
             let idx = i as u32;
