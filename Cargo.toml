@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "scry-core",
     "scry-fsevents",
+    "scry-ipc",
     "scry-daemon",
     "scry-client",
     "scry-cli",
@@ -21,13 +22,6 @@ memmap2 = "0.9"
 thiserror = "1"
 anyhow = "1"
 regex-automata = "0.4"
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Ioctl",
-    "Win32_Security",
-] }
 
 [profile.release]
 opt-level = 3

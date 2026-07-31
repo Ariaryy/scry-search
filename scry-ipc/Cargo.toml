@@ -1,0 +1,4 @@
+[package]
+name = "scry-ipc"
+version.workspace = true
+edition.workspace = true

@@ -5,7 +5,5 @@ edition.workspace = true
 
 [dependencies]
 scry-core = { path = "../scry-core" }
+scry-ipc = { path = "../scry-ipc" }
 anyhow = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }

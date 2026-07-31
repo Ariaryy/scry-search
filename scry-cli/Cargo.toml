@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 scry-client = { path = "../scry-client" }
+scry-core = { path = "../scry-core" }
 anyhow = { workspace = true }

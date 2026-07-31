@@ -31,3 +31,10 @@ impl FileRecord {
         self.flags == EntryFlags::Directory
     }
 }
+
+impl ArchivedFileRecord {
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        matches!(self.flags, ArchivedEntryFlags::Directory)
+    }
+}
