@@ -1,0 +1,13 @@
+[package]
+name = "scry-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rkyv = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+regex-automata = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

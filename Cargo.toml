@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "scry-core",
+    "scry-fsevents",
+    "scry-daemon",
+    "scry-client",
+    "scry-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["scry"]
+license = "MIT"
+
+[workspace.dependencies]
+rkyv = { version = "0.7", features = ["validation"] }
+crossbeam = "0.8"
+memmap2 = "0.9"
+thiserror = "1"
+anyhow = "1"
+regex-automata = "0.4"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+
+[profile.daemon-release]
+inherits = "release"
+opt-level = "s"
+panic = "abort"
+strip = true

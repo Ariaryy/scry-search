@@ -1,0 +1,12 @@
+[package]
+name = "scry-fsevents"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scry-core = { path = "../scry-core" }
+crossbeam = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

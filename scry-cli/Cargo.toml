@@ -1,0 +1,12 @@
+[package]
+name = "scry-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "scry"
+path = "src/main.rs"
+
+[dependencies]
+scry-client = { path = "../scry-client" }
+anyhow = { workspace = true }

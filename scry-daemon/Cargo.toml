@@ -1,0 +1,17 @@
+[package]
+name = "scry-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "scryd"
+path = "src/main.rs"
+
+[dependencies]
+scry-core = { path = "../scry-core" }
+scry-fsevents = { path = "../scry-fsevents" }
+crossbeam = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

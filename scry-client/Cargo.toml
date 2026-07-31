@@ -1,0 +1,11 @@
+[package]
+name = "scry-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scry-core = { path = "../scry-core" }
+anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
