@@ -9,6 +9,15 @@
 //! layered on top of the base snapshot — that's the natural next step once
 //! reindex latency on large volumes stops being acceptable.
 
+mod ffi;
+
+/// The Windows default heap does not return large freed spans to the OS
+/// promptly, which is why a reindex spike leaves RSS elevated long after the
+/// allocation is gone. mimalloc purges on a timer instead.
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
 use scry_core::{ArenaStore, Query};
 use std::sync::{Arc, RwLock};
@@ -16,6 +25,18 @@ use std::sync::{Arc, RwLock};
 type SharedStore = Arc<RwLock<Arc<ArenaStore>>>;
 
 fn main() -> anyhow::Result<()> {
+    // Return freed spans to the OS after 1s of idleness rather than mimalloc's
+    // 10s default; this daemon is idle far more often than it is busy.
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // SAFETY: single-threaded at this point; no other thread reads the env.
+        #[allow(deprecated)]
+        unsafe {
+            std::env::set_var("MIMALLOC_PURGE_DELAY", "1000");
+        }
+    }
+
+    configure_background_qos();
+
     let volume = std::env::args().nth(1).unwrap_or_else(|| "C:".to_string());
 
     // Enables exact self-write identification via FSCTL_MARK_HANDLE. Requires
@@ -48,6 +69,7 @@ fn main() -> anyhow::Result<()> {
         // lifetime, same as the pipe server loop below never returning.
         let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
         std::thread::spawn(move || {
+            configure_background_thread_qos();
             reindex_on_changes(volume, rx, store, auxiliary_marking_enabled, watcher)
         });
     }
@@ -65,6 +87,87 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             Err(e) => eprintln!("scryd: accept error: {e}"),
+        }
+    }
+}
+
+/// Configure this process as a well-behaved background service:
+///
+/// - **EcoQoS** (`ProcessPowerThrottling` / `EXECUTION_SPEED`): tells the
+///   Windows scheduler to prefer efficiency cores and lower clocks. A file
+///   indexer has no latency requirement that justifies boost clocks, and this
+///   is the single largest lever on the daemon's power draw.
+/// - **Low memory priority**: the index is a cache that can be re-faulted from
+///   the snapshot file, so under memory pressure these pages should be
+///   reclaimed before a foreground app's.
+///
+/// Both are best-effort. Failures are logged and ignored — an older Windows
+/// build simply doesn't support them, and that is not a reason to refuse to
+/// run.
+fn configure_background_qos() {
+    use std::mem::size_of;
+
+    // SAFETY: all pointers point to local structs with the correct layout;
+    // the Win32 functions are documented to read only within the supplied size.
+    unsafe {
+        // EcoQoS: prefer efficiency cores / lower frequencies.
+        let mut throttle = ffi::ProcessPowerThrottlingState {
+            version: ffi::PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: ffi::POWER_THROTTLING_EXECUTION_SPEED,
+            state_mask: ffi::POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let result = ffi::SetProcessInformation(
+            ffi::GetCurrentProcess(),
+            ffi::PROCESS_POWER_THROTTLING,
+            &mut throttle as *mut _ as *mut std::ffi::c_void,
+            size_of::<ffi::ProcessPowerThrottlingState>() as ffi::Dword,
+        );
+        if result == 0 {
+            let code = ffi::GetLastError();
+            eprintln!("scryd: EcoQoS unavailable (win32 error {code}); continuing at default QoS");
+        }
+
+        // Low memory priority: reclaim daemon pages first under pressure.
+        let mut mem_prio = ffi::MemoryPriorityInformation {
+            memory_priority: ffi::MEMORY_PRIORITY_LOW,
+        };
+        let result = ffi::SetProcessInformation(
+            ffi::GetCurrentProcess(),
+            ffi::PROCESS_MEMORY_PRIORITY,
+            &mut mem_prio as *mut _ as *mut std::ffi::c_void,
+            size_of::<ffi::MemoryPriorityInformation>() as ffi::Dword,
+        );
+        if result == 0 {
+            let code = ffi::GetLastError();
+            eprintln!("scryd: low memory priority unavailable (win32 error {code}); continuing");
+        }
+    }
+}
+
+/// Apply EcoQoS to the calling thread. Must be called from the thread being
+/// throttled (self-application avoids handle lifetime issues). Only apply to
+/// the reindex worker — query-serving threads must stay responsive.
+fn configure_background_thread_qos() {
+    use std::mem::size_of;
+
+    // SAFETY: same as configure_background_qos.
+    unsafe {
+        let mut throttle = ffi::ThreadPowerThrottlingState {
+            version: ffi::THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: ffi::POWER_THROTTLING_EXECUTION_SPEED,
+            state_mask: ffi::POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let result = ffi::SetThreadInformation(
+            ffi::GetCurrentThread(),
+            ffi::THREAD_POWER_THROTTLING,
+            &mut throttle as *mut _ as *mut std::ffi::c_void,
+            size_of::<ffi::ThreadPowerThrottlingState>() as ffi::Dword,
+        );
+        if result == 0 {
+            let code = ffi::GetLastError();
+            eprintln!(
+                "scryd: thread EcoQoS unavailable (win32 error {code}); reindex thread at default QoS"
+            );
         }
     }
 }
@@ -264,5 +367,20 @@ mod tests {
             is_auxiliary: false,
         };
         assert!(is_real_change(&real_created, &mut filter));
+    }
+
+    /// Struct sizes must match their Win32 counterparts exactly — a mismatch
+    /// causes `SetProcessInformation` to fail with ERROR_INVALID_PARAMETER.
+    #[test]
+    fn power_throttling_state_is_24_bytes_or_less() {
+        assert_eq!(std::mem::size_of::<ffi::ProcessPowerThrottlingState>(), 12);
+        assert_eq!(std::mem::size_of::<ffi::MemoryPriorityInformation>(), 4);
+    }
+
+    /// `configure_background_qos` must not panic; failures are logged and
+    /// ignored by design (older Windows builds may not support EcoQoS).
+    #[test]
+    fn configure_background_qos_does_not_panic() {
+        configure_background_qos();
     }
 }

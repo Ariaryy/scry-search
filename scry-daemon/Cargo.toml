@@ -13,3 +13,6 @@ scry-fsevents = { path = "../scry-fsevents" }
 scry-ipc = { path = "../scry-ipc" }
 crossbeam = { workspace = true }
 anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
