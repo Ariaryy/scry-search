@@ -283,8 +283,8 @@ fn watch(
         while !should_stop.load(Ordering::Relaxed) {
             let input = ffi::ReadUsnJournalDataV0 {
                 start_usn,
-                reason_mask: 0xFFFF_FFFF,
-                return_only_on_close: 0,
+                reason_mask: ffi::USN_STRUCTURAL_REASONS,
+                return_only_on_close: 1,
                 // Bounded wait: lets the loop re-check `should_stop` on an
                 // otherwise-idle volume instead of blocking indefinitely.
                 timeout: 1,
@@ -330,29 +330,28 @@ fn watch(
 }
 
 fn classify(header: &ffi::UsnRecordV2Header, name: String) -> ChangeEvent {
-    const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
-    const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
-    const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
-
     let reason = header.reason;
-    if reason & USN_REASON_FILE_DELETE != 0 {
+    if reason & ffi::USN_REASON_FILE_DELETE != 0 {
         ChangeEvent::Deleted {
             frn: header.file_reference_number,
         }
-    } else if reason & USN_REASON_FILE_CREATE != 0 {
+    } else if reason & ffi::USN_REASON_FILE_CREATE != 0 {
         ChangeEvent::Created {
             frn: header.file_reference_number,
             parent_frn: header.parent_file_reference_number,
             name,
             is_dir: header.file_attributes & ffi::FILE_ATTRIBUTE_DIRECTORY != 0,
         }
-    } else if reason & USN_REASON_RENAME_NEW_NAME != 0 {
+    } else if reason & ffi::USN_REASON_RENAME_NEW_NAME != 0 {
         ChangeEvent::Renamed {
             frn: header.file_reference_number,
             parent_frn: header.parent_file_reference_number,
             name,
         }
     } else {
+        // With the narrowed mask, only RENAME_OLD_NAME reaches here — the
+        // matching RENAME_NEW_NAME record carries the information the
+        // daemon actually needs.
         ChangeEvent::Modified {
             frn: header.file_reference_number,
         }
@@ -422,6 +421,23 @@ mod ffi {
     pub const FSCTL_QUERY_USN_JOURNAL: Dword = 0x0009_00F4;
     /// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 46, METHOD_NEITHER, FILE_ANY_ACCESS)
     pub const FSCTL_READ_USN_JOURNAL: Dword = 0x0009_00BB;
+
+    // USN_REASON_* — the subset scry cares about. A name-and-tree index is
+    // only affected by records that create, destroy, or move an entry;
+    // data writes (DATA_OVERWRITE/EXTEND, CLOSE, BASIC_INFO_CHANGE) cannot
+    // change anything the index can answer.
+    pub const USN_REASON_FILE_CREATE: Dword = 0x0000_0100;
+    pub const USN_REASON_FILE_DELETE: Dword = 0x0000_0200;
+    pub const USN_REASON_RENAME_OLD_NAME: Dword = 0x0000_1000;
+    pub const USN_REASON_RENAME_NEW_NAME: Dword = 0x0000_2000;
+
+    /// The only reasons that can alter the arena's shape. Passed as
+    /// `ReadUsnJournalDataV0::reason_mask`, which returns a record when
+    /// `record.reason & mask != 0`.
+    pub const USN_STRUCTURAL_REASONS: Dword = USN_REASON_FILE_CREATE
+        | USN_REASON_FILE_DELETE
+        | USN_REASON_RENAME_OLD_NAME
+        | USN_REASON_RENAME_NEW_NAME;
 
     pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 

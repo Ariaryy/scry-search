@@ -92,7 +92,11 @@ fn reindex_on_changes(
                 true
             }
         }
-        ChangeEvent::Modified { frn } => !self_frns.contains(frn),
+        // A data/metadata write cannot change the arena's shape: the index
+        // stores names, parent links and mtime only, and mtime isn't
+        // queryable. Reindexing on Modified is what made the daemon rebuild
+        // continuously on an active volume.
+        ChangeEvent::Modified { .. } => false,
         ChangeEvent::Deleted { frn } => {
             let was_self = self_frns.remove(frn);
             !was_self
