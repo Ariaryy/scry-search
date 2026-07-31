@@ -3,15 +3,15 @@
 //! turning "enumerate a million files" from a million small directory-read
 //! syscalls into a handful of large sequential reads of the MFT itself.
 //!
-//! Live updates ride the same USN journal via `FSCTL_READ_USN_JOURNAL`,
-//! polling with a bounded wait so the watcher thread can also notice a stop
-//! request promptly.
+//! Live updates ride the same USN journal via `FSCTL_READ_USN_JOURNAL`, using
+//! overlapped I/O so the watcher thread blocks at 0% CPU when the volume is
+//! idle; `JournalHandle::stop` unblocks it deterministically via `CancelIoEx`.
 
 use scry_core::{ArenaBuilder, EntryFlags, FileRecord};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -116,7 +116,7 @@ struct RawEntry {
     mtime: i64,
 }
 
-fn open_volume(volume: &str) -> Result<ffi::Handle, WindowsBackendError> {
+fn open_volume(volume: &str, flags: ffi::Dword) -> Result<ffi::Handle, WindowsBackendError> {
     let path = format!("\\\\.\\{volume}");
     let wide = to_wide(&path);
 
@@ -127,7 +127,7 @@ fn open_volume(volume: &str) -> Result<ffi::Handle, WindowsBackendError> {
             ffi::FILE_SHARE_READ | ffi::FILE_SHARE_WRITE,
             std::ptr::null_mut(),
             ffi::OPEN_EXISTING,
-            0,
+            flags,
             std::ptr::null_mut(),
         )
     };
@@ -142,7 +142,7 @@ fn open_volume(volume: &str) -> Result<ffi::Handle, WindowsBackendError> {
 }
 
 fn enumerate_mft(volume: &str) -> Result<Vec<RawEntry>, WindowsBackendError> {
-    let handle = open_volume(volume)?;
+    let handle = open_volume(volume, 0)?;
 
     let result = (|| {
         let mut entries = Vec::new();
@@ -243,38 +243,92 @@ fn parse_usn_records(buf: &[u8], bytes_returned: usize) -> Vec<(ffi::UsnRecordV2
     out
 }
 
+/// Issues a `DeviceIoControl` on a handle opened with `FILE_FLAG_OVERLAPPED`
+/// and blocks the calling thread until it completes. `event_handle` may be
+/// null, in which case the device handle itself is the completion signal —
+/// sound as long as only one overlapped operation is ever outstanding on
+/// `handle` at a time, which every caller in this module guarantees. A
+/// completion that came from `CancelIoEx` surfaces as
+/// `Err(ffi::ERROR_OPERATION_ABORTED)`, not a hang.
+unsafe fn ioctl_overlapped(
+    handle: ffi::Handle,
+    code: ffi::Dword,
+    input: *const c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+    event_handle: ffi::Handle,
+) -> Result<u32, ffi::Dword> {
+    let mut overlapped = ffi::Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: event_handle,
+    };
+    let mut bytes_returned: u32 = 0;
+    let ok = ffi::DeviceIoControl(
+        handle,
+        code,
+        input,
+        input_len,
+        output,
+        output_len,
+        &mut bytes_returned,
+        &mut overlapped as *mut _ as *mut c_void,
+    );
+    if ok != 0 {
+        return Ok(bytes_returned);
+    }
+    let err = ffi::GetLastError();
+    if err != ffi::ERROR_IO_PENDING {
+        return Err(err);
+    }
+    let waited = ffi::GetOverlappedResult(handle, &overlapped, &mut bytes_returned, 1);
+    if waited != 0 {
+        Ok(bytes_returned)
+    } else {
+        Err(ffi::GetLastError())
+    }
+}
+
 fn query_journal(handle: ffi::Handle) -> Result<ffi::UsnJournalDataV0, WindowsBackendError> {
     let mut out = ffi::UsnJournalDataV0::default();
-    let mut bytes_returned: u32 = 0;
-    let ok = unsafe {
-        ffi::DeviceIoControl(
+    let result = unsafe {
+        ioctl_overlapped(
             handle,
             ffi::FSCTL_QUERY_USN_JOURNAL,
             std::ptr::null(),
             0,
             &mut out as *mut _ as *mut c_void,
             std::mem::size_of::<ffi::UsnJournalDataV0>() as u32,
-            &mut bytes_returned,
             std::ptr::null_mut(),
         )
     };
-    if ok == 0 {
-        let code = unsafe { ffi::GetLastError() };
-        return Err(WindowsBackendError::QueryJournal { code });
-    }
-    Ok(out)
+    result
+        .map(|_| out)
+        .map_err(|code| WindowsBackendError::QueryJournal { code })
 }
 
 /// Blocks the calling thread, translating USN journal change records into
 /// [`ChangeEvent`]s on `tx` until `should_stop` is set or `tx`'s receiver is
 /// dropped. Starts from "now" (the journal's current USN) — it does not
 /// replay history, so callers must complete a bulk index first.
+///
+/// The wait between changes is a genuinely blocking overlapped read: the
+/// thread costs 0% CPU while the volume is idle. `watch_handle` publishes the
+/// open volume handle so `JournalHandle::stop` can call `CancelIoEx` on it
+/// from the stopping thread, which is what makes the wait interruptible
+/// without polling.
 fn watch(
     volume: &str,
     tx: &crossbeam::channel::Sender<ChangeEvent>,
     should_stop: &AtomicBool,
+    watch_handle: &AtomicUsize,
 ) -> Result<(), WindowsBackendError> {
-    let handle = open_volume(volume)?;
+    let handle = open_volume(volume, ffi::FILE_FLAG_OVERLAPPED)?;
+    watch_handle.store(handle as usize, Ordering::Release);
+
     let result = (|| {
         let journal = query_journal(handle)?;
         let mut start_usn = journal.next_usn;
@@ -285,30 +339,30 @@ fn watch(
                 start_usn,
                 reason_mask: ffi::USN_STRUCTURAL_REASONS,
                 return_only_on_close: 1,
-                // Bounded wait: lets the loop re-check `should_stop` on an
-                // otherwise-idle volume instead of blocking indefinitely.
-                timeout: 1,
-                bytes_to_wait_for: 1,
+                // Block indefinitely for the next structural change.
+                // CancelIoEx (from JournalHandle::stop) is what unblocks
+                // this on shutdown, surfacing as ERROR_OPERATION_ABORTED.
+                timeout: 0,
+                bytes_to_wait_for: std::mem::size_of::<ffi::UsnRecordV2Header>() as u64,
                 usn_journal_id: journal.usn_journal_id,
             };
-            let mut bytes_returned: u32 = 0;
 
-            let ok = unsafe {
-                ffi::DeviceIoControl(
+            let bytes_returned = unsafe {
+                ioctl_overlapped(
                     handle,
                     ffi::FSCTL_READ_USN_JOURNAL,
                     &input as *const _ as *const c_void,
                     std::mem::size_of::<ffi::ReadUsnJournalDataV0>() as u32,
                     out_buf.as_mut_ptr() as *mut c_void,
                     out_buf.len() as u32,
-                    &mut bytes_returned,
                     std::ptr::null_mut(),
                 )
             };
-            if ok == 0 {
-                let code = unsafe { ffi::GetLastError() };
-                return Err(WindowsBackendError::ReadJournal { code });
-            }
+            let bytes_returned = match bytes_returned {
+                Ok(n) => n,
+                Err(ffi::ERROR_OPERATION_ABORTED) => break, // normal shutdown
+                Err(code) => return Err(WindowsBackendError::ReadJournal { code }),
+            };
             if bytes_returned < 8 {
                 continue;
             }
@@ -326,6 +380,7 @@ fn watch(
         Ok(())
     })();
     unsafe { ffi::CloseHandle(handle) };
+    watch_handle.store(0, Ordering::Release);
     result
 }
 
@@ -363,12 +418,26 @@ fn classify(header: &ffi::UsnRecordV2Header, name: String) -> ChangeEvent {
 /// it down deterministically (e.g. on daemon exit).
 pub struct JournalHandle {
     stop: Arc<AtomicBool>,
+    // The open volume handle, published by `watch()` once it opens it and
+    // cleared back to 0 when it closes it. Stored as a `usize` rather than
+    // `ffi::Handle` (`*mut c_void`) so this struct stays `Send` without an
+    // unsafe impl — see the same pattern in scry-ipc's `SecurityDescriptor`.
+    watch_handle: Arc<AtomicUsize>,
     join: Option<std::thread::JoinHandle<Result<(), WindowsBackendError>>>,
 }
 
 impl JournalHandle {
     pub fn stop(mut self) -> Result<(), WindowsBackendError> {
         self.stop.store(true, Ordering::Relaxed);
+        let handle_val = self.watch_handle.load(Ordering::Acquire);
+        if handle_val != 0 {
+            // Unblocks the pending overlapped read in watch() with
+            // ERROR_OPERATION_ABORTED instead of leaving it to wait for the
+            // next real journal event, which might never come.
+            unsafe {
+                ffi::CancelIoEx(handle_val as ffi::Handle, std::ptr::null());
+            }
+        }
         match self.join.take().unwrap().join() {
             Ok(res) => res,
             Err(_) => Ok(()), // watcher thread panicked; nothing more to report here
@@ -380,13 +449,20 @@ impl WindowsBackend {
     /// Spawns a background thread streaming live USN journal changes for
     /// `volume` into `tx`. Pair with `bulk_index_volume` for the initial
     /// snapshot — this only reports changes from the moment it starts.
-    pub fn spawn_watcher(volume: &str, tx: crossbeam::channel::Sender<ChangeEvent>) -> JournalHandle {
+    pub fn spawn_watcher(
+        volume: &str,
+        tx: crossbeam::channel::Sender<ChangeEvent>,
+    ) -> JournalHandle {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let watch_handle = Arc::new(AtomicUsize::new(0));
+        let watch_handle_thread = watch_handle.clone();
         let volume = volume.to_string();
-        let join = std::thread::spawn(move || watch(&volume, &tx, &stop_thread));
+        let join =
+            std::thread::spawn(move || watch(&volume, &tx, &stop_thread, &watch_handle_thread));
         JournalHandle {
             stop,
+            watch_handle,
             join: Some(join),
         }
     }
@@ -440,6 +516,22 @@ mod ffi {
         | USN_REASON_RENAME_NEW_NAME;
 
     pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+    pub const FILE_FLAG_OVERLAPPED: Dword = 0x4000_0000;
+    pub const ERROR_IO_PENDING: Dword = 997;
+    pub const ERROR_OPERATION_ABORTED: Dword = 995;
+
+    /// Win32 OVERLAPPED. The first four fields are a union in the C header
+    /// (Internal/InternalHigh/Offset/OffsetHigh vs. Pointer); the layout below
+    /// matches the Offset/OffsetHigh form, which is what DeviceIoControl uses.
+    #[repr(C)]
+    pub struct Overlapped {
+        pub internal: usize,
+        pub internal_high: usize,
+        pub offset: u32,
+        pub offset_high: u32,
+        pub h_event: Handle,
+    }
 
     #[repr(C)]
     pub struct MftEnumDataV0 {
@@ -520,5 +612,14 @@ mod ffi {
         ) -> Bool;
 
         pub fn GetLastError() -> Dword;
+
+        pub fn GetOverlappedResult(
+            h_file: Handle,
+            lp_overlapped: *const Overlapped,
+            lp_number_of_bytes_transferred: *mut Dword,
+            b_wait: Bool,
+        ) -> Bool;
+
+        pub fn CancelIoEx(h_file: Handle, lp_overlapped: *const Overlapped) -> Bool;
     }
 }
