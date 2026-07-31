@@ -10,8 +10,6 @@ path = "src/main.rs"
 [dependencies]
 scry-core = { path = "../scry-core" }
 scry-fsevents = { path = "../scry-fsevents" }
+scry-ipc = { path = "../scry-ipc" }
 crossbeam = { workspace = true }
 anyhow = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
