@@ -201,7 +201,7 @@ pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
             return Err(err);
         }
 
-        let mut privileges = ffi::TokenPrivileges {
+        let privileges = ffi::TokenPrivileges {
             privilege_count: 1,
             privileges: ffi::LuidAndAttributes {
                 luid,
@@ -211,7 +211,7 @@ pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
         let ok = ffi::AdjustTokenPrivileges(
             token,
             0,
-            &mut privileges,
+            &privileges,
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),

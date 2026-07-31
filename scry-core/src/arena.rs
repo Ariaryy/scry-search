@@ -94,6 +94,10 @@ impl ArenaBuilder {
         self.records.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     /// Fix up a parent link after the fact. Needed because enumeration sources
     /// like NTFS's USN journal yield records in MFT order, not tree order —
     /// a child can easily be seen before its parent.

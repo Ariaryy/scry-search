@@ -1,4 +1,4 @@
-use crate::arena::{Arena, ArchivedArena};
+use crate::arena::{ArchivedArena, Arena};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
@@ -27,8 +27,8 @@ pub fn save_with<F>(arena: &Arena, path: &Path, on_create: F) -> Result<(), Stor
 where
     F: FnOnce(&File),
 {
-    let bytes = rkyv::to_bytes::<_, 1024>(arena)
-        .map_err(|e| StoreError::Validation(e.to_string()))?;
+    let bytes =
+        rkyv::to_bytes::<_, 1024>(arena).map_err(|e| StoreError::Validation(e.to_string()))?;
     let tmp_path = path.with_extension("tmp");
     {
         let mut f = File::create(&tmp_path)?;

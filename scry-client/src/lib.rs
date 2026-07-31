@@ -3,8 +3,8 @@
 //! just this crate with a formatter on top, and a future C ABI layer would
 //! be a thin wrapper around the same `Client::query` call.
 
-use scry_core::protocol::{decode_results, encode_request, QueryKind, Request};
 pub use scry_core::protocol::ResultEntry;
+use scry_core::protocol::{decode_results, encode_request, QueryKind, Request};
 
 pub struct Client {
     pipe: scry_ipc::Pipe,
@@ -21,7 +21,12 @@ impl Client {
         Ok(Self { pipe })
     }
 
-    pub fn query(&self, kind: QueryKind, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {
+    pub fn query(
+        &self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<ResultEntry>> {
         let req = Request {
             kind,
             pattern: pattern.to_string(),

@@ -16,9 +16,7 @@ fn enumerate_c_volume_or_report_why_not() {
             println!("indexed {} entries from C:", arena.len());
         }
         Err(e) => {
-            eprintln!(
-                "bulk_index_volume(\"C:\") failed (expected without elevation): {e}"
-            );
+            eprintln!("bulk_index_volume(\"C:\") failed (expected without elevation): {e}");
         }
     }
 }

@@ -13,8 +13,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    let client = Client::connect()
-        .map_err(|e| anyhow::anyhow!("{e}\nis scryd running?"))?;
+    let client = Client::connect().map_err(|e| anyhow::anyhow!("{e}\nis scryd running?"))?;
 
     let kind = if query.contains('*') || query.contains('?') {
         QueryKind::Wildcard

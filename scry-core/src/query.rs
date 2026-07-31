@@ -53,7 +53,9 @@ pub fn search(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
                 .iter()
                 .enumerate()
                 .filter(|(_, rec)| {
-                    rec.name.to_ascii_lowercase().contains(needle_lower.as_str())
+                    rec.name
+                        .to_ascii_lowercase()
+                        .contains(needle_lower.as_str())
                 })
                 .take(limit)
                 .map(|(i, _)| i as u32)

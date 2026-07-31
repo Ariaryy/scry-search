@@ -7,7 +7,7 @@ pub mod store;
 #[cfg(test)]
 mod tests;
 
-pub use arena::{Arena, ArenaBuilder, ArchivedArena};
+pub use arena::{ArchivedArena, Arena, ArenaBuilder};
 pub use protocol::{QueryKind, Request, ResultEntry};
 pub use query::Query;
 pub use record::{EntryFlags, FileRecord};
