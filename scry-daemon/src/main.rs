@@ -18,11 +18,18 @@ mod ffi;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use arc_swap::ArcSwap;
 use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
 use scry_core::{ArenaStore, Query};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-type SharedStore = Arc<RwLock<Arc<ArenaStore>>>;
+/// The live index, published to query threads by atomic pointer swap.
+///
+/// Readers take a snapshot with a single atomic load and no lock, so a
+/// reindex never blocks a query — an in-flight reader keeps its `Arc` alive
+/// and continues to see a consistent (if momentarily stale) index while the
+/// swap happens underneath it.
+type SharedStore = Arc<ArcSwap<ArenaStore>>;
 
 fn main() -> anyhow::Result<()> {
     // Return freed spans to the OS after 1s of idleness rather than mimalloc's
@@ -58,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("scryd: indexing {volume}...");
     let initial = build_store(&volume, auxiliary_marking_enabled)?;
     eprintln!("scryd: indexed {} entries", initial.archived().len());
-    let store: SharedStore = Arc::new(RwLock::new(initial));
+    let store: SharedStore = Arc::new(ArcSwap::from(initial));
 
     {
         let store = store.clone();
@@ -292,7 +299,7 @@ fn reindex_on_changes(
         match build_store(&volume, auxiliary_marking_enabled) {
             Ok(new_store) => {
                 let len = new_store.archived().len();
-                *store.write().unwrap() = new_store;
+                store.store(new_store);
                 eprintln!("scryd: reindexed {volume} ({len} entries)");
             }
             Err(e) => eprintln!("scryd: reindex failed: {e}"),
@@ -310,7 +317,9 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
             continue;
         };
 
-        let snapshot = store.read().unwrap().clone();
+        // `load_full` clones the Arc, keeping this index alive for the whole
+        // query even if the reindex thread swaps in a new one mid-search.
+        let snapshot = store.load_full();
         let archived = snapshot.archived();
         let query = match req.kind {
             QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
@@ -337,7 +346,36 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scry_core::{
+        record::{EntryFlags, FileRecord},
+        store::save,
+        Arena,
+    };
     use scry_fsevents::ChangeEvent;
+
+    fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<ArenaStore> {
+        let mut b = Arena::builder();
+        let root = b.push(FileRecord {
+            parent: u32::MAX,
+            name: "C:".into(),
+            size: 0,
+            mtime: 0,
+            flags: EntryFlags::Directory,
+        });
+        for i in 0..n.saturating_sub(1) {
+            b.push(FileRecord {
+                parent: root,
+                name: format!("file{i}.txt"),
+                size: 0,
+                mtime: 0,
+                flags: EntryFlags::File,
+            });
+        }
+        let arena = b.build();
+        let path = dir.path().join(format!("index-{n}.rkyv"));
+        save(&arena, &path).unwrap();
+        Arc::new(ArenaStore::open(&path).unwrap())
+    }
 
     #[test]
     fn modified_events_never_trigger_reindex() {
@@ -382,5 +420,60 @@ mod tests {
     #[test]
     fn configure_background_qos_does_not_panic() {
         configure_background_qos();
+    }
+
+    /// Four reader threads each observe `archived().len()` is either 2 or 3
+    /// (never corrupted) while the main thread swaps between two stores.
+    /// This pins the core `ArcSwap` correctness guarantee relied on here.
+    #[test]
+    fn concurrent_readers_see_a_consistent_index_across_a_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = build_store_with_n_records(2, &dir);
+        let store_b = build_store_with_n_records(3, &dir);
+
+        let swap: Arc<ArcSwap<ArenaStore>> = Arc::new(ArcSwap::from(store_a.clone()));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let swap = swap.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        let snap = swap.load_full();
+                        let len = snap.archived().len();
+                        assert!(
+                            len == 2 || len == 3,
+                            "unexpected len {len} — index corrupted during swap"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..1_000 {
+            swap.store(store_b.clone());
+            swap.store(store_a.clone());
+        }
+
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+    }
+
+    /// A `load_full` snapshot survives the store being replaced: callers that
+    /// hold a snapshot mid-search continue to see a consistent, valid index
+    /// even after a reindex swaps in a new one.
+    #[test]
+    fn load_full_survives_the_store_being_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = build_store_with_n_records(2, &dir);
+        let store_b = build_store_with_n_records(3, &dir);
+
+        let swap: Arc<ArcSwap<ArenaStore>> = Arc::new(ArcSwap::from(store_a));
+        let snapshot = swap.load_full();
+        assert_eq!(snapshot.archived().len(), 2);
+
+        swap.store(store_b);
+        // snapshot still points to store A — must still report 2.
+        assert_eq!(snapshot.archived().len(), 2);
     }
 }

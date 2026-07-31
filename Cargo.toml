@@ -22,6 +22,7 @@ memmap2 = "0.9"
 thiserror = "1"
 anyhow = "1"
 regex-automata = "0.4"
+arc-swap = "1"
 
 [profile.release]
 opt-level = 3
