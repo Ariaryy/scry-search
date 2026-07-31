@@ -449,6 +449,13 @@ fn query_journal(handle: ffi::Handle) -> Result<ffi::UsnJournalDataV0, WindowsBa
 /// open volume handle so `JournalHandle::stop` can call `CancelIoEx` on it
 /// from the stopping thread, which is what makes the wait interruptible
 /// without polling.
+/// Whether a raw USN `Reason` bitmask includes at least one reason that can
+/// change the arena's tree shape (create/delete/rename). Exposed publicly so
+/// the reason-mask narrowing can be unit tested without reaching into `ffi`.
+pub fn is_structural_reason(reason: u32) -> bool {
+    reason & ffi::USN_STRUCTURAL_REASONS != 0
+}
+
 fn watch(
     volume: &str,
     tx: &crossbeam::channel::Sender<ChangeEvent>,
@@ -853,5 +860,43 @@ mod ffi {
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetCurrentProcess() -> Handle;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(reason: u32, source_info: u32) -> ffi::UsnRecordV2Header {
+        ffi::UsnRecordV2Header {
+            record_length: 0,
+            major_version: 2,
+            minor_version: 0,
+            file_reference_number: 1,
+            parent_file_reference_number: 2,
+            usn: 0,
+            time_stamp: 0,
+            reason,
+            source_info,
+            security_id: 0,
+            file_attributes: 0,
+            file_name_length: 0,
+            file_name_offset: 0,
+        }
+    }
+
+    #[test]
+    fn classify_marks_auxiliary_source() {
+        let h = header(ffi::USN_REASON_FILE_CREATE, ffi::USN_SOURCE_AUXILIARY_DATA);
+        let ChangeEvent::Created { is_auxiliary, .. } = classify(&h, "foo".to_string()) else {
+            panic!("expected Created");
+        };
+        assert!(is_auxiliary);
+
+        let h = header(ffi::USN_REASON_FILE_CREATE, 0);
+        let ChangeEvent::Created { is_auxiliary, .. } = classify(&h, "foo".to_string()) else {
+            panic!("expected Created");
+        };
+        assert!(!is_auxiliary);
     }
 }

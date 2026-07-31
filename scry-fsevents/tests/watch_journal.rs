@@ -2,8 +2,28 @@
 //! delete a real file on C: and confirm the corresponding ChangeEvents show
 //! up. Requires elevation, same as the enumeration test.
 
-use scry_fsevents::{ChangeEvent, WindowsBackend};
+use scry_fsevents::{is_structural_reason, ChangeEvent, WindowsBackend};
 use std::time::{Duration, Instant};
+
+const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
+const USN_REASON_CLOSE: u32 = 0x8000_0000;
+const USN_REASON_BASIC_INFO_CHANGE: u32 = 0x0000_8000;
+const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
+const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
+const USN_REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
+const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
+
+#[test]
+fn structural_reason_mask_excludes_data_writes() {
+    assert!(!is_structural_reason(USN_REASON_DATA_OVERWRITE));
+    assert!(!is_structural_reason(USN_REASON_CLOSE));
+    assert!(!is_structural_reason(USN_REASON_BASIC_INFO_CHANGE));
+
+    assert!(is_structural_reason(USN_REASON_FILE_CREATE));
+    assert!(is_structural_reason(USN_REASON_FILE_DELETE));
+    assert!(is_structural_reason(USN_REASON_RENAME_OLD_NAME));
+    assert!(is_structural_reason(USN_REASON_RENAME_NEW_NAME));
+}
 
 #[test]
 fn watch_reports_create_rename_delete() {

@@ -5,4 +5,6 @@
 pub mod windows;
 
 #[cfg(windows)]
-pub use windows::{ChangeEvent, JournalHandle, WindowsBackend, WindowsBackendError};
+pub use windows::{
+    is_structural_reason, ChangeEvent, JournalHandle, WindowsBackend, WindowsBackendError,
+};

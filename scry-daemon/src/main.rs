@@ -230,3 +230,36 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
         pipe.write_frame(&encode_results(&entries))?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scry_fsevents::ChangeEvent;
+
+    #[test]
+    fn modified_events_never_trigger_reindex() {
+        let mut filter = SelfWriteFilter::new("C:", false);
+
+        let modified = ChangeEvent::Modified { frn: 1, is_auxiliary: false };
+        assert!(!is_real_change(&modified, &mut filter));
+
+        let auxiliary_created = ChangeEvent::Created {
+            frn: 2,
+            parent_frn: 0,
+            name: "not-the-snapshot.txt".to_string(),
+            is_dir: false,
+            is_auxiliary: true,
+        };
+        let mut aux_filter = SelfWriteFilter::new("C:", true);
+        assert!(!is_real_change(&auxiliary_created, &mut aux_filter));
+
+        let real_created = ChangeEvent::Created {
+            frn: 3,
+            parent_frn: 0,
+            name: "not-the-snapshot.txt".to_string(),
+            is_dir: false,
+            is_auxiliary: false,
+        };
+        assert!(is_real_change(&real_created, &mut filter));
+    }
+}
