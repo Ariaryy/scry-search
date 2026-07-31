@@ -1,8 +1,7 @@
 //! Windows backend: bulk-load the index via `FSCTL_ENUM_USN_DATA`, which walks
-//! the NTFS MFT in on-disk (record) order rather than the directory tree. This
-//! is the actual trick behind Everything's speed — it turns "enumerate a
-//! million files" from a million small directory-read syscalls into a handful
-//! of large sequential reads of the MFT itself.
+//! the NTFS MFT in on-disk (record) order rather than the directory tree —
+//! turning "enumerate a million files" from a million small directory-read
+//! syscalls into a handful of large sequential reads of the MFT itself.
 //!
 //! Live updates ride the same USN journal via `FSCTL_READ_USN_JOURNAL`,
 //! polling with a bounded wait so the watcher thread can also notice a stop
@@ -83,13 +82,25 @@ impl WindowsBackend {
             frn_to_idx.insert(e.frn, idx);
         }
 
+        // The NTFS root record (self-parented, or simply never referenced by
+        // any child's parent FRN, depending on what the enumeration yields)
+        // otherwise contributes nothing to full_path() — every top-level
+        // entry's parent chain would just stop, dropping the drive letter.
+        // Give every "no real parent" entry an explicit volume-root node
+        // instead of `u32::MAX` so paths always start with e.g. `C:`.
+        let root_idx = builder.push(FileRecord {
+            parent: u32::MAX,
+            name: volume.to_string(),
+            size: 0,
+            mtime: 0,
+            flags: EntryFlags::Directory,
+        });
+
         for (i, e) in entries.iter().enumerate() {
             let idx = i as u32;
             match frn_to_idx.get(&e.parent_frn) {
-                // NTFS's root record is its own parent — treat that as "no parent"
-                // rather than let full_path() spin in a cycle.
                 Some(&p) if p != idx => builder.set_parent(idx, p),
-                _ => builder.set_parent(idx, u32::MAX),
+                _ => builder.set_parent(idx, root_idx),
             }
         }
 
