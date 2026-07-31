@@ -240,7 +240,10 @@ mod tests {
     fn modified_events_never_trigger_reindex() {
         let mut filter = SelfWriteFilter::new("C:", false);
 
-        let modified = ChangeEvent::Modified { frn: 1, is_auxiliary: false };
+        let modified = ChangeEvent::Modified {
+            frn: 1,
+            is_auxiliary: false,
+        };
         assert!(!is_real_change(&modified, &mut filter));
 
         let auxiliary_created = ChangeEvent::Created {

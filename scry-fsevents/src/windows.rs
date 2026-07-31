@@ -85,10 +85,7 @@ impl WindowsBackend {
 
     /// Tags `file`'s handle so its writes are identifiable in the USN
     /// journal. See the free function of the same name for details.
-    pub fn mark_handle_as_auxiliary(
-        file: &std::fs::File,
-        volume: &str,
-    ) -> Result<(), ffi::Dword> {
+    pub fn mark_handle_as_auxiliary(file: &std::fs::File, volume: &str) -> Result<(), ffi::Dword> {
         mark_handle_as_auxiliary(file, volume)
     }
 
@@ -194,7 +191,10 @@ pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
         }
 
         let wide_name = to_wide(name);
-        let mut luid = ffi::Luid { low_part: 0, high_part: 0 };
+        let mut luid = ffi::Luid {
+            low_part: 0,
+            high_part: 0,
+        };
         if ffi::LookupPrivilegeValueW(std::ptr::null(), wide_name.as_ptr(), &mut luid) == 0 {
             let err = ffi::GetLastError();
             ffi::CloseHandle(token);
@@ -235,10 +235,7 @@ pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
 /// `SeManageVolumePrivilege` to already be enabled (see `enable_privilege`);
 /// callers should treat failure as non-fatal and fall back to the name-based
 /// heuristic.
-pub fn mark_handle_as_auxiliary(
-    file: &std::fs::File,
-    volume: &str,
-) -> Result<(), ffi::Dword> {
+pub fn mark_handle_as_auxiliary(file: &std::fs::File, volume: &str) -> Result<(), ffi::Dword> {
     use std::os::windows::io::AsRawHandle;
 
     let volume_handle = open_volume(volume, 0).map_err(|_| unsafe { ffi::GetLastError() })?;
@@ -263,7 +260,11 @@ pub fn mark_handle_as_auxiliary(
             &mut bytes_returned,
             std::ptr::null_mut(),
         );
-        if ok != 0 { Ok(()) } else { Err(ffi::GetLastError()) }
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(ffi::GetLastError())
+        }
     };
 
     unsafe { ffi::CloseHandle(volume_handle) };
@@ -621,7 +622,13 @@ impl WindowsBackend {
         let overflowed_thread = overflowed.clone();
         let volume = volume.to_string();
         let join = std::thread::spawn(move || {
-            watch(&volume, &tx, &stop_thread, &watch_handle_thread, &overflowed_thread)
+            watch(
+                &volume,
+                &tx,
+                &stop_thread,
+                &watch_handle_thread,
+                &overflowed_thread,
+            )
         });
         JournalHandle {
             stop,
