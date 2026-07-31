@@ -36,9 +36,14 @@ pub enum ChangeEvent {
         parent_frn: u64,
         name: String,
         is_dir: bool,
+        /// Set when this record was produced by a handle marked via
+        /// `FSCTL_MARK_HANDLE` — i.e. it's scry's own write, not a real
+        /// filesystem change. See `mark_handle_as_auxiliary`.
+        is_auxiliary: bool,
     },
     Deleted {
         frn: u64,
+        is_auxiliary: bool,
     },
     /// Covers both a rename and a move (new parent), since NTFS reports both
     /// as a name-change record on the same FRN.
@@ -46,18 +51,47 @@ pub enum ChangeEvent {
         frn: u64,
         parent_frn: u64,
         name: String,
+        is_auxiliary: bool,
     },
     /// Metadata/content changed but identity, name and parent did not — the
     /// arena's tree shape is unaffected, so the daemon can ignore or use this
     /// only to refresh mtime.
     Modified {
         frn: u64,
+        is_auxiliary: bool,
     },
+}
+
+impl ChangeEvent {
+    pub fn is_auxiliary(&self) -> bool {
+        match self {
+            ChangeEvent::Created { is_auxiliary, .. }
+            | ChangeEvent::Deleted { is_auxiliary, .. }
+            | ChangeEvent::Renamed { is_auxiliary, .. }
+            | ChangeEvent::Modified { is_auxiliary, .. } => *is_auxiliary,
+        }
+    }
 }
 
 pub struct WindowsBackend;
 
 impl WindowsBackend {
+    /// Enables a named privilege (e.g. `SeManageVolumePrivilege`) on the
+    /// current process token. See the free function of the same name for
+    /// details.
+    pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
+        enable_privilege(name)
+    }
+
+    /// Tags `file`'s handle so its writes are identifiable in the USN
+    /// journal. See the free function of the same name for details.
+    pub fn mark_handle_as_auxiliary(
+        file: &std::fs::File,
+        volume: &str,
+    ) -> Result<(), ffi::Dword> {
+        mark_handle_as_auxiliary(file, volume)
+    }
+
     /// Bulk-enumerate a volume (e.g. `"C:"`) directly from its MFT via the USN
     /// journal's enumeration ioctl, bypassing per-file stat()/directory walks.
     /// Requires the process to hold `SeBackupPrivilege` (i.e. run elevated).
@@ -139,6 +173,101 @@ fn open_volume(volume: &str, flags: ffi::Dword) -> Result<ffi::Handle, WindowsBa
         });
     }
     Ok(handle)
+}
+
+/// Enables a named privilege (e.g. `SeManageVolumePrivilege`) on the current
+/// process token. Administrators tokens hold this privilege but it is
+/// disabled by default; `AdjustTokenPrivileges` returns nonzero even when it
+/// only partially succeeds, so success must be confirmed separately via
+/// `GetLastError() != ERROR_NOT_ALL_ASSIGNED`.
+pub fn enable_privilege(name: &str) -> Result<(), ffi::Dword> {
+    unsafe {
+        let mut token: ffi::Handle = std::ptr::null_mut();
+        let process = ffi::GetCurrentProcess();
+        if ffi::OpenProcessToken(
+            process,
+            ffi::TOKEN_ADJUST_PRIVILEGES | ffi::TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return Err(ffi::GetLastError());
+        }
+
+        let wide_name = to_wide(name);
+        let mut luid = ffi::Luid { low_part: 0, high_part: 0 };
+        if ffi::LookupPrivilegeValueW(std::ptr::null(), wide_name.as_ptr(), &mut luid) == 0 {
+            let err = ffi::GetLastError();
+            ffi::CloseHandle(token);
+            return Err(err);
+        }
+
+        let mut privileges = ffi::TokenPrivileges {
+            privilege_count: 1,
+            privileges: ffi::LuidAndAttributes {
+                luid,
+                attributes: ffi::SE_PRIVILEGE_ENABLED,
+            },
+        };
+        let ok = ffi::AdjustTokenPrivileges(
+            token,
+            0,
+            &mut privileges,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let err = ffi::GetLastError();
+        ffi::CloseHandle(token);
+        if ok == 0 {
+            return Err(err);
+        }
+        if err == ffi::ERROR_NOT_ALL_ASSIGNED {
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// Tags `file`'s handle via `FSCTL_MARK_HANDLE` so that any USN records
+/// produced by writes through this handle carry `USN_SOURCE_AUXILIARY_DATA`
+/// in `SourceInfo`, letting the journal watcher recognize the daemon's own
+/// snapshot writes exactly instead of matching them by name/FRN. Requires
+/// `SeManageVolumePrivilege` to already be enabled (see `enable_privilege`);
+/// callers should treat failure as non-fatal and fall back to the name-based
+/// heuristic.
+pub fn mark_handle_as_auxiliary(
+    file: &std::fs::File,
+    volume: &str,
+) -> Result<(), ffi::Dword> {
+    use std::os::windows::io::AsRawHandle;
+
+    let volume_handle = open_volume(volume, 0).map_err(|_| unsafe { ffi::GetLastError() })?;
+
+    let mut info = ffi::MarkHandleInfo {
+        usn_source_info: ffi::USN_SOURCE_AUXILIARY_DATA,
+        _pad0: 0,
+        volume_handle,
+        handle_info: 0,
+        _pad1: 0,
+    };
+
+    let result = unsafe {
+        let mut bytes_returned: u32 = 0;
+        let ok = ffi::DeviceIoControl(
+            file.as_raw_handle() as ffi::Handle,
+            ffi::FSCTL_MARK_HANDLE,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ffi::MarkHandleInfo>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        );
+        if ok != 0 { Ok(()) } else { Err(ffi::GetLastError()) }
+    };
+
+    unsafe { ffi::CloseHandle(volume_handle) };
+    result
 }
 
 fn enumerate_mft(volume: &str) -> Result<Vec<RawEntry>, WindowsBackendError> {
@@ -386,9 +515,11 @@ fn watch(
 
 fn classify(header: &ffi::UsnRecordV2Header, name: String) -> ChangeEvent {
     let reason = header.reason;
+    let is_auxiliary = header.source_info & ffi::USN_SOURCE_AUXILIARY_DATA != 0;
     if reason & ffi::USN_REASON_FILE_DELETE != 0 {
         ChangeEvent::Deleted {
             frn: header.file_reference_number,
+            is_auxiliary,
         }
     } else if reason & ffi::USN_REASON_FILE_CREATE != 0 {
         ChangeEvent::Created {
@@ -396,12 +527,14 @@ fn classify(header: &ffi::UsnRecordV2Header, name: String) -> ChangeEvent {
             parent_frn: header.parent_file_reference_number,
             name,
             is_dir: header.file_attributes & ffi::FILE_ATTRIBUTE_DIRECTORY != 0,
+            is_auxiliary,
         }
     } else if reason & ffi::USN_REASON_RENAME_NEW_NAME != 0 {
         ChangeEvent::Renamed {
             frn: header.file_reference_number,
             parent_frn: header.parent_file_reference_number,
             name,
+            is_auxiliary,
         }
     } else {
         // With the narrowed mask, only RENAME_OLD_NAME reaches here — the
@@ -409,6 +542,7 @@ fn classify(header: &ffi::UsnRecordV2Header, name: String) -> ChangeEvent {
         // daemon actually needs.
         ChangeEvent::Modified {
             frn: header.file_reference_number,
+            is_auxiliary,
         }
     }
 }
@@ -514,6 +648,26 @@ mod ffi {
         | USN_REASON_FILE_DELETE
         | USN_REASON_RENAME_OLD_NAME
         | USN_REASON_RENAME_NEW_NAME;
+
+    /// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 63, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    pub const FSCTL_MARK_HANDLE: Dword = 0x0009_00FC;
+    /// Set in USN_RECORD_V2::source_info for records generated through a
+    /// handle marked with this flag. Lets the daemon recognise its own
+    /// snapshot writes without matching on filenames.
+    pub const USN_SOURCE_AUXILIARY_DATA: Dword = 0x0000_0002;
+
+    /// Input to FSCTL_MARK_HANDLE. `usn_source_info` is a union with
+    /// `CopyNumber` in the C header; scry only ever uses the former.
+    /// On x64 the HANDLE forces 8-byte alignment, so there is 4 bytes of
+    /// padding after `usn_source_info` and 4 at the end — total size 24.
+    #[repr(C)]
+    pub struct MarkHandleInfo {
+        pub usn_source_info: Dword,
+        pub _pad0: Dword,
+        pub volume_handle: Handle,
+        pub handle_info: Dword,
+        pub _pad1: Dword,
+    }
 
     pub const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
@@ -621,5 +775,60 @@ mod ffi {
         ) -> Bool;
 
         pub fn CancelIoEx(h_file: Handle, lp_overlapped: *const Overlapped) -> Bool;
+    }
+
+    pub const TOKEN_ADJUST_PRIVILEGES: Dword = 0x20;
+    pub const TOKEN_QUERY: Dword = 0x8;
+    pub const SE_PRIVILEGE_ENABLED: Dword = 0x2;
+    pub const ERROR_NOT_ALL_ASSIGNED: Dword = 1300;
+
+    #[repr(C)]
+    pub struct Luid {
+        pub low_part: u32,
+        pub high_part: i32,
+    }
+
+    #[repr(C)]
+    pub struct LuidAndAttributes {
+        pub luid: Luid,
+        pub attributes: Dword,
+    }
+
+    /// TOKEN_PRIVILEGES with a single trailing LUID_AND_ATTRIBUTES — the real
+    /// struct has a variable-length `Privileges[ANYSIZE_ARRAY]` tail, but scry
+    /// only ever adjusts one privilege at a time.
+    #[repr(C)]
+    pub struct TokenPrivileges {
+        pub privilege_count: Dword,
+        pub privileges: LuidAndAttributes,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        pub fn OpenProcessToken(
+            process_handle: Handle,
+            desired_access: Dword,
+            token_handle: *mut Handle,
+        ) -> Bool;
+
+        pub fn LookupPrivilegeValueW(
+            lp_system_name: *const u16,
+            lp_name: *const u16,
+            lp_luid: *mut Luid,
+        ) -> Bool;
+
+        pub fn AdjustTokenPrivileges(
+            token_handle: Handle,
+            disable_all_privileges: Bool,
+            new_state: *const TokenPrivileges,
+            buffer_length: Dword,
+            previous_state: *mut TokenPrivileges,
+            return_length: *mut Dword,
+        ) -> Bool;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetCurrentProcess() -> Handle;
     }
 }

@@ -17,11 +17,22 @@ pub enum StoreError {
 /// serialization happens — it's an offline/background step (snapshot compaction),
 /// never on the query path.
 pub fn save(arena: &Arena, path: &Path) -> Result<(), StoreError> {
+    save_with(arena, path, |_| {})
+}
+
+/// Like `save`, but calls `on_create` with the freshly-created temp file
+/// before its contents are written, so callers can tag the handle (e.g. via
+/// `FSCTL_MARK_HANDLE`) before any bytes hit the volume.
+pub fn save_with<F>(arena: &Arena, path: &Path, on_create: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&File),
+{
     let bytes = rkyv::to_bytes::<_, 1024>(arena)
         .map_err(|e| StoreError::Validation(e.to_string()))?;
     let tmp_path = path.with_extension("tmp");
     {
         let mut f = File::create(&tmp_path)?;
+        on_create(&f);
         f.write_all(&bytes)?;
         f.sync_all()?;
     }

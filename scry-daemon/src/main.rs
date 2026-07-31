@@ -18,8 +18,24 @@ type SharedStore = Arc<RwLock<Arc<ArenaStore>>>;
 fn main() -> anyhow::Result<()> {
     let volume = std::env::args().nth(1).unwrap_or_else(|| "C:".to_string());
 
+    // Enables exact self-write identification via FSCTL_MARK_HANDLE. Requires
+    // SeManageVolumePrivilege, which an elevated Administrators token holds
+    // but doesn't enable by default. Non-fatal: build_store falls back to the
+    // name/FRN heuristic if this fails.
+    let auxiliary_marking_enabled =
+        match scry_fsevents::WindowsBackend::enable_privilege("SeManageVolumePrivilege") {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "scryd: could not enable SeManageVolumePrivilege ({e}), \
+                     falling back to name-based self-write detection"
+                );
+                false
+            }
+        };
+
     eprintln!("scryd: indexing {volume}...");
-    let initial = build_store(&volume)?;
+    let initial = build_store(&volume, auxiliary_marking_enabled)?;
     eprintln!("scryd: indexed {} entries", initial.archived().len());
     let store: SharedStore = Arc::new(RwLock::new(initial));
 
@@ -30,7 +46,9 @@ fn main() -> anyhow::Result<()> {
         // Leaked intentionally: the watcher runs for the daemon's whole
         // lifetime, same as the pipe server loop below never returning.
         std::mem::forget(scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx));
-        std::thread::spawn(move || reindex_on_changes(volume, rx, store));
+        std::thread::spawn(move || {
+            reindex_on_changes(volume, rx, store, auxiliary_marking_enabled)
+        });
     }
 
     eprintln!("scryd: listening on {}", scry_ipc::PIPE_NAME);
@@ -50,11 +68,18 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn build_store(volume: &str) -> anyhow::Result<Arc<ArenaStore>> {
+fn build_store(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<ArenaStore>> {
     let arena = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
         .map_err(|e| anyhow::anyhow!("indexing {volume} failed: {e}"))?;
     let path = snapshot_path(volume);
-    scry_core::store::save(&arena, &path)?;
+    let volume = volume.to_string();
+    scry_core::store::save_with(&arena, &path, |f| {
+        if auxiliary_marking_enabled {
+            if let Err(e) = scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(f, &volume) {
+                eprintln!("scryd: could not mark snapshot handle as auxiliary ({e})");
+            }
+        }
+    })?;
     Ok(Arc::new(ArenaStore::open(&path)?))
 }
 
@@ -67,14 +92,16 @@ fn reindex_on_changes(
     volume: String,
     rx: crossbeam::channel::Receiver<scry_fsevents::ChangeEvent>,
     store: SharedStore,
+    auxiliary_marking_enabled: bool,
 ) {
     use scry_fsevents::ChangeEvent;
 
     // The snapshot file itself lives on the volume being watched, so writing
     // it produces USN events that would otherwise feed straight back into
-    // this function — an infinite reindex loop that never settles. Filter
-    // those out by name (for Created/Renamed) and remember the FRNs they
-    // land on so the nameless Modified/Deleted variants can be filtered too.
+    // this function — an infinite reindex loop that never settles. When
+    // auxiliary marking is enabled, is_auxiliary alone identifies these
+    // exactly. The name/FRN heuristic below stays as a fallback for when
+    // SeManageVolumePrivilege couldn't be enabled.
     let path = snapshot_path(&volume);
     let tmp_path = path.with_extension("tmp");
     let snapshot_name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -82,24 +109,31 @@ fn reindex_on_changes(
     let is_own_name = |name: &str| name == snapshot_name || name == snapshot_tmp_name;
     let mut self_frns: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    let is_real_change = |ev: &ChangeEvent, self_frns: &mut std::collections::HashSet<u64>| match ev
-    {
-        ChangeEvent::Created { frn, name, .. } | ChangeEvent::Renamed { frn, name, .. } => {
-            if is_own_name(name) {
-                self_frns.insert(*frn);
-                false
-            } else {
-                true
+    let is_real_change = |ev: &ChangeEvent, self_frns: &mut std::collections::HashSet<u64>| {
+        if ev.is_auxiliary() && auxiliary_marking_enabled {
+            if let ChangeEvent::Deleted { frn, .. } = ev {
+                self_frns.remove(frn);
             }
+            return false;
         }
-        // A data/metadata write cannot change the arena's shape: the index
-        // stores names, parent links and mtime only, and mtime isn't
-        // queryable. Reindexing on Modified is what made the daemon rebuild
-        // continuously on an active volume.
-        ChangeEvent::Modified { .. } => false,
-        ChangeEvent::Deleted { frn } => {
-            let was_self = self_frns.remove(frn);
-            !was_self
+        match ev {
+            ChangeEvent::Created { frn, name, .. } | ChangeEvent::Renamed { frn, name, .. } => {
+                if is_own_name(name) {
+                    self_frns.insert(*frn);
+                    false
+                } else {
+                    true
+                }
+            }
+            // A data/metadata write cannot change the arena's shape: the index
+            // stores names, parent links and mtime only, and mtime isn't
+            // queryable. Reindexing on Modified is what made the daemon rebuild
+            // continuously on an active volume.
+            ChangeEvent::Modified { .. } => false,
+            ChangeEvent::Deleted { frn, .. } => {
+                let was_self = self_frns.remove(frn);
+                !was_self
+            }
         }
     };
 
@@ -122,7 +156,7 @@ fn reindex_on_changes(
             continue;
         }
 
-        match build_store(&volume) {
+        match build_store(&volume, auxiliary_marking_enabled) {
             Ok(new_store) => {
                 let len = new_store.archived().len();
                 *store.write().unwrap() = new_store;
