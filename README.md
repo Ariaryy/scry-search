@@ -19,6 +19,16 @@ any client over a local named pipe.
 cargo build --release
 ```
 
+### Building the daemon for release
+
+```
+cargo build --profile daemon-release -p scry-daemon
+```
+
+The `daemon-release` profile adds fat LTO, `panic = "abort"` and symbol
+stripping on top of `release`. Use plain `cargo build --release` for
+development; the profile difference only matters for packaging.
+
 ## Run
 
 ```
