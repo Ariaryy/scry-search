@@ -5,10 +5,18 @@
   map cleanly onto generated fixed-size bindings, and pulling in a binding crate for a dozen
   functions isn't worth it. Follow the same pattern for any new Win32 calls: minimal `extern "system"`
   block, only the constants actually used, `#[repr(C)]` structs matching the real layout.
-- `ArchivedArena` (the rkyv zero-copy view) and `Arena`/`FileRecord` (the builder-side owned types)
-  are different generated types. Anything that needs to work on both (e.g. `is_dir()`) needs an impl
-  on each — see `record.rs`.
-- `Arena` uses a format v5 index (12-byte records, name-sorted, front-coded names) rather than plain `String` fields, reducing snapshot size significantly.
+- `ArchivedArena` (the rkyv zero-copy view) and `Arena` (the builder-side owned type)
+  are different generated types. Anything that needs to work on both (e.g. `is_dir()`,
+  `parent()`, `mtime()`) needs an impl on each — the accessors on `ArchivedArena` read
+  directly from the archived column vectors. `FileRecord` no longer exists; the dual-impl
+  pattern now applies to functions on `ArchivedArena` vs the free functions in `record.rs`.
+- `Arena` uses a format v6 index (three parallel 4-byte columns: `parents` hot,
+  `mtimes` and `sizes` cold; plus name-sorted front-coded names) rather than plain
+  `String` fields or a single interleaved struct. The hot/cold split is load-bearing:
+  `parents` alone in its column gives 16 parent hops per cache line; keeping `mtimes`
+  and `sizes` separate lets them stay paged out between compaction bursts. A future
+  change that folds any cold field back into the hot column must update both this note
+  and the doc comments in `arena.rs`.
 - The `$MFT` parser (`scry-fsevents/src/mft/`) reads a live on-disk structure
   and must treat every length and offset as hostile: checked slicing only, no
   unchecked arithmetic, and an explicit termination guard on every loop driven

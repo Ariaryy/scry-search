@@ -1,28 +1,35 @@
-# Index format v5
+# Index format v6
 
 `scry-core::Arena` (`scry-core/src/arena.rs`):
 
 ```rust
 Arena {
-    format_version: u32,     // = 4
+    format_version: u32,     // = 6
     names: Vec<u8>,          // front-coded name blob
     bucket_offsets: Vec<u32>,// len = num_buckets + 1; last entry == names.len()
-    records: Vec<FileRecord>, // 12 bytes each, in name-sorted order
+    parents: Vec<u32>,       // bit 31 = is_dir; bits 0..30 = parent index (HOT)
+    mtimes: Vec<u32>,        // seconds since 1970-01-01 UTC, clamped to [0, 2^32-1] (COLD)
+    sizes: Vec<u32>,         // logical size in KiB, rounded up, saturating at u32::MAX (COLD)
     trigram_index: Vec<u8>,  // trigram-to-1024-record-block bitmap matrix
-}
-
-FileRecord {
-    parent_and_flags: u32,   // bit 31 = is_dir; bits 0..31 = parent record index
-    mtime_secs: u32,         // seconds since 1970-01-01 UTC, clamped to [0, 2^32-1] (year 2106)
-    size_kib: u32,           // logical size rounded up to KiB, saturating at u32::MAX
 }
 ```
 
-Format v5 is a 12-byte record compact index, name-sorted storage, front-coded name blob,
-and a trigram block filter.
+`parents`, `mtimes`, and `sizes` are index-parallel: entry `i` is described
+by `parents[i]`, `mtimes[i]`, and `sizes[i]`. They are kept separate (rather
+than interleaved into a struct) for a hot/cold split:
+
+- `parents` is the hot column, touched by `full_path` on every displayed
+  result. Packing it alone means a 64-byte cache line holds 16 useful parent
+  hops instead of 5 (as it would interleaved with mtime and size).
+- `mtimes` and `sizes` are cold columns read only by delta metadata lookup
+  and compaction, never on the query path. Kept separate so the OS can evict
+  those pages between compaction bursts.
 
 ## Changelog
 
+- v6 — split the interleaved 12-byte record into three parallel 4-byte columns:
+  `parents` (hot), `mtimes` (cold), `sizes` (cold). No bytes added; same
+  fields, same widths, same semantics.
 - v5 — added KiB-quantised logical file sizes. The raw MFT path populates the
   field; the USN fallback leaves it 0, so 0 means unknown rather than empty.
 - v4 — added the trigram block filter.
@@ -53,7 +60,7 @@ tree order — a child can appear before its parent. Resolution is two passes:
 1. Push every `RawEntry` via the `ArenaBuilder::push(name, mtime, is_dir)`.
 2. Walk again, calling `builder.set_parent(idx, p)`.
 
-Every entry whose parent doesn't resolve is parented to a synthesized volume-root `FileRecord` (e.g. named `C:`).
+Every entry whose parent doesn't resolve is parented to a synthesized volume-root entry (e.g. named `C:`).
 This keeps `full_path()` finite (no cycles) and keeps the drive letter in
 every returned path.
 
