@@ -9,5 +9,6 @@ pub mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    is_structural_reason, ChangeEvent, JournalHandle, WindowsBackend, WindowsBackendError,
+    enumerate_mft_usn, is_structural_reason, ChangeEvent, JournalHandle, WindowsBackend,
+    WindowsBackendError,
 };

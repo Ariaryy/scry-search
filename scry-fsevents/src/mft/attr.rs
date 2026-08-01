@@ -35,21 +35,21 @@ pub fn parse_file_name(attribute: &AttributeRef<'_>) -> Result<FileNameInfo, Mft
         return Err(MftError::Invalid("not a FILE_NAME attribute"));
     }
     let value = resident_value(attribute)?;
-    let parent_frn = read_u64(value, 0)? & 0x0000_ffff_ffff_ffff;
+    let parent_frn = read_u64(value, 0)?;
     let code_units = *value
-        .get(0x48)
+        .get(0x40)
         .ok_or(MftError::Invalid("truncated FILE_NAME length"))? as usize;
     let namespace = *value
-        .get(0x49)
+        .get(0x41)
         .ok_or(MftError::Invalid("truncated FILE_NAME namespace"))?;
     let byte_length = code_units
         .checked_mul(2)
         .ok_or(MftError::Invalid("FILE_NAME length overflow"))?;
-    let end = 0x4ausize
+    let end = 0x42usize
         .checked_add(byte_length)
         .ok_or(MftError::Invalid("FILE_NAME end overflow"))?;
     let name_bytes = value
-        .get(0x4a..end)
+        .get(0x42..end)
         .ok_or(MftError::Invalid("truncated FILE_NAME value"))?;
     let utf16: Vec<u16> = name_bytes
         .chunks_exact(2)
@@ -120,24 +120,24 @@ mod tests {
     #[test]
     fn file_name_parses_unicode_and_code_units() {
         let name: Vec<u16> = "rocket_🚀.txt".encode_utf16().collect();
-        let mut value = vec![0u8; 0x4a + name.len() * 2];
-        value[0..8].copy_from_slice(&0x1234u64.to_le_bytes());
-        value[0x48] = name.len() as u8;
-        value[0x49] = 1;
-        for (slot, unit) in value[0x4a..].chunks_exact_mut(2).zip(name) {
+        let mut value = vec![0u8; 0x42 + name.len() * 2];
+        value[0..8].copy_from_slice(&0x0007_0000_0000_1234u64.to_le_bytes());
+        value[0x40] = name.len() as u8;
+        value[0x41] = 1;
+        for (slot, unit) in value[0x42..].chunks_exact_mut(2).zip(name) {
             slot.copy_from_slice(&unit.to_le_bytes());
         }
         let attribute = resident(FILE_NAME, &value);
         let parsed = parse_file_name(&reference(&attribute)).unwrap();
-        assert_eq!(parsed.parent_frn, 0x1234);
+        assert_eq!(parsed.parent_frn, 0x0007_0000_0000_1234);
         assert_eq!(parsed.name, "rocket_🚀.txt");
         assert_eq!(parsed.namespace, 1);
     }
 
     #[test]
     fn file_name_dos_namespace_is_identified() {
-        let mut value = vec![0u8; 0x4a];
-        value[0x49] = 2;
+        let mut value = vec![0u8; 0x42];
+        value[0x41] = 2;
         let attribute = resident(FILE_NAME, &value);
         assert_eq!(
             parse_file_name(&reference(&attribute)).unwrap().namespace,

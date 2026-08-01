@@ -323,7 +323,7 @@ pub fn mark_handle_as_auxiliary(file: &std::fs::File, volume: &str) -> Result<()
 ///
 /// `sink` receives: FRN, parent FRN, UTF-8 name bytes, is-directory, and the
 /// raw FILETIME mtime.
-fn enumerate_mft_usn(
+pub fn enumerate_mft_usn(
     volume: &str,
     mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
 ) -> Result<(), WindowsBackendError> {

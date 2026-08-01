@@ -57,6 +57,9 @@ pub fn enumerate_mft_raw(
     let mut report = MftEnumReport::default();
     let mut buffer = AlignedBuffer::new(4 * 1024 * 1024, geometry.physical_sector_size)?;
     let mut stream_position = 0u64;
+    let run_count = runs.len();
+    let mut read_elapsed = std::time::Duration::ZERO;
+    let mut parse_elapsed = std::time::Duration::ZERO;
 
     for run in runs {
         let Some(lcn) = run.lcn else {
@@ -79,10 +82,13 @@ pub fn enumerate_mft_raw(
                 break;
             }
             file.seek(std::io::SeekFrom::Start(disk_offset + run_position))?;
+            let read_started = std::time::Instant::now();
             std::io::Read::read_exact(&mut file, &mut buffer.as_mut_slice()[..aligned])?;
+            read_elapsed += read_started.elapsed();
             let logical = (remaining_stream.min(aligned as u64) as usize)
                 / geometry.file_record_size as usize
                 * geometry.file_record_size as usize;
+            let parse_started = std::time::Instant::now();
             for (within_chunk, record_bytes) in buffer.as_mut_slice()[..logical]
                 .chunks_exact_mut(geometry.file_record_size as usize)
                 .enumerate()
@@ -98,13 +104,21 @@ pub fn enumerate_mft_raw(
                 ) {
                     Ok(()) => {}
                     Err(MftError::TornRecord) => report.torn_records_skipped += 1,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        eprintln!(
+                            "scry: raw MFT parse failed at record {stream_record}, \
+                             stream byte {stream_position}, run LCN {lcn}, run byte {run_position}: {error}"
+                        );
+                        return Err(error);
+                    }
                 }
             }
+            parse_elapsed += parse_started.elapsed();
             run_position += aligned as u64;
             stream_position += aligned as u64;
         }
     }
+    eprintln!("scry: raw MFT runs={run_count}, read={read_elapsed:?}, parse={parse_elapsed:?}");
     Ok(report)
 }
 
@@ -227,9 +241,27 @@ fn parse_and_emit(
         return Ok(());
     }
     if record.record_number() as u64 != stream_record {
-        return Err(MftError::Invalid(
-            "FILE record number does not match stream position",
-        ));
+        report.bad_records_skipped += 1;
+        return Ok(());
+    }
+    const DIAGNOSTIC_FRNS: [u64; 3] = [
+        490_610_884_406_673_478,
+        103_864_266_406_235_383,
+        178_455_135_234_566_132,
+    ];
+    if DIAGNOSTIC_FRNS.contains(&record.frn()) {
+        let names = record
+            .attributes()
+            .filter_map(Result::ok)
+            .filter(|attribute| attribute.type_code == FILE_NAME)
+            .filter_map(|attribute| parse_file_name(&attribute).ok())
+            .map(|name| (name.parent_frn, name.namespace, name.name))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "scry: diagnostic frn={} hard_links={} names={names:?}",
+            record.frn(),
+            record.hard_link_count()?
+        );
     }
     let mut selected_name = None;
     let mut fallback_name = None;

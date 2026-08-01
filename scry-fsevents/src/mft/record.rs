@@ -68,6 +68,10 @@ impl<'a> ParsedRecord<'a> {
         self.record_number
     }
 
+    pub fn hard_link_count(&self) -> Result<u16, MftError> {
+        read_u16(self.bytes, 0x12)
+    }
+
     pub fn frn(&self) -> u64 {
         (self.sequence_number as u64) << 48 | self.record_number as u64
     }
