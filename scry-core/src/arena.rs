@@ -435,7 +435,11 @@ impl ArenaBuilder {
 
     fn staged_name(&self, i: u32) -> &[u8] {
         let i = i as usize;
-        let start = if i == 0 { 0 } else { self.name_ends[i - 1] as usize };
+        let start = if i == 0 {
+            0
+        } else {
+            self.name_ends[i - 1] as usize
+        };
         let end = self.name_ends[i] as usize;
         &self.staging_names[start..end]
     }
@@ -678,5 +682,77 @@ mod tests {
             !path.is_empty(),
             "full_path should return something even with a cycle"
         );
+    }
+
+    /// The key equivalence test for the blob-backed staging refactor: building
+    /// the same tree via `push` (str) and via `push_bytes` (raw bytes) must
+    /// produce byte-identical serialized output. That single assertion covers
+    /// sort order, parent remapping, and front-coding all at once.
+    #[test]
+    fn push_bytes_and_push_produce_identical_arenas() {
+        let names: Vec<String> = (0..500)
+            .map(|i| format!("file_{i:04}_{}.dat", i % 7))
+            .collect();
+
+        let mut b1 = ArenaBuilder::default();
+        let root1 = b1.push("C:", 0, true);
+        for name in &names {
+            let idx = b1.push(name, 0, false);
+            b1.set_parent(idx, root1);
+        }
+        let arena1 = b1.build();
+
+        let mut b2 = ArenaBuilder::with_capacity(names.len() + 1, 0);
+        let root2 = b2.push_bytes(b"C:", 0, true);
+        for name in &names {
+            let idx = b2.push_bytes(name.as_bytes(), 0, false);
+            b2.set_parent(idx, root2);
+        }
+        let arena2 = b2.build();
+
+        let bytes1 = rkyv::to_bytes::<_, 1024>(&arena1).unwrap();
+        let bytes2 = rkyv::to_bytes::<_, 1024>(&arena2).unwrap();
+        assert_eq!(
+            bytes1.as_slice(),
+            bytes2.as_slice(),
+            "push and push_bytes must produce byte-identical arenas"
+        );
+    }
+
+    #[test]
+    fn builder_with_blob_staging_matches_string_staging() {
+        // "String staging" here means the pre-refactor semantics: names
+        // pushed one at a time via `push`, compared against a brute-force
+        // sort/front-code done independently over owned `String`s. If the
+        // blob-backed builder drifted from that behaviour, this test would
+        // fail on sort order or front-coding content.
+        let names = [
+            "readme.txt",
+            "Readme.txt",
+            "a",
+            "abc",
+            "abcd",
+            "z_last",
+            "IMG_0001.jpg",
+            "img_0002.jpg",
+            "",
+            "mid",
+        ];
+
+        let arena = simple_arena(&names);
+
+        let mut expected: Vec<&str> = names.to_vec();
+        expected.sort_by(|a, b| ascii::cmp_ci(a.as_bytes(), b.as_bytes()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_staging.rkyv");
+        save(&arena, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+
+        let actual: Vec<String> = (0..archived.len() as u32)
+            .map(|i| archived.name(i))
+            .collect();
+        assert_eq!(actual, expected);
     }
 }

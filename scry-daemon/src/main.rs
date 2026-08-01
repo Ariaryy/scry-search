@@ -351,9 +351,9 @@ mod tests {
 
     fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<ArenaStore> {
         let mut b = Arena::builder();
-        let root = b.push("C:".into(), 0, true);
+        let root = b.push("C:", 0, true);
         for i in 0..n.saturating_sub(1) {
-            let child = b.push(format!("file{i}.txt"), 0, false);
+            let child = b.push(&format!("file{i}.txt"), 0, false);
             b.set_parent(child, root);
         }
         let arena = b.build();
