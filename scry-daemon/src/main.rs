@@ -19,6 +19,7 @@ mod ffi;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use arc_swap::ArcSwap;
+use scry_core::delta::{ApplyOutcome, DeltaEvent};
 use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
 use scry_core::{ArenaStore, IndexView, Query};
 use std::sync::Arc;
@@ -297,21 +298,46 @@ fn reindex_on_changes(
             eprintln!("scryd: journal watcher channel closed, live updates stopped");
             return;
         };
-        let mut triggered = is_real_change(&first, &mut filter);
+        let mut batch = Vec::new();
+        if is_real_change(&first, &mut filter) {
+            batch.push(first);
+        }
 
         // ...then absorb a short burst of further changes before paying for
         // a full reindex, so e.g. extracting a zip doesn't trigger thousands
         // of back-to-back rebuilds.
         while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            triggered |= is_real_change(&ev, &mut filter);
+            if is_real_change(&ev, &mut filter) {
+                batch.push(ev);
+            }
         }
 
         // The channel filled up while we were mid-reindex; a structural
         // event may have been dropped, so force a resync regardless of what
         // the drained events looked like.
-        triggered |= watcher.take_overflow();
+        let mut needs_full_reindex = watcher.take_overflow();
 
-        if !triggered {
+        if batch.is_empty() && !needs_full_reindex {
+            continue;
+        }
+
+        let view = store.load_full();
+        let mut delta = (*view.delta).clone();
+        for event in &batch {
+            let Some(event) = delta_event(event) else {
+                continue;
+            };
+            if delta.apply(&event, &view.base) == ApplyOutcome::NeedsFullReindex {
+                needs_full_reindex = true;
+                break;
+            }
+        }
+
+        if !needs_full_reindex {
+            store.store(Arc::new(IndexView {
+                base: view.base.clone(),
+                delta: Arc::new(delta),
+            }));
             continue;
         }
 
@@ -323,6 +349,38 @@ fn reindex_on_changes(
             }
             Err(e) => eprintln!("scryd: reindex failed: {e}"),
         }
+    }
+}
+
+fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
+    use scry_fsevents::ChangeEvent;
+
+    match event {
+        ChangeEvent::Created {
+            frn,
+            parent_frn,
+            name,
+            is_dir,
+            ..
+        } => Some(DeltaEvent::Created {
+            frn: *frn,
+            parent_frn: *parent_frn,
+            name: name.clone(),
+            is_dir: *is_dir,
+            mtime_secs: 0,
+        }),
+        ChangeEvent::Deleted { frn, .. } => Some(DeltaEvent::Deleted { frn: *frn }),
+        ChangeEvent::Renamed {
+            frn,
+            parent_frn,
+            name,
+            ..
+        } => Some(DeltaEvent::Renamed {
+            frn: *frn,
+            parent_frn: *parent_frn,
+            name: name.clone(),
+        }),
+        ChangeEvent::Modified { .. } => None,
     }
 }
 
