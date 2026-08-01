@@ -19,10 +19,18 @@ pub struct FrnMap {
 
 impl FrnMap {
     pub fn save(path: &Path, entries: &mut [FrnEntry]) -> io::Result<()> {
+        Self::save_with(path, entries, |_| {})
+    }
+
+    pub fn save_with<F>(path: &Path, entries: &mut [FrnEntry], on_create: F) -> io::Result<()>
+    where
+        F: FnOnce(&File),
+    {
         entries.sort_unstable_by_key(|entry| entry.frn);
         let tmp = path.with_extension("frn.tmp");
         {
             let mut file = File::create(&tmp)?;
+            on_create(&file);
             // SAFETY: FrnEntry is repr(C), contains no padding with unspecified
             // contents, and the slice remains alive for the duration of write_all.
             let bytes = unsafe {

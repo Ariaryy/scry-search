@@ -1,4 +1,5 @@
 use crate::ascii;
+use crate::frnmap::FrnEntry;
 use crate::record::{FileRecord, BUCKET_SIZE, PARENT_NONE};
 use crate::trigram::{for_each_trigram, num_blocks, row_bytes, TRIGRAM_BLOCK, TRIGRAM_ROWS};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -474,6 +475,7 @@ pub struct ArenaBuilder {
     parents: Vec<u32>,
     mtimes: Vec<u32>,
     dirs: Vec<bool>,
+    frns: Vec<Option<u64>>,
 }
 
 impl ArenaBuilder {
@@ -487,6 +489,7 @@ impl ArenaBuilder {
             parents: Vec::with_capacity(entries),
             mtimes: Vec::with_capacity(entries),
             dirs: Vec::with_capacity(entries),
+            frns: Vec::with_capacity(entries),
         }
     }
 
@@ -495,12 +498,33 @@ impl ArenaBuilder {
     /// calls before `build()` — `build()` reorders into name order and
     /// rewrites all parent links).
     pub fn push_bytes(&mut self, name: &[u8], mtime_secs: u32, is_dir: bool) -> u32 {
+        self.push_bytes_internal(name, mtime_secs, is_dir, None)
+    }
+
+    pub fn push_bytes_with_frn(
+        &mut self,
+        name: &[u8],
+        mtime_secs: u32,
+        is_dir: bool,
+        frn: u64,
+    ) -> u32 {
+        self.push_bytes_internal(name, mtime_secs, is_dir, Some(frn))
+    }
+
+    fn push_bytes_internal(
+        &mut self,
+        name: &[u8],
+        mtime_secs: u32,
+        is_dir: bool,
+        frn: Option<u64>,
+    ) -> u32 {
         let idx = self.name_ends.len() as u32;
         self.staging_names.extend_from_slice(name);
         self.name_ends.push(self.staging_names.len() as u32);
         self.parents.push(PARENT_NONE);
         self.mtimes.push(mtime_secs);
         self.dirs.push(is_dir);
+        self.frns.push(frn);
         idx
     }
 
@@ -534,7 +558,7 @@ impl ArenaBuilder {
     }
 
     /// Finalize: sort by name, remap parents, front-code names.
-    pub fn build(mut self) -> Arena {
+    pub fn build(mut self) -> (Arena, Vec<FrnEntry>) {
         let n = self.name_ends.len();
         assert!(
             n < PARENT_NONE as usize,
@@ -572,6 +596,17 @@ impl ArenaBuilder {
                 )
             })
             .collect();
+        let frn_entries = order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &original)| {
+                self.frns[original as usize].map(|frn| FrnEntry {
+                    frn,
+                    index: index as u32,
+                    _pad: 0,
+                })
+            })
+            .collect();
 
         // 4. Front-code names and build the block filter in final order.
         let name_refs: Vec<&[u8]> = order.iter().map(|&i| self.staged_name(i)).collect();
@@ -600,13 +635,16 @@ impl ArenaBuilder {
         drop(std::mem::take(&mut self.staging_names));
         drop(std::mem::take(&mut self.name_ends));
 
-        Arena {
-            format_version: crate::record::FORMAT_VERSION,
-            names,
-            bucket_offsets,
-            records,
-            trigram_index,
-        }
+        (
+            Arena {
+                format_version: crate::record::FORMAT_VERSION,
+                names,
+                bucket_offsets,
+                records,
+                trigram_index,
+            },
+            frn_entries,
+        )
     }
 }
 
@@ -621,7 +659,7 @@ mod tests {
         for &name in names {
             b.push(name, 0, false);
         }
-        b.build()
+        b.build().0
     }
 
     #[test]
@@ -650,7 +688,7 @@ mod tests {
         for name in &raw {
             b.push(name, 0, false);
         }
-        let arena = b.build();
+        let arena = b.build().0;
 
         // Reconstruct what the sorted order should be.
         let mut expected: Vec<String> = raw.clone();
@@ -725,7 +763,7 @@ mod tests {
         for n in &names {
             b.push(n, 0, false);
         }
-        let arena = b.build();
+        let arena = b.build().0;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rkyv");
@@ -820,7 +858,7 @@ mod tests {
             let idx = b1.push(name, 0, false);
             b1.set_parent(idx, root1);
         }
-        let arena1 = b1.build();
+        let arena1 = b1.build().0;
 
         let mut b2 = ArenaBuilder::with_capacity(names.len() + 1, 0);
         let root2 = b2.push_bytes(b"C:", 0, true);
@@ -828,7 +866,7 @@ mod tests {
             let idx = b2.push_bytes(name.as_bytes(), 0, false);
             b2.set_parent(idx, root2);
         }
-        let arena2 = b2.build();
+        let arena2 = b2.build().0;
 
         let bytes1 = rkyv::to_bytes::<_, 1024>(&arena1).unwrap();
         let bytes2 = rkyv::to_bytes::<_, 1024>(&arena2).unwrap();
@@ -881,7 +919,7 @@ mod tests {
         for i in 0..count {
             builder.push(&format!("family_{:02}_file_{i:05}.dat", i % 37), 0, false);
         }
-        builder.build()
+        builder.build().0
     }
 
     #[test]
@@ -985,5 +1023,25 @@ mod tests {
             std::ops::ControlFlow::Continue(())
         });
         assert_eq!(mid, full[5..45]);
+    }
+
+    #[test]
+    fn frn_map_points_at_correct_records() {
+        let mut builder = ArenaBuilder::default();
+        let mut expected = Vec::new();
+        for i in 0..1_000u64 {
+            let name = format!("name_{:04}", 999 - i);
+            builder.push_bytes_with_frn(name.as_bytes(), 0, false, 10_000 + i * 17);
+            expected.push((10_000 + i * 17, name));
+        }
+        let (arena, mut entries) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped.rkyv");
+        crate::store::save_with_sidecar(&arena, &mut entries, &path, |_| {}, |_| {}).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let map = store.frn_map.as_ref().unwrap();
+        for (frn, name) in expected {
+            assert_eq!(store.archived().name(map.lookup(frn).unwrap()), name);
+        }
     }
 }

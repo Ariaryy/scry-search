@@ -5,7 +5,7 @@ fn bench_size() {
     for i in 0..1_000_000 {
         b.push(&format!("filename_somewhat_long_test_{i}.txt"), 0, false);
     }
-    let arena = b.build();
+    let arena = b.build().0;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench.rkyv");
     scry_core::store::save(&arena, &path).unwrap();

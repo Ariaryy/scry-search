@@ -7,13 +7,14 @@
 #[test]
 fn enumerate_c_volume_or_report_why_not() {
     match scry_fsevents::WindowsBackend::bulk_index_volume("C:") {
-        Ok(arena) => {
+        Ok((arena, frns)) => {
             assert!(
                 arena.len() > 1000,
                 "expected a real NTFS volume to have >1000 entries, got {}",
                 arena.len()
             );
             println!("indexed {} entries from C:", arena.len());
+            assert_eq!(arena.len() - 1, frns.len());
         }
         Err(e) => {
             eprintln!("bulk_index_volume(\"C:\") failed (expected without elevation): {e}");

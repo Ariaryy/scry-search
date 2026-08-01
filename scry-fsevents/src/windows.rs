@@ -92,7 +92,9 @@ impl WindowsBackend {
     /// Bulk-enumerate a volume (e.g. `"C:"`) directly from its MFT via the USN
     /// journal's enumeration ioctl, bypassing per-file stat()/directory walks.
     /// Requires the process to hold `SeBackupPrivilege` (i.e. run elevated).
-    pub fn bulk_index_volume(volume: &str) -> Result<scry_core::Arena, WindowsBackendError> {
+    pub fn bulk_index_volume(
+        volume: &str,
+    ) -> Result<(scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>), WindowsBackendError> {
         // Arbitrary initial guess (200k entries / 4 MB of names) that avoids
         // the first several reallocations of the staging blob without
         // over-committing on small volumes.
@@ -108,7 +110,7 @@ impl WindowsBackend {
         let mut parent_frns: Vec<u64> = Vec::new();
 
         enumerate_mft(volume, |frn, parent_frn, name, is_dir, mtime| {
-            let idx = builder.push_bytes(name, filetime_to_secs(mtime), is_dir);
+            let idx = builder.push_bytes_with_frn(name, filetime_to_secs(mtime), is_dir, frn);
             frn_table.push((frn, idx));
             parent_frns.push(parent_frn);
         })?;

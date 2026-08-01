@@ -13,7 +13,7 @@ fn sample_arena() -> Arena {
     b.set_parent(r2, docs);
     let readme = b.push("readme.txt", 0, false);
     b.set_parent(readme, root);
-    b.build()
+    b.build().0
 }
 
 fn open_sample_store(dir: &tempfile::TempDir) -> ArenaStore {
@@ -94,7 +94,7 @@ fn generated_arena(count: usize) -> Arena {
         };
         builder.push(&name, 0, false);
     }
-    builder.build()
+    builder.build().0
 }
 
 #[test]

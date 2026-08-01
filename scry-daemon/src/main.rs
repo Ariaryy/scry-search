@@ -180,17 +180,18 @@ fn configure_background_thread_qos() {
 }
 
 fn build_store(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<ArenaStore>> {
-    let arena = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
+    let (arena, mut frns) = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
         .map_err(|e| anyhow::anyhow!("indexing {volume} failed: {e}"))?;
     let path = snapshot_path(volume);
     let volume = volume.to_string();
-    scry_core::store::save_with(&arena, &path, |f| {
+    let mark = |f: &std::fs::File| {
         if auxiliary_marking_enabled {
             if let Err(e) = scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(f, &volume) {
-                eprintln!("scryd: could not mark snapshot handle as auxiliary ({e})");
+                eprintln!("scryd: could not mark index handle as auxiliary ({e})");
             }
         }
-    })?;
+    };
+    scry_core::store::save_with_sidecar(&arena, &mut frns, &path, mark, mark)?;
     Ok(Arc::new(ArenaStore::open(&path)?))
 }
 
@@ -206,6 +207,8 @@ fn snapshot_path(volume: &str) -> std::path::PathBuf {
 struct SelfWriteFilter {
     snapshot_name: String,
     snapshot_tmp_name: String,
+    sidecar_name: String,
+    sidecar_tmp_name: String,
     self_frns: std::collections::HashSet<u64>,
     use_auxiliary: bool,
 }
@@ -214,16 +217,31 @@ impl SelfWriteFilter {
     fn new(volume: &str, use_auxiliary: bool) -> Self {
         let path = snapshot_path(volume);
         let tmp_path = path.with_extension("tmp");
+        let sidecar_path = path.with_extension("frn");
+        let sidecar_tmp_path = path.with_extension("frn.tmp");
         SelfWriteFilter {
             snapshot_name: path.file_name().unwrap().to_string_lossy().into_owned(),
             snapshot_tmp_name: tmp_path.file_name().unwrap().to_string_lossy().into_owned(),
+            sidecar_name: sidecar_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            sidecar_tmp_name: sidecar_tmp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             self_frns: std::collections::HashSet::new(),
             use_auxiliary,
         }
     }
 
     fn is_own_name(&self, name: &str) -> bool {
-        name == self.snapshot_name || name == self.snapshot_tmp_name
+        name == self.snapshot_name
+            || name == self.snapshot_tmp_name
+            || name == self.sidecar_name
+            || name == self.sidecar_tmp_name
     }
 }
 
@@ -356,7 +374,7 @@ mod tests {
             let child = b.push(&format!("file{i}.txt"), 0, false);
             b.set_parent(child, root);
         }
-        let arena = b.build();
+        let arena = b.build().0;
         let path = dir.path().join(format!("index-{n}.rkyv"));
         save(&arena, &path).unwrap();
         Arc::new(ArenaStore::open(&path).unwrap())

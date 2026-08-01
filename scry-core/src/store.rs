@@ -1,4 +1,5 @@
 use crate::arena::{ArchivedArena, Arena};
+use crate::frnmap::{FrnEntry, FrnMap};
 use crate::record::FORMAT_VERSION;
 use memmap2::Mmap;
 use std::fs::File;
@@ -43,6 +44,22 @@ where
     Ok(())
 }
 
+pub fn save_with_sidecar<FA, FF>(
+    arena: &Arena,
+    frns: &mut [FrnEntry],
+    path: &Path,
+    on_arena_create: FA,
+    on_sidecar_create: FF,
+) -> Result<(), StoreError>
+where
+    FA: FnOnce(&File),
+    FF: FnOnce(&File),
+{
+    save_with(arena, path, on_arena_create)?;
+    FrnMap::save_with(&path.with_extension("frn"), frns, on_sidecar_create)?;
+    Ok(())
+}
+
 /// An mmap-backed, zero-copy view of a persisted Arena. Opening this does not
 /// deserialize anything — the OS page cache backs the memory, and `archived()`
 /// just casts bytes.
@@ -55,6 +72,7 @@ where
 /// layout did, despite this comment previously claiming otherwise.
 pub struct ArenaStore {
     mmap: Mmap,
+    pub frn_map: Option<FrnMap>,
 }
 
 impl ArenaStore {
@@ -71,7 +89,8 @@ impl ArenaStore {
                 expected: FORMAT_VERSION,
             });
         }
-        Ok(Self { mmap })
+        let frn_map = FrnMap::open(&path.with_extension("frn")).ok();
+        Ok(Self { mmap, frn_map })
     }
 
     #[inline]
@@ -91,7 +110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut b = crate::arena::ArenaBuilder::default();
         b.push("test", 0, false);
-        let arena = b.build();
+        let arena = b.build().0;
         let path = dir.path().join("versioned.rkyv");
         save(&arena, &path).unwrap();
 
@@ -111,5 +130,16 @@ mod tests {
             result.is_err(),
             "expected error opening invalid archive, got Ok"
         );
+    }
+
+    #[test]
+    fn store_opens_without_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone.rkyv");
+        let mut builder = crate::ArenaBuilder::default();
+        builder.push("file", 0, false);
+        save(&builder.build().0, &path).unwrap();
+        let store = ArenaStore::open(&path).unwrap();
+        assert!(store.frn_map.is_none());
     }
 }
