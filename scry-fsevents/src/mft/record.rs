@@ -267,4 +267,59 @@ mod tests {
         record[0x14..0x16].copy_from_slice(&0x500u16.to_le_bytes());
         assert!(ParsedRecord::parse(&mut record, 512).is_err());
     }
+
+    #[test]
+    fn parser_never_panics_on_mutated_records() {
+        let original = synthetic_record();
+        for seed in 0..200_000u32 {
+            let mut record = original.clone();
+            let mut state = seed.wrapping_add(1);
+            for _ in 0..6 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let position = state as usize % record.len();
+                record[position] ^= 1 << ((state >> 16) & 7);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(Some(parsed)) = ParsedRecord::parse(&mut record, 512) {
+                    for attribute in parsed.attributes() {
+                        if attribute.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }));
+            assert!(result.is_ok(), "parser panicked for mutation seed {seed}");
+        }
+
+        let adversarial = [
+            (4usize, 0xffu8), // USA offset/count corruption
+            (6, 0xff),
+            (0x14, 0xff), // first attribute beyond the record
+            (0x3c, 0),    // zero attribute length
+            (0x38, 0x30), // FILE_NAME type with truncated value
+        ];
+        for (position, value) in adversarial {
+            let mut record = original.clone();
+            record[position] = value;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(Some(parsed)) = ParsedRecord::parse(&mut record, 512) {
+                    let _ = parsed.attributes().collect::<Vec<_>>();
+                }
+            }));
+            assert!(
+                result.is_ok(),
+                "parser panicked for adversarial byte {position:#x}"
+            );
+        }
+
+        for runlist in [
+            &[0x88, 0][..],
+            &[0x11][..],
+            &[0x10, 1, 0][..],
+            &[0x91, 1, 0][..],
+        ] {
+            let result = std::panic::catch_unwind(|| super::super::runlist::decode_runs(runlist));
+            assert!(result.is_ok());
+        }
+    }
 }
