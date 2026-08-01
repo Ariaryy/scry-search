@@ -20,7 +20,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use arc_swap::ArcSwap;
 use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
-use scry_core::{ArenaStore, Query};
+use scry_core::{ArenaStore, IndexView, Query};
 use std::sync::Arc;
 
 /// The live index, published to query threads by atomic pointer swap.
@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// reindex never blocks a query — an in-flight reader keeps its `Arc` alive
 /// and continues to see a consistent (if momentarily stale) index while the
 /// swap happens underneath it.
-type SharedStore = Arc<ArcSwap<ArenaStore>>;
+type SharedStore = Arc<ArcSwap<IndexView>>;
 
 fn main() -> anyhow::Result<()> {
     // Return freed spans to the OS after 1s of idleness rather than mimalloc's
@@ -63,8 +63,8 @@ fn main() -> anyhow::Result<()> {
         };
 
     eprintln!("scryd: indexing {volume}...");
-    let initial = build_store(&volume, auxiliary_marking_enabled)?;
-    eprintln!("scryd: indexed {} entries", initial.archived().len());
+    let initial = build_view(&volume, auxiliary_marking_enabled)?;
+    eprintln!("scryd: indexed {} entries", initial.len());
     let store: SharedStore = Arc::new(ArcSwap::from(initial));
 
     {
@@ -179,7 +179,7 @@ fn configure_background_thread_qos() {
     }
 }
 
-fn build_store(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<ArenaStore>> {
+fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<IndexView>> {
     let (arena, mut frns) = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
         .map_err(|e| anyhow::anyhow!("indexing {volume} failed: {e}"))?;
     let path = snapshot_path(volume);
@@ -192,7 +192,8 @@ fn build_store(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<
         }
     };
     scry_core::store::save_with_sidecar(&arena, &mut frns, &path, mark, mark)?;
-    Ok(Arc::new(ArenaStore::open(&path)?))
+    let base = Arc::new(ArenaStore::open(&path)?);
+    Ok(Arc::new(IndexView::new(base)))
 }
 
 fn snapshot_path(volume: &str) -> std::path::PathBuf {
@@ -314,10 +315,10 @@ fn reindex_on_changes(
             continue;
         }
 
-        match build_store(&volume, auxiliary_marking_enabled) {
-            Ok(new_store) => {
-                let len = new_store.archived().len();
-                store.store(new_store);
+        match build_view(&volume, auxiliary_marking_enabled) {
+            Ok(new_view) => {
+                let len = new_view.len();
+                store.store(new_view);
                 eprintln!("scryd: reindexed {volume} ({len} entries)");
             }
             Err(e) => eprintln!("scryd: reindex failed: {e}"),
@@ -338,24 +339,12 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
         // `load_full` clones the Arc, keeping this index alive for the whole
         // query even if the reindex thread swaps in a new one mid-search.
         let snapshot = store.load_full();
-        let archived = snapshot.archived();
         let query = match req.kind {
             QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
             QueryKind::Substring => Query::Substring(req.pattern.clone()),
             QueryKind::Wildcard => Query::wildcard(&req.pattern),
         };
-        let hits = scry_core::query::search(archived, &query, req.limit as usize);
-        let entries: Vec<ResultEntry> = hits
-            .iter()
-            .map(|&idx| {
-                let rec = &archived.records[idx as usize];
-                ResultEntry {
-                    path: archived.full_path(idx, '\\'),
-                    size: 0, // format v2 drops the per-record size field; see docs/index-format.md
-                    is_dir: rec.is_dir(),
-                }
-            })
-            .collect();
+        let entries: Vec<ResultEntry> = snapshot.search(&query, req.limit as usize);
 
         pipe.write_frame(&encode_results(&entries))?;
     }

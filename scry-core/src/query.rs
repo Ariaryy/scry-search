@@ -35,7 +35,7 @@ impl Query {
 /// Search results are returned as arena indices — callers reconstruct paths
 /// lazily via `ArchivedArena::full_path`, and only for the slice they actually
 /// send over IPC (streaming, not materializing the whole result set).
-pub fn search(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
+pub(crate) fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
     match query {
         Query::Prefix(prefix) => {
             let range = arena.prefix_range(prefix);

@@ -1,5 +1,5 @@
 use crate::arena::Arena;
-use crate::query::{search, Query};
+use crate::query::{search_base, Query};
 use crate::store::{save, ArenaStore};
 
 fn sample_arena() -> Arena {
@@ -27,7 +27,7 @@ fn open_sample_store(dir: &tempfile::TempDir) -> ArenaStore {
 fn prefix_search_finds_no_match_for_unknown_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let store = open_sample_store(&dir);
-    let hits = search(store.archived(), &Query::Prefix("nonsense".into()), 10);
+    let hits = search_base(store.archived(), &Query::Prefix("nonsense".into()), 10);
     assert!(hits.is_empty());
 }
 
@@ -42,7 +42,7 @@ fn round_trip_through_mmap_store_preserves_data() {
     let archived = store.archived();
     assert_eq!(archived.len(), 5);
 
-    let hits = search(archived, &Query::Prefix("report".into()), 10);
+    let hits = search_base(archived, &Query::Prefix("report".into()), 10);
     assert_eq!(hits.len(), 2);
     let mut names: Vec<String> = hits.iter().map(|&i| archived.name(i)).collect();
     names.sort();
@@ -63,10 +63,10 @@ fn wildcard_query_matches_extension() {
     let store = ArenaStore::open(&path).unwrap();
     let archived = store.archived();
 
-    let hits = search(archived, &Query::wildcard("*.docx"), 10);
+    let hits = search_base(archived, &Query::wildcard("*.docx"), 10);
     assert_eq!(hits.len(), 2);
 
-    let hits = search(archived, &Query::wildcard("readme.*"), 10);
+    let hits = search_base(archived, &Query::wildcard("readme.*"), 10);
     assert_eq!(hits.len(), 1);
 }
 
@@ -79,7 +79,7 @@ fn substring_query_is_case_insensitive() {
     let store = ArenaStore::open(&path).unwrap();
     let archived = store.archived();
 
-    let hits = search(archived, &Query::Substring("FINAL".into()), 10);
+    let hits = search_base(archived, &Query::Substring("FINAL".into()), 10);
     assert_eq!(hits.len(), 1);
 }
 
@@ -112,7 +112,7 @@ fn substring_results_match_brute_force_and_preserve_limits() {
         let length = 1 + sample as usize % 8;
         let start = sample as usize % (bytes.len() - length + 1);
         let needle = String::from_utf8(bytes[start..start + length].to_vec()).unwrap();
-        let filtered = search(archived, &Query::Substring(needle.clone()), usize::MAX);
+        let filtered = search_base(archived, &Query::Substring(needle.clone()), usize::MAX);
         let needle_lower = needle.to_ascii_lowercase();
         let mut brute = Vec::new();
         archived.for_each_name(|idx, candidate| {
@@ -124,7 +124,7 @@ fn substring_results_match_brute_force_and_preserve_limits() {
         assert_eq!(filtered, brute, "needle {needle:?}");
     }
 
-    let limited = search(archived, &Query::Substring("node".into()), 17);
+    let limited = search_base(archived, &Query::Substring("node".into()), 17);
     assert_eq!(limited.len(), 17);
     assert!(limited.windows(2).all(|pair| pair[0] < pair[1]));
 }
@@ -148,7 +148,7 @@ fn bench_substring_filtered_vs_scan() {
 
     let started = Instant::now();
     for needle in &needles {
-        let _ = search(archived, &Query::Substring(needle.clone()), usize::MAX);
+        let _ = search_base(archived, &Query::Substring(needle.clone()), usize::MAX);
     }
     let filtered = started.elapsed();
 

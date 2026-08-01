@@ -7,6 +7,7 @@ pub mod query;
 pub mod record;
 pub mod store;
 pub mod trigram;
+pub mod view;
 
 #[cfg(test)]
 mod tests;
@@ -19,3 +20,4 @@ pub use record::{
     PARENT_NONE,
 };
 pub use store::{ArenaStore, StoreError};
+pub use view::IndexView;
