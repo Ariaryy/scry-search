@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod ascii;
+pub mod bitvec;
 pub mod delta;
 pub mod frnmap;
 mod literals;
