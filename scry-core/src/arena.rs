@@ -1,15 +1,26 @@
 use crate::ascii;
 use crate::frnmap::FrnEntry;
-use crate::record::{FileRecord, BUCKET_SIZE, PARENT_NONE};
+use crate::record::{bytes_to_size_kib, pack_parent, unpack_parent, word_is_dir, BUCKET_SIZE, PARENT_NONE};
 use crate::trigram::{for_each_trigram, num_blocks, row_bytes, TRIGRAM_BLOCK, TRIGRAM_ROWS};
 use rkyv::{Archive, Deserialize, Serialize};
 
-/// The full index: records in name-sorted order, names front-coded in a
+/// The full index: entries in name-sorted order, names front-coded in a
 /// separate blob, version-stamped for safe mmap reuse across daemon upgrades.
 ///
-/// Three arrays, all plain PODs — no String, no relative pointer — so rkyv's
+/// Five arrays, all plain PODs — no String, no relative pointer — so rkyv's
 /// bytecheck performs a handful of bounds checks rather than chasing a pointer
 /// and UTF-8-validating a name for every one of a million records.
+///
+/// The hot/cold split is deliberate and load-bearing:
+/// - `parents` is touched by `full_path` on every displayed result. Packing it
+///   alone means a 64-byte cache line holds 16 useful hops instead of 5 (as
+///   it would interleaved with mtime and size).
+/// - `mtimes` and `sizes` are read only during delta metadata lookup and
+///   compaction, never on the query path. Kept in their own arrays so the OS
+///   can evict those pages between compaction bursts.
+/// These arrays are index-parallel: `parents[i]`, `mtimes[i]`, and `sizes[i]`
+/// all describe the same entry. A future change that pushes to one without
+/// the others silently corrupts the index.
 #[derive(Archive, Serialize, Deserialize, Debug)]
 #[archive(check_bytes)]
 pub struct Arena {
@@ -17,13 +28,23 @@ pub struct Arena {
     /// stale snapshots before any other field is read.
     pub format_version: u32,
     /// Front-coded name blob. Names are stored in name-sorted order (matching
-    /// `records`). Decode via `bucket_offsets` + the LEB128 encoding below.
+    /// `parents`). Decode via `bucket_offsets` + the LEB128 encoding below.
     pub names: Vec<u8>,
     /// `bucket_offsets[b]` is the byte offset of bucket `b` in `names`.
     /// `bucket_offsets[num_buckets]` == `names.len()` (sentinel).
     pub bucket_offsets: Vec<u32>,
-    /// One `FileRecord` per entry, in name-sorted order. 8 bytes each.
-    pub records: Vec<FileRecord>,
+    /// Packed parent index and directory flag, one per entry, name-sorted.
+    /// Hot: walked by `full_path` on every displayed result.
+    /// Bit 31 = is_dir flag; bits 0..30 = parent record index.
+    pub parents: Vec<u32>,
+    /// Seconds since 1970-01-01 UTC, one per entry, name-sorted.
+    /// Cold: read only by delta metadata lookup and compaction, never by a
+    /// query. Kept out of `parents` so it can stay paged out between bursts.
+    pub mtimes: Vec<u32>,
+    /// File size in KiB, rounded up and saturating at u32::MAX.
+    /// Cold: same eviction rationale as `mtimes`. 0 means unknown (USN path),
+    /// not empty — see the `size` limitation note in CLAUDE.md.
+    pub sizes: Vec<u32>,
     /// Trigram row matrix; each row has one LSB-first bit per 1024 records.
     pub trigram_index: Vec<u8>,
 }
@@ -34,11 +55,11 @@ impl Arena {
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.parents.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.parents.is_empty()
     }
 }
 
@@ -130,15 +151,40 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 
 impl ArchivedArena {
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.parents.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.parents.is_empty()
     }
 
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Parent record index for entry `idx`. Returns `PARENT_NONE` for roots.
+    #[inline]
+    pub fn parent(&self, idx: u32) -> u32 {
+        unpack_parent(self.parents[idx as usize])
+    }
+
+    /// Whether entry `idx` is a directory.
+    #[inline]
+    pub fn is_dir(&self, idx: u32) -> bool {
+        word_is_dir(self.parents[idx as usize])
+    }
+
+    /// Modification time for entry `idx`, seconds since 1970-01-01 UTC.
+    #[inline]
+    pub fn mtime(&self, idx: u32) -> u32 {
+        self.mtimes[idx as usize]
+    }
+
+    /// File size for entry `idx`, in bytes (decoded from KiB column).
+    /// Returns 0 when size is unknown (USN fallback path).
+    #[inline]
+    pub fn size_bytes(&self, idx: u32) -> u64 {
+        self.sizes[idx as usize] as u64 * 1024
     }
 
     /// Decode the name of record `idx` into `out`, clearing it first.
@@ -188,7 +234,7 @@ impl ArchivedArena {
     /// Decodes each bucket sequentially — cache-friendly, allocation-free (one
     /// scratch `Vec<u8>` reused across the whole scan).
     pub fn for_each_name(&self, mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>) {
-        let n = self.records.len();
+        let n = self.parents.len();
         let blob: &[u8] = &self.names;
         let offsets: &[u32] = &self.bucket_offsets;
         let num_buckets = offsets.len().saturating_sub(1);
@@ -238,7 +284,7 @@ impl ArchivedArena {
         range: std::ops::Range<u32>,
         mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
     ) {
-        let end = range.end.min(self.records.len() as u32);
+        let end = range.end.min(self.parents.len() as u32);
         if range.start >= end {
             return;
         }
@@ -247,7 +293,7 @@ impl ArchivedArena {
         let mut name = Vec::new();
         'outer: for bucket in first_bucket..=last_bucket {
             let bucket_start = bucket * BUCKET_SIZE;
-            let bucket_end = (bucket_start + BUCKET_SIZE).min(self.records.len());
+            let bucket_end = (bucket_start + BUCKET_SIZE).min(self.parents.len());
             let blob_start = self.bucket_offsets[bucket] as usize;
             let blob_end = self.bucket_offsets[bucket + 1] as usize;
             let blob = &self.names.as_slice()[blob_start..blob_end];
@@ -279,7 +325,7 @@ impl ArchivedArena {
         if needle_lower.len() < 3 || self.trigram_index.is_empty() {
             return None;
         }
-        let blocks = num_blocks(self.records.len());
+        let blocks = num_blocks(self.parents.len());
         let bytes = row_bytes(blocks);
         let mut hashes = Vec::new();
         for_each_trigram(needle_lower, |hash| hashes.push(hash as usize));
@@ -311,7 +357,9 @@ impl ArchivedArena {
         for _ in 0..512 {
             self.name_into(idx, &mut name_buf);
             parts.push(name_buf.clone());
-            let parent = self.records[idx as usize].parent();
+            // `self.parent(idx)` reads only from the hot `parents` column;
+            // mtime and size stay evicted.
+            let parent = self.parent(idx);
             if parent == PARENT_NONE {
                 break;
             }
@@ -330,7 +378,7 @@ impl ArchivedArena {
     /// with `prefix` (ASCII-case-insensitive).
     pub fn prefix_range(&self, prefix: &str) -> std::ops::Range<u32> {
         let prefix_lower: Vec<u8> = prefix.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let n = self.records.len() as u32;
+        let n = self.parents.len() as u32;
 
         if prefix_lower.is_empty() {
             return 0..n;
@@ -593,24 +641,21 @@ impl ArenaBuilder {
             rank[orig as usize] = j as u32;
         }
 
-        // 3. Build records in sorted order with remapped parents.
-        let records: Vec<FileRecord> = order
-            .iter()
-            .map(|&orig| {
-                let orig_parent = self.parents[orig as usize];
-                let new_parent = if orig_parent == PARENT_NONE {
-                    PARENT_NONE
-                } else {
-                    rank[orig_parent as usize]
-                };
-                FileRecord::new_with_size(
-                    new_parent,
-                    self.dirs[orig as usize],
-                    self.mtimes[orig as usize],
-                    self.sizes[orig as usize],
-                )
-            })
-            .collect();
+        // 3. Build sorted columns with remapped parents.
+        let mut out_parents: Vec<u32> = Vec::with_capacity(n);
+        let mut out_mtimes: Vec<u32> = Vec::with_capacity(n);
+        let mut out_sizes: Vec<u32> = Vec::with_capacity(n);
+        for &orig in &order {
+            let orig_parent = self.parents[orig as usize];
+            let new_parent = if orig_parent == PARENT_NONE {
+                PARENT_NONE
+            } else {
+                rank[orig_parent as usize]
+            };
+            out_parents.push(pack_parent(new_parent, self.dirs[orig as usize]));
+            out_mtimes.push(self.mtimes[orig as usize]);
+            out_sizes.push(bytes_to_size_kib(self.sizes[orig as usize]));
+        }
         let frn_entries = order
             .iter()
             .enumerate()
@@ -655,7 +700,9 @@ impl ArenaBuilder {
                 format_version: crate::record::FORMAT_VERSION,
                 names,
                 bucket_offsets,
-                records,
+                parents: out_parents,
+                mtimes: out_mtimes,
+                sizes: out_sizes,
                 trigram_index,
             },
             frn_entries,
@@ -666,7 +713,7 @@ impl ArenaBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::FileRecord;
+    use crate::record::PARENT_NONE;
     use crate::store::save;
 
     fn simple_arena(names: &[&str]) -> Arena {
@@ -820,26 +867,23 @@ mod tests {
     #[test]
     fn full_path_terminates_on_a_parent_cycle() {
         // Manually construct a minimal Arena with a cycle: record 0 -> parent 1, record 1 -> parent 0.
+        let (names, bucket_offsets) = {
+            let names_in: Vec<&[u8]> = vec![b"a", b"b"];
+            let mut blob = Vec::new();
+            let mut offsets = Vec::new();
+            front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
+            (blob, offsets)
+        };
         let arena = Arena {
             format_version: crate::record::FORMAT_VERSION,
-            names: {
-                let names_in: Vec<&[u8]> = vec![b"a", b"b"];
-                let mut blob = Vec::new();
-                let mut offsets = Vec::new();
-                front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
-                blob
-            },
-            bucket_offsets: {
-                let names_in: Vec<&[u8]> = vec![b"a", b"b"];
-                let mut blob = Vec::new();
-                let mut offsets = Vec::new();
-                front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
-                offsets
-            },
-            records: vec![
-                FileRecord::new(1, false, 0), // record 0, parent = 1
-                FileRecord::new(0, false, 0), // record 1, parent = 0 — CYCLE
+            names,
+            bucket_offsets,
+            parents: vec![
+                pack_parent(1, false), // record 0, parent = 1
+                pack_parent(0, false), // record 1, parent = 0 — CYCLE
             ],
+            mtimes: vec![0, 0],
+            sizes: vec![0, 0],
             trigram_index: Vec::new(),
         };
 

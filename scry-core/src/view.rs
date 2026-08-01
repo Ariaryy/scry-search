@@ -201,11 +201,10 @@ impl IndexView {
             if self.delta.tombstones.get(index) {
                 continue;
             }
-            let record = &arena.records[index as usize];
             entries.push(ResultEntry {
                 path: arena.full_path(index, '\\'),
-                size: record.size_bytes(),
-                is_dir: record.is_dir(),
+                size: arena.size_bytes(index),
+                is_dir: arena.is_dir(index),
             });
         }
 
@@ -296,21 +295,20 @@ impl IndexView {
                 continue;
             }
             arena.name_into(old, &mut name);
-            let record = &arena.records[old as usize];
             let new = match frns_by_base[old as usize] {
                 Some(frn) => builder.push_bytes_with_metadata(
                     &name,
-                    record.mtime_secs,
-                    record.is_dir(),
+                    arena.mtime(old),
+                    arena.is_dir(old),
                     Some(frn),
-                    record.size_bytes(),
+                    arena.size_bytes(old),
                 ),
                 None => builder.push_bytes_with_metadata(
                     &name,
-                    record.mtime_secs,
-                    record.is_dir(),
+                    arena.mtime(old),
+                    arena.is_dir(old),
                     None,
-                    record.size_bytes(),
+                    arena.size_bytes(old),
                 ),
             };
             base_indices[old as usize] = Some(new);
@@ -339,7 +337,7 @@ impl IndexView {
             let Some(new) = base_indices[old as usize] else {
                 continue;
             };
-            let parent = arena.records[old as usize].parent();
+            let parent = arena.parent(old);
             if parent != PARENT_NONE {
                 if let Some(new_parent) = base_indices[parent as usize] {
                     builder.set_parent(new, new_parent);

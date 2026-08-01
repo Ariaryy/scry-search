@@ -1,9 +1,7 @@
-use rkyv::{Archive, Deserialize, Serialize};
-
 /// Format version stamped into every snapshot. `ArenaStore::open` rejects
 /// snapshots with a different version rather than parsing them leniently —
 /// a version bump is a breaking format change, not a migration.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Seconds between the Windows FILETIME epoch (1601-01-01) and the Unix
 /// epoch (1970-01-01). `mtime_secs` is stored relative to 1970 rather than
@@ -18,81 +16,40 @@ pub const FILETIME_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
 /// filename corpora.
 pub const BUCKET_SIZE: usize = 32;
 
-/// Bit 31 of `FileRecord::parent_and_flags` — set for directories.
+/// Bit 31 of a packed parent word — set for directories.
 pub const DIR_BIT: u32 = 0x8000_0000;
 
 /// Sentinel parent index meaning "no parent" (volume root).
 /// Must not equal DIR_BIT; capped at 2^31 - 2 so it fits in 31 bits.
 pub const PARENT_NONE: u32 = 0x7FFF_FFFF;
 
-/// One indexed filesystem entry. Two fields, 8 bytes total — this is the
-/// unit multiplied by millions, so every byte here is megabytes of RSS.
+/// Packs a parent index and directory flag into one word.
+/// Stored in `Arena.parents`; bits 0..30 = parent record index, bit 31 = is_dir.
 ///
-/// Names are NOT stored here; they live in the front-coded `Arena.names`
-/// blob, indexed via `Arena.bucket_offsets`. This keeps the hot record
-/// array cache-friendly during scans.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
-#[archive(check_bytes)]
-pub struct FileRecord {
-    /// Bit 31 = is_dir flag; bits 0..30 = parent record index.
-    /// Use the accessors rather than reading this field directly.
-    pub parent_and_flags: u32,
-    /// Seconds since 1970-01-01 UTC, clamped. Range: 0 (1970) to 2^32-1
-    /// (year 2106). USN records give 100ns FILETIMEs; the narrower field
-    /// saves 4 bytes per record versus an i64, and 4 bytes per record is
-    /// megabytes of RSS at a million files.
-    pub mtime_secs: u32,
-    /// File size in KiB, rounded up and saturating at `u32::MAX`.
-    pub size_kib: u32,
+/// This is the hot word: `full_path` hops through parent links on every
+/// displayed result, so it lives alone in its column so that a 64-byte cache
+/// line carries 16 useful parents instead of 8 (as it would interleaved with
+/// mtime and size).
+#[inline]
+pub fn pack_parent(parent: u32, is_dir: bool) -> u32 {
+    debug_assert!(parent <= PARENT_NONE, "parent index exceeds PARENT_NONE");
+    let flags = if is_dir { DIR_BIT } else { 0 };
+    flags | parent
 }
 
-impl FileRecord {
-    #[inline]
-    pub fn new(parent: u32, is_dir: bool, mtime_secs: u32) -> Self {
-        Self::new_with_size(parent, is_dir, mtime_secs, 0)
-    }
-
-    pub fn new_with_size(parent: u32, is_dir: bool, mtime_secs: u32, size_bytes: u64) -> Self {
-        debug_assert!(parent <= PARENT_NONE, "parent index exceeds PARENT_NONE");
-        let flags = if is_dir { DIR_BIT } else { 0 };
-        FileRecord {
-            parent_and_flags: flags | parent,
-            mtime_secs,
-            size_kib: bytes_to_size_kib(size_bytes),
-        }
-    }
-
-    #[inline]
-    pub fn parent(&self) -> u32 {
-        self.parent_and_flags & !DIR_BIT
-    }
-
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        self.parent_and_flags & DIR_BIT != 0
-    }
-
-    pub fn size_bytes(&self) -> u64 {
-        self.size_kib as u64 * 1024
-    }
+/// Extracts the parent record index from a packed parent word.
+#[inline]
+pub fn unpack_parent(word: u32) -> u32 {
+    word & !DIR_BIT
 }
 
-impl ArchivedFileRecord {
-    #[inline]
-    pub fn parent(&self) -> u32 {
-        self.parent_and_flags & !DIR_BIT
-    }
-
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        self.parent_and_flags & DIR_BIT != 0
-    }
-
-    pub fn size_bytes(&self) -> u64 {
-        self.size_kib as u64 * 1024
-    }
+/// Tests the directory flag in a packed parent word.
+#[inline]
+pub fn word_is_dir(word: u32) -> bool {
+    word & DIR_BIT != 0
 }
 
+/// Convert bytes to KiB, rounding up and saturating at `u32::MAX`.
 pub fn bytes_to_size_kib(bytes: u64) -> u32 {
     bytes.div_ceil(1024).min(u32::MAX as u64) as u32
 }
@@ -115,9 +72,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_record_is_8_bytes() {
-        assert_eq!(std::mem::size_of::<FileRecord>(), 12);
-        assert_eq!(std::mem::size_of::<ArchivedFileRecord>(), 12);
+    fn pack_parent_round_trips() {
+        let word = pack_parent(42, true);
+        assert!(word_is_dir(word));
+        assert_eq!(unpack_parent(word), 42);
+
+        let word2 = pack_parent(PARENT_NONE, false);
+        assert!(!word_is_dir(word2));
+        assert_eq!(unpack_parent(word2), PARENT_NONE);
     }
 
     #[test]
@@ -162,27 +124,15 @@ mod tests {
     }
 
     #[test]
-    fn parent_and_flags_round_trips() {
-        let r = FileRecord::new(42, true, 100);
-        assert!(r.is_dir());
-        assert_eq!(r.parent(), 42);
-
-        let r2 = FileRecord::new(PARENT_NONE, false, 0);
-        assert!(!r2.is_dir());
-        assert_eq!(r2.parent(), PARENT_NONE);
-    }
-
-    #[test]
     fn size_kib_roundtrips_and_saturates() {
-        for (input, expected) in [
-            (0, 0),
-            (1, 1024),
-            (1023, 1024),
-            (1024, 1024),
-            (u64::MAX, u32::MAX as u64 * 1024),
+        for (input, expected_kib) in [
+            (0u64, 0u32),
+            (1, 1),
+            (1023, 1),
+            (1024, 1),
+            (u64::MAX, u32::MAX),
         ] {
-            let record = FileRecord::new_with_size(PARENT_NONE, false, 0, input);
-            assert_eq!(record.size_bytes(), expected);
+            assert_eq!(bytes_to_size_kib(input), expected_kib);
         }
     }
 }

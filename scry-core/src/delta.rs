@@ -204,8 +204,8 @@ impl Delta {
                 .then_some((record.is_dir, record.mtime_secs, record.size_bytes));
         }
         let index = base.frn_map.as_ref()?.lookup(frn)?;
-        let record = &base.archived().records[index as usize];
-        Some((record.is_dir(), record.mtime_secs, record.size_bytes()))
+        let arena = base.archived();
+        Some((arena.is_dir(index), arena.mtime(index), arena.size_bytes(index)))
     }
 }
 
