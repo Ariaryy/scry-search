@@ -17,8 +17,8 @@ pub use frnmap::FrnEntry;
 pub use protocol::{QueryKind, Request, ResultEntry};
 pub use query::Query;
 pub use record::{
-    filetime_to_secs, FileRecord, BUCKET_SIZE, DIR_BIT, FILETIME_UNIX_EPOCH_SECS, FORMAT_VERSION,
-    PARENT_NONE,
+    bytes_to_size_kib, filetime_to_secs, FileRecord, BUCKET_SIZE, DIR_BIT,
+    FILETIME_UNIX_EPOCH_SECS, FORMAT_VERSION, PARENT_NONE,
 };
 pub use store::{ArenaStore, StoreError};
 pub use view::IndexView;

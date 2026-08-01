@@ -95,51 +95,101 @@ impl WindowsBackend {
     pub fn bulk_index_volume(
         volume: &str,
     ) -> Result<(scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>), WindowsBackendError> {
-        // Arbitrary initial guess (200k entries / 4 MB of names) that avoids
-        // the first several reallocations of the staging blob without
-        // over-committing on small volumes.
-        let mut builder = ArenaBuilder::with_capacity(200_000, 4 * 1024 * 1024);
-        // (frn, provisional index), sorted after enumeration for binary
-        // search. A hashmap keyed by frn costs ~18 MB at a million entries
-        // once hashbrown's load factor is accounted for, with random-access
-        // probe behaviour; a sorted Vec is 12 bytes per entry, contiguous,
-        // and built with one sort.
-        let mut frn_table: Vec<(u64, u32)> = Vec::new();
-        // Parallel to record order: each entry's parent FRN, needed once all
-        // entries (and therefore all indices) are known.
-        let mut parent_frns: Vec<u64> = Vec::new();
-
-        enumerate_mft(volume, |frn, parent_frn, name, is_dir, mtime| {
-            let idx = builder.push_bytes_with_frn(name, filetime_to_secs(mtime), is_dir, frn);
-            frn_table.push((frn, idx));
-            parent_frns.push(parent_frn);
-        })?;
-
-        // The NTFS root record (self-parented, or simply never referenced by
-        // any child's parent FRN, depending on what the enumeration yields)
-        // otherwise contributes nothing to full_path() — every top-level
-        // entry's parent chain would just stop, dropping the drive letter.
-        // Give every "no real parent" entry an explicit volume-root node
-        // so full_path() always includes the drive letter.
-        let root_idx = builder.push(volume, 0, true);
-
-        frn_table.sort_unstable_by_key(|&(frn, _)| frn);
-
-        for (i, &parent_frn) in parent_frns.iter().enumerate() {
-            let idx = i as u32;
-            match frn_table.binary_search_by_key(&parent_frn, |&(frn, _)| frn) {
-                Ok(pos) if frn_table[pos].1 != idx => builder.set_parent(idx, frn_table[pos].1),
-                _ => builder.set_parent(idx, root_idx),
+        match build_raw_index(volume) {
+            Ok((arena, frns, report)) => {
+                eprintln!("scry: raw MFT reader: {report:?}");
+                Ok((arena, frns))
+            }
+            Err(error) => {
+                eprintln!("scry: raw MFT reader unavailable ({error}); using USN enumeration");
+                build_usn_index(volume)
             }
         }
-
-        // Released before build()'s sort allocates its permutation — ~20 MB
-        // freed ahead of the next big transient.
-        drop(frn_table);
-        drop(parent_frns);
-
-        Ok(builder.build())
     }
+}
+
+struct IndexAssembly<'a> {
+    volume: &'a str,
+    builder: ArenaBuilder,
+    frn_table: Vec<(u64, u32)>,
+    parent_frns: Vec<u64>,
+}
+
+impl<'a> IndexAssembly<'a> {
+    fn new(volume: &'a str) -> Self {
+        Self {
+            volume,
+            builder: ArenaBuilder::with_capacity(200_000, 4 * 1024 * 1024),
+            frn_table: Vec::new(),
+            parent_frns: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        frn: u64,
+        parent_frn: u64,
+        name: &[u8],
+        is_dir: bool,
+        mtime_secs: u32,
+        size_bytes: u64,
+    ) {
+        let index =
+            self.builder
+                .push_bytes_with_metadata(name, mtime_secs, is_dir, Some(frn), size_bytes);
+        self.frn_table.push((frn, index));
+        self.parent_frns.push(parent_frn);
+    }
+
+    fn finish(mut self) -> (scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>) {
+        let root = self.builder.push(self.volume, 0, true);
+        self.frn_table.sort_unstable_by_key(|&(frn, _)| frn);
+        for (index, &parent_frn) in self.parent_frns.iter().enumerate() {
+            match self
+                .frn_table
+                .binary_search_by_key(&parent_frn, |&(frn, _)| frn)
+            {
+                Ok(position) if self.frn_table[position].1 != index as u32 => {
+                    self.builder
+                        .set_parent(index as u32, self.frn_table[position].1);
+                }
+                _ => self.builder.set_parent(index as u32, root),
+            }
+        }
+        self.builder.build()
+    }
+}
+
+fn build_raw_index(
+    volume: &str,
+) -> Result<
+    (
+        scry_core::Arena,
+        Vec<scry_core::frnmap::FrnEntry>,
+        crate::mft::MftEnumReport,
+    ),
+    crate::mft::MftError,
+> {
+    let mut assembly = IndexAssembly::new(volume);
+    let report =
+        crate::mft::enumerate_mft_raw(volume, |frn, parent, name, is_dir, mtime, size| {
+            assembly.push(frn, parent, name, is_dir, mtime, size);
+        })?;
+    if report.torn_records_skipped > report.emitted / 100 {
+        return Err(crate::mft::MftError::Invalid("excessive torn-record rate"));
+    }
+    let (arena, frns) = assembly.finish();
+    Ok((arena, frns, report))
+}
+
+fn build_usn_index(
+    volume: &str,
+) -> Result<(scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>), WindowsBackendError> {
+    let mut assembly = IndexAssembly::new(volume);
+    enumerate_mft_usn(volume, |frn, parent, name, is_dir, mtime, size| {
+        assembly.push(frn, parent, name, is_dir, mtime, size);
+    })?;
+    Ok(assembly.finish())
 }
 
 fn open_volume(volume: &str, flags: ffi::Dword) -> Result<ffi::Handle, WindowsBackendError> {
@@ -273,9 +323,9 @@ pub fn mark_handle_as_auxiliary(file: &std::fs::File, volume: &str) -> Result<()
 ///
 /// `sink` receives: FRN, parent FRN, UTF-8 name bytes, is-directory, and the
 /// raw FILETIME mtime.
-fn enumerate_mft(
+fn enumerate_mft_usn(
     volume: &str,
-    mut sink: impl FnMut(u64, u64, &[u8], bool, i64),
+    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
 ) -> Result<(), WindowsBackendError> {
     let handle = open_volume(volume, 0)?;
 
@@ -332,7 +382,8 @@ fn enumerate_mft(
                     header.parent_file_reference_number,
                     name.as_bytes(),
                     header.file_attributes & ffi::FILE_ATTRIBUTE_DIRECTORY != 0,
-                    header.time_stamp,
+                    filetime_to_secs(header.time_stamp),
+                    0,
                 );
             });
 

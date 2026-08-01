@@ -51,6 +51,7 @@ pub struct DeltaRecord {
     pub parent: ParentRef,
     pub mtime_secs: u32,
     pub is_dir: bool,
+    pub size_bytes: u64,
     pub live: bool,
 }
 
@@ -118,7 +119,13 @@ impl Delta {
                 name,
                 is_dir,
                 mtime_secs,
-            } => self.create(*frn, *parent_frn, name.clone(), *is_dir, *mtime_secs, base),
+            } => self.create(
+                *frn,
+                *parent_frn,
+                name.clone(),
+                (*is_dir, *mtime_secs, 0),
+                base,
+            ),
             DeltaEvent::Deleted { frn } => {
                 self.delete(*frn, base);
                 ApplyOutcome::Applied
@@ -128,11 +135,17 @@ impl Delta {
                 parent_frn,
                 name,
             } => {
-                let Some((is_dir, mtime_secs)) = self.metadata(*frn, base) else {
+                let Some((is_dir, mtime_secs, size_bytes)) = self.metadata(*frn, base) else {
                     return ApplyOutcome::NeedsFullReindex;
                 };
                 self.delete(*frn, base);
-                self.create(*frn, *parent_frn, name.clone(), is_dir, mtime_secs, base)
+                self.create(
+                    *frn,
+                    *parent_frn,
+                    name.clone(),
+                    (is_dir, mtime_secs, size_bytes),
+                    base,
+                )
             }
             DeltaEvent::Modified => ApplyOutcome::Applied,
         }
@@ -155,19 +168,20 @@ impl Delta {
         frn: u64,
         parent_frn: u64,
         name: String,
-        is_dir: bool,
-        mtime_secs: u32,
+        metadata: (bool, u32, u64),
         base: &ArenaStore,
     ) -> ApplyOutcome {
         let Some(parent) = self.resolve_parent(parent_frn, base) else {
             return ApplyOutcome::NeedsFullReindex;
         };
         let index = self.added.len() as u32;
+        let (is_dir, mtime_secs, size_bytes) = metadata;
         self.added.push(DeltaRecord {
             name,
             parent,
             mtime_secs,
             is_dir,
+            size_bytes,
             live: true,
         });
         self.added_frns.insert(frn, index);
@@ -182,14 +196,16 @@ impl Delta {
         }
     }
 
-    fn metadata(&self, frn: u64, base: &ArenaStore) -> Option<(bool, u32)> {
+    fn metadata(&self, frn: u64, base: &ArenaStore) -> Option<(bool, u32, u64)> {
         if let Some(&index) = self.added_frns.get(&frn) {
             let record = &self.added[index as usize];
-            return record.live.then_some((record.is_dir, record.mtime_secs));
+            return record
+                .live
+                .then_some((record.is_dir, record.mtime_secs, record.size_bytes));
         }
         let index = base.frn_map.as_ref()?.lookup(frn)?;
         let record = &base.archived().records[index as usize];
-        Some((record.is_dir(), record.mtime_secs))
+        Some((record.is_dir(), record.mtime_secs, record.size_bytes()))
     }
 }
 

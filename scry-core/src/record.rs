@@ -3,7 +3,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Format version stamped into every snapshot. `ArenaStore::open` rejects
 /// snapshots with a different version rather than parsing them leniently —
 /// a version bump is a breaking format change, not a migration.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Seconds between the Windows FILETIME epoch (1601-01-01) and the Unix
 /// epoch (1970-01-01). `mtime_secs` is stored relative to 1970 rather than
@@ -42,16 +42,23 @@ pub struct FileRecord {
     /// saves 4 bytes per record versus an i64, and 4 bytes per record is
     /// megabytes of RSS at a million files.
     pub mtime_secs: u32,
+    /// File size in KiB, rounded up and saturating at `u32::MAX`.
+    pub size_kib: u32,
 }
 
 impl FileRecord {
     #[inline]
     pub fn new(parent: u32, is_dir: bool, mtime_secs: u32) -> Self {
+        Self::new_with_size(parent, is_dir, mtime_secs, 0)
+    }
+
+    pub fn new_with_size(parent: u32, is_dir: bool, mtime_secs: u32, size_bytes: u64) -> Self {
         debug_assert!(parent <= PARENT_NONE, "parent index exceeds PARENT_NONE");
         let flags = if is_dir { DIR_BIT } else { 0 };
         FileRecord {
             parent_and_flags: flags | parent,
             mtime_secs,
+            size_kib: bytes_to_size_kib(size_bytes),
         }
     }
 
@@ -63,6 +70,10 @@ impl FileRecord {
     #[inline]
     pub fn is_dir(&self) -> bool {
         self.parent_and_flags & DIR_BIT != 0
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_kib as u64 * 1024
     }
 }
 
@@ -76,6 +87,14 @@ impl ArchivedFileRecord {
     pub fn is_dir(&self) -> bool {
         self.parent_and_flags & DIR_BIT != 0
     }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_kib as u64 * 1024
+    }
+}
+
+pub fn bytes_to_size_kib(bytes: u64) -> u32 {
+    bytes.div_ceil(1024).min(u32::MAX as u64) as u32
 }
 
 /// Convert a Windows FILETIME (100ns ticks since 1601-01-01) to whole seconds
@@ -97,8 +116,8 @@ mod tests {
 
     #[test]
     fn file_record_is_8_bytes() {
-        assert_eq!(std::mem::size_of::<FileRecord>(), 8);
-        assert_eq!(std::mem::size_of::<ArchivedFileRecord>(), 8);
+        assert_eq!(std::mem::size_of::<FileRecord>(), 12);
+        assert_eq!(std::mem::size_of::<ArchivedFileRecord>(), 12);
     }
 
     #[test]
@@ -151,5 +170,19 @@ mod tests {
         let r2 = FileRecord::new(PARENT_NONE, false, 0);
         assert!(!r2.is_dir());
         assert_eq!(r2.parent(), PARENT_NONE);
+    }
+
+    #[test]
+    fn size_kib_roundtrips_and_saturates() {
+        for (input, expected) in [
+            (0, 0),
+            (1, 1024),
+            (1023, 1024),
+            (1024, 1024),
+            (u64::MAX, u32::MAX as u64 * 1024),
+        ] {
+            let record = FileRecord::new_with_size(PARENT_NONE, false, 0, input);
+            assert_eq!(record.size_bytes(), expected);
+        }
     }
 }

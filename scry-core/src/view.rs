@@ -66,6 +66,7 @@ mod tests {
                 parent: ParentRef::Base(root),
                 mtime_secs: 0,
                 is_dir: false,
+                size_bytes: 0,
                 live: true,
             });
         }
@@ -92,6 +93,7 @@ mod tests {
             parent: ParentRef::Base(root),
             mtime_secs: 0,
             is_dir: true,
+            size_bytes: 0,
             live: true,
         });
         delta.added.push(DeltaRecord {
@@ -99,6 +101,7 @@ mod tests {
             parent: ParentRef::Delta(0),
             mtime_secs: 0,
             is_dir: false,
+            size_bytes: 0,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -126,6 +129,7 @@ mod tests {
             parent: ParentRef::Base(root),
             mtime_secs: 0,
             is_dir: false,
+            size_bytes: 0,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -200,7 +204,7 @@ impl IndexView {
             let record = &arena.records[index as usize];
             entries.push(ResultEntry {
                 path: arena.full_path(index, '\\'),
-                size: 0,
+                size: record.size_bytes(),
                 is_dir: record.is_dir(),
             });
         }
@@ -232,7 +236,7 @@ impl IndexView {
             if matches {
                 entries.push(ResultEntry {
                     path: self.delta_path(index),
-                    size: 0,
+                    size: record.size_bytes,
                     is_dir: record.is_dir,
                 });
             }
@@ -294,24 +298,39 @@ impl IndexView {
             arena.name_into(old, &mut name);
             let record = &arena.records[old as usize];
             let new = match frns_by_base[old as usize] {
-                Some(frn) => {
-                    builder.push_bytes_with_frn(&name, record.mtime_secs, record.is_dir(), frn)
-                }
-                None => builder.push_bytes(&name, record.mtime_secs, record.is_dir()),
+                Some(frn) => builder.push_bytes_with_metadata(
+                    &name,
+                    record.mtime_secs,
+                    record.is_dir(),
+                    Some(frn),
+                    record.size_bytes(),
+                ),
+                None => builder.push_bytes_with_metadata(
+                    &name,
+                    record.mtime_secs,
+                    record.is_dir(),
+                    None,
+                    record.size_bytes(),
+                ),
             };
             base_indices[old as usize] = Some(new);
         }
         for (old, record) in self.delta.live_added() {
             let new = match frns_by_delta[old as usize] {
-                Some(frn) => builder.push_bytes_with_frn(
+                Some(frn) => builder.push_bytes_with_metadata(
                     record.name.as_bytes(),
                     record.mtime_secs,
                     record.is_dir,
-                    frn,
+                    Some(frn),
+                    record.size_bytes,
                 ),
-                None => {
-                    builder.push_bytes(record.name.as_bytes(), record.mtime_secs, record.is_dir)
-                }
+                None => builder.push_bytes_with_metadata(
+                    record.name.as_bytes(),
+                    record.mtime_secs,
+                    record.is_dir,
+                    None,
+                    record.size_bytes,
+                ),
             };
             delta_indices[old as usize] = Some(new);
         }

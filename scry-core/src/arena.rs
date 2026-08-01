@@ -475,6 +475,7 @@ pub struct ArenaBuilder {
     parents: Vec<u32>,
     mtimes: Vec<u32>,
     dirs: Vec<bool>,
+    sizes: Vec<u64>,
     frns: Vec<Option<u64>>,
 }
 
@@ -489,6 +490,7 @@ impl ArenaBuilder {
             parents: Vec::with_capacity(entries),
             mtimes: Vec::with_capacity(entries),
             dirs: Vec::with_capacity(entries),
+            sizes: Vec::with_capacity(entries),
             frns: Vec::with_capacity(entries),
         }
     }
@@ -518,6 +520,17 @@ impl ArenaBuilder {
         is_dir: bool,
         frn: Option<u64>,
     ) -> u32 {
+        self.push_bytes_with_metadata(name, mtime_secs, is_dir, frn, 0)
+    }
+
+    pub fn push_bytes_with_metadata(
+        &mut self,
+        name: &[u8],
+        mtime_secs: u32,
+        is_dir: bool,
+        frn: Option<u64>,
+        size_bytes: u64,
+    ) -> u32 {
         let idx = self.name_ends.len() as u32;
         self.staging_names.extend_from_slice(name);
         self.name_ends.push(self.staging_names.len() as u32);
@@ -525,6 +538,7 @@ impl ArenaBuilder {
         self.mtimes.push(mtime_secs);
         self.dirs.push(is_dir);
         self.frns.push(frn);
+        self.sizes.push(size_bytes);
         idx
     }
 
@@ -589,10 +603,11 @@ impl ArenaBuilder {
                 } else {
                     rank[orig_parent as usize]
                 };
-                FileRecord::new(
+                FileRecord::new_with_size(
                     new_parent,
                     self.dirs[orig as usize],
                     self.mtimes[orig as usize],
+                    self.sizes[orig as usize],
                 )
             })
             .collect();
