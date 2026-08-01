@@ -1,5 +1,7 @@
 pub mod arena;
 pub mod ascii;
+pub mod delta;
+pub mod frnmap;
 pub mod protocol;
 pub mod query;
 pub mod record;
