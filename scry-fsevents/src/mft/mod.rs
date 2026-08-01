@@ -41,6 +41,15 @@ pub fn enumerate_mft_raw(
     volume: &str,
     mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
 ) -> Result<MftEnumReport, MftError> {
+    enumerate_mft_raw_with_names(volume, &mut sink, |_, _| {})
+}
+
+#[doc(hidden)]
+pub fn enumerate_mft_raw_with_names(
+    volume: &str,
+    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    mut name_sink: impl FnMut(u64, &[attr::FileNameInfo]),
+) -> Result<MftEnumReport, MftError> {
     let geometry = read_volume_boot(volume)?;
     let path = format!(r"\\.\{volume}");
     let mut file = std::fs::OpenOptions::new()
@@ -100,6 +109,7 @@ pub fn enumerate_mft_raw(
                     geometry,
                     stream_record,
                     &mut sink,
+                    &mut name_sink,
                     &mut report,
                 ) {
                     Ok(()) => {}
@@ -231,6 +241,7 @@ fn parse_and_emit(
     geometry: VolumeGeometry,
     stream_record: u64,
     sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo]),
     report: &mut MftEnumReport,
 ) -> Result<(), MftError> {
     let Some(record) = ParsedRecord::parse(bytes, geometry.bytes_per_sector as usize)? else {
@@ -244,26 +255,7 @@ fn parse_and_emit(
         report.bad_records_skipped += 1;
         return Ok(());
     }
-    const DIAGNOSTIC_FRNS: [u64; 3] = [
-        490_610_884_406_673_478,
-        103_864_266_406_235_383,
-        178_455_135_234_566_132,
-    ];
-    if DIAGNOSTIC_FRNS.contains(&record.frn()) {
-        let names = record
-            .attributes()
-            .filter_map(Result::ok)
-            .filter(|attribute| attribute.type_code == FILE_NAME)
-            .filter_map(|attribute| parse_file_name(&attribute).ok())
-            .map(|name| (name.parent_frn, name.namespace, name.name))
-            .collect::<Vec<_>>();
-        eprintln!(
-            "scry: diagnostic frn={} hard_links={} names={names:?}",
-            record.frn(),
-            record.hard_link_count()?
-        );
-    }
-    let mut selected_name = None;
+    let mut win32_names = Vec::new();
     let mut fallback_name = None;
     let mut mtime = 0u32;
     let mut size = 0u64;
@@ -279,11 +271,7 @@ fn parse_and_emit(
                 continue;
             }
             if name.namespace == 1 || name.namespace == 3 {
-                if selected_name.is_some() {
-                    report.extra_hard_links_ignored += 1;
-                } else {
-                    selected_name = Some(name);
-                }
+                win32_names.push(name);
             } else if fallback_name.is_none() {
                 fallback_name = Some(name);
             }
@@ -291,7 +279,9 @@ fn parse_and_emit(
             size = data_size(&attribute)?;
         }
     }
-    let Some(name) = selected_name.or(fallback_name) else {
+    name_sink(record.frn(), &win32_names);
+    report.extra_hard_links_ignored += win32_names.len().saturating_sub(1);
+    let Some(name) = win32_names.into_iter().next().or(fallback_name) else {
         return Ok(());
     };
     sink(
