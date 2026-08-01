@@ -205,7 +205,11 @@ impl Delta {
         }
         let index = base.frn_map.as_ref()?.lookup(frn)?;
         let arena = base.archived();
-        Some((arena.is_dir(index), arena.mtime(index), arena.size_bytes(index)))
+        Some((
+            arena.is_dir(index),
+            arena.mtime(index),
+            arena.size_bytes(index),
+        ))
     }
 }
 
