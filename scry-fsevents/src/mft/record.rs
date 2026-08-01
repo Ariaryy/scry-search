@@ -64,6 +64,10 @@ impl<'a> ParsedRecord<'a> {
         self.base_reference != 0
     }
 
+    pub fn base_reference(&self) -> u64 {
+        self.base_reference
+    }
+
     pub fn record_number(&self) -> u32 {
         self.record_number
     }

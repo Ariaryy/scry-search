@@ -13,6 +13,38 @@ pub struct FileNameInfo {
     pub name: String,
 }
 
+pub fn attribute_list_file_name_refs(
+    attribute: &AttributeRef<'_>,
+) -> Result<Option<Vec<u64>>, MftError> {
+    if attribute.type_code != ATTRIBUTE_LIST {
+        return Err(MftError::Invalid("not an ATTRIBUTE_LIST attribute"));
+    }
+    if attribute.non_resident {
+        return Ok(None);
+    }
+    let value = resident_value(attribute)?;
+    let mut position = 0usize;
+    let mut references = Vec::new();
+    while position < value.len() {
+        let type_code = read_u32(value, position)?;
+        let length = read_u16(value, position + 4)? as usize;
+        if length < 0x1a || !length.is_multiple_of(8) {
+            return Err(MftError::Invalid("invalid ATTRIBUTE_LIST entry length"));
+        }
+        let end = position
+            .checked_add(length)
+            .ok_or(MftError::Invalid("ATTRIBUTE_LIST entry overflow"))?;
+        if end > value.len() {
+            return Err(MftError::Invalid("ATTRIBUTE_LIST entry exceeds value"));
+        }
+        if type_code == FILE_NAME {
+            references.push(read_u64(value, position + 0x10)?);
+        }
+        position = end;
+    }
+    Ok(Some(references))
+}
+
 pub fn resident_value<'a>(attribute: &AttributeRef<'a>) -> Result<&'a [u8], MftError> {
     if attribute.non_resident {
         return Err(MftError::Invalid(
@@ -175,5 +207,30 @@ mod tests {
     fn attribute_list_is_detected() {
         let attribute = resident(ATTRIBUTE_LIST, &[]);
         assert!(has_attribute_list(&reference(&attribute)));
+    }
+
+    #[test]
+    fn attribute_list_collects_file_name_extension_references() {
+        let mut value = vec![0u8; 0x40];
+        value[0..4].copy_from_slice(&FILE_NAME.to_le_bytes());
+        value[4..6].copy_from_slice(&0x20u16.to_le_bytes());
+        value[0x10..0x18].copy_from_slice(&0x0003_0000_0000_0042u64.to_le_bytes());
+        value[0x20..0x24].copy_from_slice(&DATA.to_le_bytes());
+        value[0x24..0x26].copy_from_slice(&0x20u16.to_le_bytes());
+        let attribute = resident(ATTRIBUTE_LIST, &value);
+        assert_eq!(
+            attribute_list_file_name_refs(&reference(&attribute)).unwrap(),
+            Some(vec![0x0003_0000_0000_0042])
+        );
+    }
+
+    #[test]
+    fn nonresident_attribute_list_is_reported() {
+        let mut attribute = resident(ATTRIBUTE_LIST, &[]);
+        attribute[8] = 1;
+        assert_eq!(
+            attribute_list_file_name_refs(&reference(&attribute)).unwrap(),
+            None
+        );
     }
 }
