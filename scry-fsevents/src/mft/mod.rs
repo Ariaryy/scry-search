@@ -11,7 +11,7 @@ use std::io::Seek;
 use std::os::windows::fs::OpenOptionsExt;
 
 use attr::{
-    attribute_list_file_name_refs, data_size, has_attribute_list, parse_file_name,
+    attribute_list_entries, data_size, has_attribute_list, parse_file_name,
     parse_standard_information, DATA, FILE_NAME, STANDARD_INFORMATION,
 };
 use boot::{read_volume_boot, VolumeGeometry};
@@ -43,6 +43,7 @@ pub struct MftEnumReport {
 struct DeferredRecord {
     frn: u64,
     child_references: Vec<u64>,
+    names: Vec<attr::FileNameInfo>,
     is_dir: bool,
     mtime: u32,
     size: u64,
@@ -52,14 +53,14 @@ pub fn enumerate_mft_raw(
     volume: &str,
     mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
 ) -> Result<MftEnumReport, MftError> {
-    enumerate_mft_raw_with_names(volume, &mut sink, |_, _| {})
+    enumerate_mft_raw_with_names(volume, &mut sink, |_, _, _| {})
 }
 
 #[doc(hidden)]
 pub fn enumerate_mft_raw_with_names(
     volume: &str,
     mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
-    mut name_sink: impl FnMut(u64, &[attr::FileNameInfo]),
+    mut name_sink: impl FnMut(u64, &[attr::FileNameInfo], bool),
 ) -> Result<MftEnumReport, MftError> {
     let geometry = read_volume_boot(volume)?;
     let path = format!(r"\\.\{volume}");
@@ -263,7 +264,7 @@ fn parse_and_emit(
     geometry: VolumeGeometry,
     stream_record: u64,
     sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64),
-    name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo]),
+    name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo], bool),
     report: &mut MftEnumReport,
     deferred: &mut Vec<DeferredRecord>,
 ) -> Result<(), MftError> {
@@ -282,23 +283,26 @@ fn parse_and_emit(
     let mut fallback_names = Vec::new();
     let mut mtime = 0u32;
     let mut size = 0u64;
-    let mut child_references = Vec::new();
+    let mut list_entries = Vec::new();
     let mut saw_attribute_list = false;
+    let mut nonresident_attribute_list = false;
+    let mut has_standard_information = false;
+    let mut has_data = false;
     for attribute in record.attributes() {
         let attribute = attribute?;
         if has_attribute_list(&attribute) {
             report.attribute_list_fallbacks += 1;
             saw_attribute_list = true;
-            match attribute_list_file_name_refs(&attribute)? {
-                Some(references) => child_references.extend(
-                    references
-                        .into_iter()
-                        .filter(|reference| reference & 0x0000_ffff_ffff_ffff != stream_record),
-                ),
-                None => report.nonresident_attribute_lists += 1,
+            match attribute_list_entries(&attribute)? {
+                Some(entries) => list_entries.extend(entries),
+                None => {
+                    report.nonresident_attribute_lists += 1;
+                    nonresident_attribute_list = true;
+                }
             }
         } else if attribute.type_code == STANDARD_INFORMATION {
             mtime = parse_standard_information(&attribute)?;
+            has_standard_information = true;
         } else if attribute.type_code == FILE_NAME {
             let name = parse_file_name(&attribute)?;
             if name.namespace == 2 {
@@ -311,26 +315,45 @@ fn parse_and_emit(
             }
         } else if attribute.type_code == DATA && unnamed(&attribute)? {
             size = data_size(&attribute)?;
+            has_data = true;
         }
     }
-    name_sink(record.frn(), &win32_names);
-    report.extra_hard_links_ignored += (win32_names.len() + fallback_names.len()).saturating_sub(1);
-    let Some(name) = win32_names
+    let mut names = win32_names;
+    names.extend(fallback_names);
+    let mut child_references = list_entries
         .into_iter()
-        .next()
-        .or_else(|| fallback_names.into_iter().next())
-    else {
-        if saw_attribute_list {
-            child_references.sort_unstable();
-            child_references.dedup();
-            deferred.push(DeferredRecord {
-                frn: record.frn(),
-                child_references,
-                is_dir: record.is_dir(),
-                mtime,
-                size,
-            });
-        }
+        .filter(|entry| entry.file_reference & 0x0000_ffff_ffff_ffff != stream_record)
+        .filter(|entry| {
+            (entry.type_code == FILE_NAME && names.is_empty())
+                || (entry.type_code == DATA && !has_data)
+                || (entry.type_code == STANDARD_INFORMATION && !has_standard_information)
+        })
+        .map(|entry| entry.file_reference)
+        .collect::<Vec<_>>();
+    child_references.sort_unstable();
+    child_references.dedup();
+    if saw_attribute_list && (!child_references.is_empty() || names.is_empty()) {
+        deferred.push(DeferredRecord {
+            frn: record.frn(),
+            child_references,
+            names,
+            is_dir: record.is_dir(),
+            mtime,
+            size,
+        });
+        return Ok(());
+    }
+    let oracle_count = names
+        .iter()
+        .take_while(|name| name.namespace == 1 || name.namespace == 3)
+        .count();
+    name_sink(
+        record.frn(),
+        &names[..oracle_count],
+        !nonresident_attribute_list,
+    );
+    report.extra_hard_links_ignored += names.len().saturating_sub(1);
+    let Some(name) = names.first() else {
         return Ok(());
     };
     sink(
@@ -351,7 +374,7 @@ fn resolve_deferred(
     runs: &[Run],
     deferred: &[DeferredRecord],
     sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64),
-    name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo]),
+    name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo], bool),
     report: &mut MftEnumReport,
 ) -> Result<(), MftError> {
     use std::collections::BTreeMap;
@@ -366,6 +389,9 @@ fn resolve_deferred(
         }
     }
     let mut resolved_names = (0..deferred.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut resolved_sizes = vec![None; deferred.len()];
+    let mut resolved_mtimes = vec![None; deferred.len()];
+    let mut resolved_children = vec![false; deferred.len()];
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(1 | 2)
@@ -383,6 +409,8 @@ fn resolve_deferred(
             continue;
         }
         let mut names = Vec::new();
+        let mut extension_size = None;
+        let mut extension_mtime = None;
         for attribute in record.attributes() {
             let attribute = attribute?;
             if attribute.type_code == FILE_NAME {
@@ -390,11 +418,22 @@ fn resolve_deferred(
                 if name.namespace != 2 {
                     names.push(name);
                 }
+            } else if attribute.type_code == DATA && unnamed(&attribute)? {
+                extension_size = Some(data_size(&attribute)?);
+            } else if attribute.type_code == STANDARD_INFORMATION {
+                extension_mtime = Some(parse_standard_information(&attribute)?);
             }
         }
         for base_index in base_indexes {
             let base = &deferred[base_index];
             if record.base_reference() == base.frn {
+                resolved_children[base_index] = true;
+                if extension_size.is_some() {
+                    resolved_sizes[base_index] = extension_size;
+                }
+                if extension_mtime.is_some() {
+                    resolved_mtimes[base_index] = extension_mtime;
+                }
                 resolved_names[base_index].extend(names.iter().map(|name| attr::FileNameInfo {
                     parent_frn: name.parent_frn,
                     namespace: name.namespace,
@@ -403,7 +442,17 @@ fn resolve_deferred(
             }
         }
     }
-    for (base, names) in deferred.iter().zip(resolved_names) {
+    for (base_index, (base, extension_names)) in deferred.iter().zip(resolved_names).enumerate() {
+        let mut names = base
+            .names
+            .iter()
+            .map(|name| attr::FileNameInfo {
+                parent_frn: name.parent_frn,
+                namespace: name.namespace,
+                name: name.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        names.extend(extension_names);
         let win32_names = names
             .iter()
             .filter(|name| name.namespace == 1 || name.namespace == 3)
@@ -416,7 +465,7 @@ fn resolve_deferred(
                 name: name.name.clone(),
             })
             .collect::<Vec<_>>();
-        name_sink(base.frn, &oracle_names);
+        name_sink(base.frn, &oracle_names, resolved_children[base_index]);
         let selected = win32_names
             .first()
             .copied()
@@ -428,10 +477,12 @@ fn resolve_deferred(
                 name.parent_frn,
                 name.name.as_bytes(),
                 base.is_dir,
-                base.mtime,
-                base.size,
+                resolved_mtimes[base_index].unwrap_or(base.mtime),
+                resolved_sizes[base_index].unwrap_or(base.size),
             );
             report.emitted += 1;
+        }
+        if resolved_children[base_index] {
             report.attribute_list_resolved += 1;
         } else {
             report.attribute_list_unresolved += 1;

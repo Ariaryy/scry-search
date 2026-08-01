@@ -8,7 +8,12 @@
 - `ArchivedArena` (the rkyv zero-copy view) and `Arena`/`FileRecord` (the builder-side owned types)
   are different generated types. Anything that needs to work on both (e.g. `is_dir()`) needs an impl
   on each — see `record.rs`.
-- `Arena` uses a format v2 index (8-byte records, name-sorted, front-coded names) rather than plain `String` fields, reducing snapshot size significantly.
+- `Arena` uses a format v5 index (12-byte records, name-sorted, front-coded names) rather than plain `String` fields, reducing snapshot size significantly.
+- The `$MFT` parser (`scry-fsevents/src/mft/`) reads a live on-disk structure
+  and must treat every length and offset as hostile: checked slicing only, no
+  unchecked arithmetic, and an explicit termination guard on every loop driven
+  by an on-disk length. Extend `parser_never_panics_on_mutated_records` whenever
+  the parser learns a new structure.
 - The daemon's snapshot file (`%TEMP%\scry-index-<vol>.rkyv`) lives on the volume being watched.
   Any code that writes to disk from within the daemon must be accounted for in the USN-event filter
   in `reindex_on_changes` (`scry-daemon/src/main.rs`) or it'll retrigger its own reindex.
@@ -29,7 +34,11 @@
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full
   scan. Regex/wildcard queries are **not** filtered — that needs required-literal
   extraction from the pattern and hasn't been done.
-- **No `size` field.** USN records don't carry file size, and the format v2 compact index removed the size field entirely to keep records at 8 bytes. A lazy stat pass would be needed for sizes.
+- **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
+  saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
+  it 0 because USN records do not carry size, so 0 means unknown rather than
+  empty. The raw reader is used for a supported elevated NTFS volume and
+  demotes to USN on parse errors or excessive torn records.
 - **Single volume per daemon instance**, chosen via argv. No multi-volume aggregation yet.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust
   consumers would need a `cdylib` shim over `scry-ipc`'s framing.

@@ -1,4 +1,4 @@
-# Index format v4
+# Index format v5
 
 `scry-core::Arena` (`scry-core/src/arena.rs`):
 
@@ -7,21 +7,24 @@ Arena {
     format_version: u32,     // = 4
     names: Vec<u8>,          // front-coded name blob
     bucket_offsets: Vec<u32>,// len = num_buckets + 1; last entry == names.len()
-    records: Vec<FileRecord>, // 8 bytes each, in name-sorted order
+    records: Vec<FileRecord>, // 12 bytes each, in name-sorted order
     trigram_index: Vec<u8>,  // trigram-to-1024-record-block bitmap matrix
 }
 
 FileRecord {
     parent_and_flags: u32,   // bit 31 = is_dir; bits 0..31 = parent record index
     mtime_secs: u32,         // seconds since 1970-01-01 UTC, clamped to [0, 2^32-1] (year 2106)
+    size_kib: u32,           // logical size rounded up to KiB, saturating at u32::MAX
 }
 ```
 
-Format v4 is an 8-byte record compact index, name-sorted storage, front-coded name blob,
+Format v5 is a 12-byte record compact index, name-sorted storage, front-coded name blob,
 and a trigram block filter.
 
 ## Changelog
 
+- v5 — added KiB-quantised logical file sizes. The raw MFT path populates the
+  field; the USN fallback leaves it 0, so 0 means unknown rather than empty.
 - v4 — added the trigram block filter.
 - v3 — mtime_secs rebased from the 1601 FILETIME epoch to the Unix epoch (v2 saturated for all real timestamps).
 

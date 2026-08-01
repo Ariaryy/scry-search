@@ -13,9 +13,15 @@ pub struct FileNameInfo {
     pub name: String,
 }
 
-pub fn attribute_list_file_name_refs(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttributeListEntry {
+    pub type_code: u32,
+    pub file_reference: u64,
+}
+
+pub fn attribute_list_entries(
     attribute: &AttributeRef<'_>,
-) -> Result<Option<Vec<u64>>, MftError> {
+) -> Result<Option<Vec<AttributeListEntry>>, MftError> {
     if attribute.type_code != ATTRIBUTE_LIST {
         return Err(MftError::Invalid("not an ATTRIBUTE_LIST attribute"));
     }
@@ -37,9 +43,10 @@ pub fn attribute_list_file_name_refs(
         if end > value.len() {
             return Err(MftError::Invalid("ATTRIBUTE_LIST entry exceeds value"));
         }
-        if type_code == FILE_NAME {
-            references.push(read_u64(value, position + 0x10)?);
-        }
+        references.push(AttributeListEntry {
+            type_code,
+            file_reference: read_u64(value, position + 0x10)?,
+        });
         position = end;
     }
     Ok(Some(references))
@@ -219,8 +226,17 @@ mod tests {
         value[0x24..0x26].copy_from_slice(&0x20u16.to_le_bytes());
         let attribute = resident(ATTRIBUTE_LIST, &value);
         assert_eq!(
-            attribute_list_file_name_refs(&reference(&attribute)).unwrap(),
-            Some(vec![0x0003_0000_0000_0042])
+            attribute_list_entries(&reference(&attribute)).unwrap(),
+            Some(vec![
+                AttributeListEntry {
+                    type_code: FILE_NAME,
+                    file_reference: 0x0003_0000_0000_0042,
+                },
+                AttributeListEntry {
+                    type_code: DATA,
+                    file_reference: 0,
+                },
+            ])
         );
     }
 
@@ -229,7 +245,7 @@ mod tests {
         let mut attribute = resident(ATTRIBUTE_LIST, &[]);
         attribute[8] = 1;
         assert_eq!(
-            attribute_list_file_name_refs(&reference(&attribute)).unwrap(),
+            attribute_list_entries(&reference(&attribute)).unwrap(),
             None
         );
     }
