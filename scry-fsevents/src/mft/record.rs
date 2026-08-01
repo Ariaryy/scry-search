@@ -11,6 +11,7 @@ pub struct ParsedRecord<'a> {
     flags: u16,
     base_reference: u64,
     record_number: u32,
+    sequence_number: u16,
 }
 
 impl<'a> ParsedRecord<'a> {
@@ -27,6 +28,7 @@ impl<'a> ParsedRecord<'a> {
         let used_size = read_u32(bytes, 0x18)? as usize;
         let base_reference = read_u64(bytes, 0x20)?;
         let record_number = read_u32(bytes, 0x2c)?;
+        let sequence_number = read_u16(bytes, 0x10)?;
         if used_size > bytes.len() || first_attribute < 0x30 || first_attribute > used_size {
             return Err(MftError::Invalid("invalid FILE record bounds"));
         }
@@ -37,6 +39,7 @@ impl<'a> ParsedRecord<'a> {
             flags,
             base_reference,
             record_number,
+            sequence_number,
         }))
     }
 
@@ -63,6 +66,10 @@ impl<'a> ParsedRecord<'a> {
 
     pub fn record_number(&self) -> u32 {
         self.record_number
+    }
+
+    pub fn frn(&self) -> u64 {
+        (self.sequence_number as u64) << 48 | self.record_number as u64
     }
 }
 
@@ -163,7 +170,7 @@ fn apply_fixups(bytes: &mut [u8], sector_size: usize) -> Result<(), MftError> {
             .get(end - 2..end)
             .ok_or(MftError::Invalid("sector trailer out of bounds"))?;
         if trailer != sequence {
-            return Err(MftError::Invalid("torn FILE record"));
+            return Err(MftError::TornRecord);
         }
         let replacement_offset = usa_offset + (sector + 1) * 2;
         let replacement_raw = bytes
