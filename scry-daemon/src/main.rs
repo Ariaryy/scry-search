@@ -18,7 +18,6 @@ mod ffi;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use arc_swap::ArcSwap;
 use scry_core::delta::{ApplyOutcome, DeltaEvent};
 use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
 use scry_core::{ArenaStore, IndexView, Query};
@@ -30,7 +29,7 @@ use std::sync::Arc;
 /// reindex never blocks a query — an in-flight reader keeps its `Arc` alive
 /// and continues to see a consistent (if momentarily stale) index while the
 /// swap happens underneath it.
-type SharedStore = Arc<ArcSwap<IndexView>>;
+type SharedStore = Arc<arc_swap::ArcSwap<IndexView>>;
 
 fn main() -> anyhow::Result<()> {
     // Return freed spans to the OS after 1s of idleness rather than mimalloc's
@@ -66,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("scryd: indexing {volume}...");
     let initial = build_view(&volume, auxiliary_marking_enabled)?;
     eprintln!("scryd: indexed {} entries", initial.len());
-    let store: SharedStore = Arc::new(ArcSwap::from(initial));
+    let store: SharedStore = Arc::new(initial.into());
 
     {
         let store = store.clone();
@@ -480,7 +479,7 @@ mod tests {
     use scry_core::{store::save, Arena};
     use scry_fsevents::ChangeEvent;
 
-    fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<ArenaStore> {
+    fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<IndexView> {
         let mut b = Arena::builder();
         let root = b.push("C:", 0, true);
         for i in 0..n.saturating_sub(1) {
@@ -490,7 +489,7 @@ mod tests {
         let arena = b.build().0;
         let path = dir.path().join(format!("index-{n}.rkyv"));
         save(&arena, &path).unwrap();
-        Arc::new(ArenaStore::open(&path).unwrap())
+        Arc::new(IndexView::new(Arc::new(ArenaStore::open(&path).unwrap())))
     }
 
     #[test]
@@ -540,14 +539,14 @@ mod tests {
 
     /// Four reader threads each observe `archived().len()` is either 2 or 3
     /// (never corrupted) while the main thread swaps between two stores.
-    /// This pins the core `ArcSwap` correctness guarantee relied on here.
+    /// This pins the atomic publication guarantee relied on here.
     #[test]
     fn concurrent_readers_see_a_consistent_index_across_a_swap() {
         let dir = tempfile::tempdir().unwrap();
         let store_a = build_store_with_n_records(2, &dir);
         let store_b = build_store_with_n_records(3, &dir);
 
-        let swap: Arc<ArcSwap<ArenaStore>> = Arc::new(ArcSwap::from(store_a.clone()));
+        let swap: SharedStore = Arc::new(store_a.clone().into());
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
@@ -555,7 +554,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..10_000 {
                         let snap = swap.load_full();
-                        let len = snap.archived().len();
+                        let len = snap.len();
                         assert!(
                             len == 2 || len == 3,
                             "unexpected len {len} — index corrupted during swap"
@@ -584,12 +583,12 @@ mod tests {
         let store_a = build_store_with_n_records(2, &dir);
         let store_b = build_store_with_n_records(3, &dir);
 
-        let swap: Arc<ArcSwap<ArenaStore>> = Arc::new(ArcSwap::from(store_a));
+        let swap: SharedStore = Arc::new(store_a.into());
         let snapshot = swap.load_full();
-        assert_eq!(snapshot.archived().len(), 2);
+        assert_eq!(snapshot.len(), 2);
 
         swap.store(store_b);
         // snapshot still points to store A — must still report 2.
-        assert_eq!(snapshot.archived().len(), 2);
+        assert_eq!(snapshot.len(), 2);
     }
 }

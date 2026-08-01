@@ -79,6 +79,7 @@ mod tests {
                 .count(),
             5
         );
+        assert_eq!(view.search(&Query::Substring("DELTA".into()), 100).len(), 5);
     }
 
     #[test]
@@ -211,14 +212,19 @@ impl IndexView {
                 .ok(),
             _ => None,
         };
+        let substring_lower = match query {
+            Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
+            _ => None,
+        };
         for (index, record) in self.delta.live_added() {
             let matches = match query {
                 Query::Prefix(prefix) => {
                     ascii::starts_with_ci(record.name.as_bytes(), prefix.as_bytes())
                 }
-                Query::Substring(needle) => {
-                    ascii::contains_ci(record.name.as_bytes(), needle.as_bytes())
-                }
+                Query::Substring(_) => ascii::contains_ci(
+                    record.name.as_bytes(),
+                    substring_lower.as_ref().unwrap().as_bytes(),
+                ),
                 Query::Regex(_) => regex
                     .as_ref()
                     .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),

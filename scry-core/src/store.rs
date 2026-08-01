@@ -89,7 +89,18 @@ impl ArenaStore {
                 expected: FORMAT_VERSION,
             });
         }
-        let frn_map = FrnMap::open(&path.with_extension("frn")).ok();
+        let sidecar = path.with_extension("frn");
+        let frn_map = match FrnMap::open(&sidecar) {
+            Ok(map) => Some(map),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!(
+                    "scry: ignoring malformed FRN sidecar {}: {error}",
+                    sidecar.display()
+                );
+                None
+            }
+        };
         Ok(Self { mmap, frn_map })
     }
 

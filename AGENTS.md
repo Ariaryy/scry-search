@@ -15,10 +15,15 @@
 
 ## Known limitations (not oversights — documented tradeoffs)
 
-- **Full reindex on change, not incremental patching.** `scryd` debounces USN events (500ms drain)
-  then rebuilds the whole `Arena` and atomically swaps the mmap. rkyv's archived view is read-only
-  by construction (that's what makes it zero-copy), so incremental patching needs a mutable overlay
-  layered on top of the base snapshot — worth doing once reindex latency on large volumes matters.
+- **Incremental updates via an in-memory delta layer.** Structural USN events
+  are applied to a `Delta` (a bitset of tombstoned base indices plus a `Vec` of
+  added records) and published together with the base through one
+  `ArcSwap<IndexView>` — never two, or a reader could pair a new base with a
+  stale delta. The delta is compacted into a new base by streaming merge (no
+  MFT re-enumeration) once it exceeds 5% of base size. Full reindex remains the
+  fallback whenever an event can't be applied confidently, whenever the event
+  channel overflowed, and on startup. Deletes use an FRN-to-index `.frn`
+  sidecar kept out of the hot mmap so it stays evicted between bursts.
 - **Substring search uses a trigram block filter** (16,384 rows × one bit per
   1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full

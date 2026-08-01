@@ -79,5 +79,20 @@ At query time, duplicate hashes are removed and their rows are bitwise-ANDed. Se
 identify candidate blocks, whose names are then decoded and checked for the complete
 substring. Hash collisions can add candidate blocks but cannot hide a match.
 
+## FRN sidecar
+
+Each snapshot may have a sibling `.frn` file containing a sorted array of
+16-byte `(frn: u64, record_index: u32, padding: u32)` entries. The sidecar is a
+plain native-endian POD array rather than an rkyv archive. It is mmap-backed,
+validated for entry size and alignment when opened, and consulted only while
+applying structural filesystem events. A missing or malformed sidecar disables
+incremental updates but does not prevent the snapshot itself from opening.
+
+The in-memory delta is never serialized. It contains tombstoned base indices
+and records added after the snapshot was built. It starts empty after every
+daemon restart and is merged into a new base when its change count exceeds 5%
+of the base; that merge reads the existing snapshot sequentially and does not
+enumerate the filesystem.
+
 `full_path(idx, sep)` walks the parent chain from a record up to the volume root, collecting
 names, then joins them in reverse.
