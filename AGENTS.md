@@ -39,6 +39,10 @@
   it 0 because USN records do not carry size, so 0 means unknown rather than
   empty. The raw reader is used for a supported elevated NTFS volume and
   demotes to USN on parse errors or excessive torn records.
+- **Non-resident `$ATTRIBUTE_LIST` streams are detected but not decoded.** The
+  reference C: measurement reported 4,220 such lists, 1,540 unresolved base
+  records, and a stable 1,555–1,564 USN-only residual versus 18–25 raw-only
+  entries. This is a systematic coverage gap, not live-volume churn.
 - **Single volume per daemon instance**, chosen via argv. No multi-volume aggregation yet.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust
   consumers would need a `cdylib` shim over `scry-ipc`'s framing.
