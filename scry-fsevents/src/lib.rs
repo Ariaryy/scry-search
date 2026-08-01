@@ -2,6 +2,9 @@
 //! Journal live updates); other platforms land behind the same trait later.
 
 #[cfg(windows)]
+pub mod mft;
+
+#[cfg(windows)]
 pub mod windows;
 
 #[cfg(windows)]
