@@ -2,12 +2,12 @@
 use std::cmp::Ordering;
 
 pub fn cmp_ci(a: &[u8], b: &[u8]) -> Ordering {
-    let len = a.len().min(b.len());
-    for i in 0..len {
-        let x = a[i].to_ascii_lowercase();
-        let y = b[i].to_ascii_lowercase();
-        if x != y {
-            return x.cmp(&y);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let lo_x = x.to_ascii_lowercase();
+        let lo_y = y.to_ascii_lowercase();
+        match lo_x.cmp(&lo_y) {
+            Ordering::Equal => {}
+            other => return other,
         }
     }
     a.len().cmp(&b.len())
