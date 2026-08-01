@@ -1,5 +1,6 @@
 //! Bounds-checked raw NTFS metadata reader.
 
+pub mod attr;
 pub mod boot;
 pub mod record;
 pub mod runlist;
