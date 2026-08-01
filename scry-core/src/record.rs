@@ -3,7 +3,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Format version stamped into every snapshot. `ArenaStore::open` rejects
 /// snapshots with a different version rather than parsing them leniently —
 /// a version bump is a breaking format change, not a migration.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Seconds between the Windows FILETIME epoch (1601-01-01) and the Unix
 /// epoch (1970-01-01). `mtime_secs` is stored relative to 1970 rather than

@@ -19,8 +19,11 @@
   then rebuilds the whole `Arena` and atomically swaps the mmap. rkyv's archived view is read-only
   by construction (that's what makes it zero-copy), so incremental patching needs a mutable overlay
   layered on top of the base snapshot — worth doing once reindex latency on large volumes matters.
-- **Substring search is a linear scan.** Fine up to a few million entries; an n-gram index is the
-  natural next step if that stops being true.
+- **Substring search uses a trigram block filter** (16,384 rows × one bit per
+  1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
+  of the needle's trigram rows; needles shorter than 3 bytes fall back to a full
+  scan. Regex/wildcard queries are **not** filtered — that needs required-literal
+  extraction from the pattern and hasn't been done.
 - **No `size` field.** USN records don't carry file size, and the format v2 compact index removed the size field entirely to keep records at 8 bytes. A lazy stat pass would be needed for sizes.
 - **Single volume per daemon instance**, chosen via argv. No multi-volume aggregation yet.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust

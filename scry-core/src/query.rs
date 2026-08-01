@@ -1,5 +1,4 @@
 use crate::arena::ArchivedArena;
-use crate::ascii;
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
@@ -7,9 +6,7 @@ use regex_automata::util::syntax;
 pub enum Query {
     /// Anchored prefix — binary search over name-sorted records, O(log n + k).
     Prefix(String),
-    /// Unanchored substring — linear scan; needle lowercased once before the loop.
-    /// An n-gram inverted index is the documented next step if this becomes the
-    /// bottleneck (plan 006).
+    /// Unanchored substring, accelerated by a trigram block filter.
     Substring(String),
     /// Wildcard (`*`/`?`) or regex, compiled to a DFA once and reused across the scan.
     Regex(String),
@@ -45,18 +42,37 @@ pub fn search(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
             range.take(limit).collect()
         }
         Query::Substring(needle) => {
-            // Lowercase once before the scan — not once per record.
             let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            let finder = memchr::memmem::Finder::new(&needle_lower);
             let mut results = Vec::new();
-            arena.for_each_name(|idx, name| {
-                if ascii::contains_ci(name, &needle_lower) {
+            let mut scratch = Vec::new();
+            let stopped = std::cell::Cell::new(false);
+            let mut visit = |idx, name: &[u8]| {
+                scratch.clear();
+                scratch.extend(name.iter().map(|b| b.to_ascii_lowercase()));
+                if finder.find(&scratch).is_some() {
                     results.push(idx);
                     if results.len() >= limit {
+                        stopped.set(true);
                         return std::ops::ControlFlow::Break(());
                     }
                 }
                 std::ops::ControlFlow::Continue(())
-            });
+            };
+            match arena.candidate_blocks(&needle_lower) {
+                None => arena.for_each_name(&mut visit),
+                Some(blocks) => {
+                    for block in blocks {
+                        let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
+                        let end =
+                            (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
+                        arena.for_each_name_in(start..end, &mut visit);
+                        if stopped.get() {
+                            break;
+                        }
+                    }
+                }
+            }
             results
         }
         Query::Regex(pattern) => {

@@ -1,5 +1,6 @@
 use crate::ascii;
 use crate::record::{FileRecord, BUCKET_SIZE, PARENT_NONE};
+use crate::trigram::{for_each_trigram, num_blocks, row_bytes, TRIGRAM_BLOCK, TRIGRAM_ROWS};
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// The full index: records in name-sorted order, names front-coded in a
@@ -22,6 +23,8 @@ pub struct Arena {
     pub bucket_offsets: Vec<u32>,
     /// One `FileRecord` per entry, in name-sorted order. 8 bytes each.
     pub records: Vec<FileRecord>,
+    /// Trigram row matrix; each row has one LSB-first bit per 1024 records.
+    pub trigram_index: Vec<u8>,
 }
 
 impl Arena {
@@ -73,7 +76,13 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u32 {
 /// Encode `names_in_order` (already in sorted order) into `blob` and
 /// `offsets`. `offsets` will have `ceil(n/BUCKET_SIZE) + 1` entries,
 /// with `offsets[last] == blob.len()`.
-fn front_code(names_in_order: &[&[u8]], blob: &mut Vec<u8>, offsets: &mut Vec<u32>) {
+fn front_code(
+    names_in_order: &[&[u8]],
+    blob: &mut Vec<u8>,
+    offsets: &mut Vec<u32>,
+    trigram_index: &mut [u8],
+    row_len: usize,
+) {
     let n = names_in_order.len();
     let num_buckets = n.div_ceil(BUCKET_SIZE);
     offsets.reserve(num_buckets + 1);
@@ -85,12 +94,14 @@ fn front_code(names_in_order: &[&[u8]], blob: &mut Vec<u8>, offsets: &mut Vec<u3
 
         // First entry in bucket: just length + bytes (no back-reference).
         let first = names_in_order[start];
+        index_trigrams(start, first, trigram_index, row_len);
         write_varint(blob, first.len() as u32);
         blob.extend_from_slice(first);
         let mut prev = first;
 
         // Remaining entries: shared prefix length + suffix.
-        for cur in names_in_order[(start + 1)..end].iter() {
+        for (index, cur) in names_in_order[(start + 1)..end].iter().enumerate() {
+            index_trigrams(start + 1 + index, cur, trigram_index, row_len);
             let shared = common_prefix_len(prev, cur);
             write_varint(blob, shared as u32);
             let suffix = &cur[shared..];
@@ -100,6 +111,16 @@ fn front_code(names_in_order: &[&[u8]], blob: &mut Vec<u8>, offsets: &mut Vec<u3
         }
     }
     offsets.push(blob.len() as u32); // sentinel
+}
+
+fn index_trigrams(index: usize, name: &[u8], matrix: &mut [u8], row_len: usize) {
+    if matrix.is_empty() {
+        return;
+    }
+    let block = index / TRIGRAM_BLOCK;
+    for_each_trigram(name, |hash| {
+        matrix[hash as usize * row_len + block / 8] |= 1 << (block % 8);
+    });
 }
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
@@ -208,6 +229,74 @@ impl ArchivedArena {
                 }
             }
         }
+    }
+
+    /// Walk names whose record indices fall within `range`.
+    pub fn for_each_name_in(
+        &self,
+        range: std::ops::Range<u32>,
+        mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+    ) {
+        let end = range.end.min(self.records.len() as u32);
+        if range.start >= end {
+            return;
+        }
+        let first_bucket = range.start as usize / BUCKET_SIZE;
+        let last_bucket = (end as usize - 1) / BUCKET_SIZE;
+        let mut name = Vec::new();
+        'outer: for bucket in first_bucket..=last_bucket {
+            let bucket_start = bucket * BUCKET_SIZE;
+            let bucket_end = (bucket_start + BUCKET_SIZE).min(self.records.len());
+            let blob_start = self.bucket_offsets[bucket] as usize;
+            let blob_end = self.bucket_offsets[bucket + 1] as usize;
+            let blob = &self.names.as_slice()[blob_start..blob_end];
+            let mut pos = 0;
+            let first_len = read_varint(blob, &mut pos) as usize;
+            name.clear();
+            name.extend_from_slice(&blob[pos..pos + first_len]);
+            pos += first_len;
+            for idx in bucket_start..bucket_end {
+                if idx != bucket_start {
+                    let shared = read_varint(blob, &mut pos) as usize;
+                    let suffix_len = read_varint(blob, &mut pos) as usize;
+                    name.truncate(shared);
+                    name.extend_from_slice(&blob[pos..pos + suffix_len]);
+                    pos += suffix_len;
+                }
+                if idx >= range.start as usize
+                    && idx < end as usize
+                    && f(idx as u32, &name).is_break()
+                {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    /// Return blocks that can contain every trigram in `needle_lower`.
+    pub fn candidate_blocks(&self, needle_lower: &[u8]) -> Option<Vec<u32>> {
+        if needle_lower.len() < 3 || self.trigram_index.is_empty() {
+            return None;
+        }
+        let blocks = num_blocks(self.records.len());
+        let bytes = row_bytes(blocks);
+        let mut hashes = Vec::new();
+        for_each_trigram(needle_lower, |hash| hashes.push(hash as usize));
+        hashes.sort_unstable();
+        hashes.dedup();
+        let mut candidates = vec![u8::MAX; bytes];
+        for hash in hashes {
+            let row = &self.trigram_index.as_slice()[hash * bytes..(hash + 1) * bytes];
+            for (candidate, &value) in candidates.iter_mut().zip(row) {
+                *candidate &= value;
+            }
+        }
+        Some(
+            (0..blocks)
+                .filter(|&block| candidates[block / 8] & (1 << (block % 8)) != 0)
+                .map(|block| block as u32)
+                .collect(),
+        )
     }
 
     /// Walk the parent chain to reconstruct the full path. Path segments are
@@ -484,11 +573,24 @@ impl ArenaBuilder {
             })
             .collect();
 
-        // 4. Front-code names in sorted order.
+        // 4. Front-code names and build the block filter in final order.
         let name_refs: Vec<&[u8]> = order.iter().map(|&i| self.staged_name(i)).collect();
+        let blocks = num_blocks(n);
+        let row_len = row_bytes(blocks);
+        let mut trigram_index = if n < TRIGRAM_BLOCK {
+            Vec::new()
+        } else {
+            vec![0; TRIGRAM_ROWS * row_len]
+        };
         let mut names = Vec::new();
         let mut bucket_offsets = Vec::new();
-        front_code(&name_refs, &mut names, &mut bucket_offsets);
+        front_code(
+            &name_refs,
+            &mut names,
+            &mut bucket_offsets,
+            &mut trigram_index,
+            row_len,
+        );
 
         // The staging blob and the front-coded output blob briefly coexist
         // above; drop the staging blob before returning so it isn't held
@@ -503,6 +605,7 @@ impl ArenaBuilder {
             names,
             bucket_offsets,
             records,
+            trigram_index,
         }
     }
 }
@@ -607,8 +710,13 @@ mod tests {
             .flat_map(|i| {
                 vec![
                     format!("img_{i:04}.jpg"),
+                    format!("IMG archive {i:04}.png"),
                     format!("readme_{i}.txt"),
+                    format!("readme-{i:03}-final.md"),
+                    format!("alpha.beta.{i:03}"),
+                    format!("alphabet_{i:03}"),
                     format!("z_{i}"),
+                    format!("éclair_{i:03}"),
                 ]
             })
             .collect();
@@ -625,7 +733,18 @@ mod tests {
         let store = crate::store::ArenaStore::open(&path).unwrap();
         let archived = store.archived();
 
-        for prefix in &["img", "readme", "z_", "IMG", "README_0", "x", ""] {
+        for prefix in &[
+            "img",
+            "IMG ",
+            "readme",
+            "README_0",
+            "alpha.",
+            "alphabet_09",
+            "z_",
+            "éclair_",
+            "x",
+            "",
+        ] {
             let range = archived.prefix_range(prefix);
             let mut range_names: Vec<String> = range.map(|i| archived.name(i)).collect();
             range_names.sort();
@@ -654,20 +773,21 @@ mod tests {
                 let names_in: Vec<&[u8]> = vec![b"a", b"b"];
                 let mut blob = Vec::new();
                 let mut offsets = Vec::new();
-                front_code(&names_in, &mut blob, &mut offsets);
+                front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
                 blob
             },
             bucket_offsets: {
                 let names_in: Vec<&[u8]> = vec![b"a", b"b"];
                 let mut blob = Vec::new();
                 let mut offsets = Vec::new();
-                front_code(&names_in, &mut blob, &mut offsets);
+                front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
                 offsets
             },
             records: vec![
                 FileRecord::new(1, false, 0), // record 0, parent = 1
                 FileRecord::new(0, false, 0), // record 1, parent = 0 — CYCLE
             ],
+            trigram_index: Vec::new(),
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -754,5 +874,116 @@ mod tests {
             .map(|i| archived.name(i))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    fn large_arena(count: usize) -> Arena {
+        let mut builder = ArenaBuilder::default();
+        for i in 0..count {
+            builder.push(&format!("family_{:02}_file_{i:05}.dat", i % 37), 0, false);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn trigram_index_size_matches_formula() {
+        let arena = large_arena(5_000);
+        assert_eq!(
+            arena.trigram_index.len(),
+            TRIGRAM_ROWS * row_bytes(num_blocks(arena.len()))
+        );
+    }
+
+    #[test]
+    fn small_arena_has_empty_trigram_index() {
+        assert!(large_arena(100).trigram_index.is_empty());
+    }
+
+    #[test]
+    fn trigram_index_has_no_false_negatives() {
+        let arena = large_arena(5_000);
+        let bytes = row_bytes(num_blocks(arena.len()));
+        for sample in 0..200 {
+            let source_idx = sample * 23 % arena.len();
+            let source = name_from_owned_arena(&arena, source_idx as u32);
+            let length = 3 + sample % 6;
+            let start = sample % (source.len() - length + 1);
+            let needle = &source[start..start + length];
+            for idx in 0..arena.len() {
+                let name = name_from_owned_arena(&arena, idx as u32);
+                if crate::ascii::contains_ci(&name, needle) {
+                    for_each_trigram(needle, |hash| {
+                        let block = idx / TRIGRAM_BLOCK;
+                        assert_ne!(
+                            arena.trigram_index[hash as usize * bytes + block / 8]
+                                & (1 << (block % 8)),
+                            0,
+                            "missing block {block} for needle {:?}",
+                            String::from_utf8_lossy(needle)
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    fn name_from_owned_arena(arena: &Arena, idx: u32) -> Vec<u8> {
+        let bucket = idx as usize / BUCKET_SIZE;
+        let position = idx as usize % BUCKET_SIZE;
+        let blob = &arena.names
+            [arena.bucket_offsets[bucket] as usize..arena.bucket_offsets[bucket + 1] as usize];
+        let mut cursor = 0;
+        let len = read_varint(blob, &mut cursor) as usize;
+        let mut name = blob[cursor..cursor + len].to_vec();
+        cursor += len;
+        for _ in 0..position {
+            let shared = read_varint(blob, &mut cursor) as usize;
+            let suffix = read_varint(blob, &mut cursor) as usize;
+            name.truncate(shared);
+            name.extend_from_slice(&blob[cursor..cursor + suffix]);
+            cursor += suffix;
+        }
+        name
+    }
+
+    #[test]
+    fn candidate_blocks_and_ranged_scan_are_sound() {
+        let arena = large_arena(5_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trigram.rkyv");
+        save(&arena, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+
+        for needle in [b"fam".as_slice(), b"file_01", b".dat"] {
+            let candidates = archived.candidate_blocks(needle).unwrap();
+            archived.for_each_name(|idx, name| {
+                if crate::ascii::contains_ci(name, needle) {
+                    assert!(candidates.contains(&(idx / TRIGRAM_BLOCK as u32)));
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+        }
+        assert!(archived.candidate_blocks(b"").is_none());
+        assert!(archived.candidate_blocks(b"a").is_none());
+        assert!(archived.candidate_blocks(b"ab").is_none());
+
+        let mut full = Vec::new();
+        archived.for_each_name(|idx, name| {
+            full.push((idx, name.to_vec()));
+            std::ops::ControlFlow::Continue(())
+        });
+        let mut ranged = Vec::new();
+        archived.for_each_name_in(0..archived.len() as u32, |idx, name| {
+            ranged.push((idx, name.to_vec()));
+            std::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(ranged, full);
+
+        let mut mid = Vec::new();
+        archived.for_each_name_in(5..45, |idx, name| {
+            mid.push((idx, name.to_vec()));
+            std::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(mid, full[5..45]);
     }
 }

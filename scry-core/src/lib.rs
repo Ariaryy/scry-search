@@ -4,6 +4,7 @@ pub mod protocol;
 pub mod query;
 pub mod record;
 pub mod store;
+pub mod trigram;
 
 #[cfg(test)]
 mod tests;
