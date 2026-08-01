@@ -346,10 +346,7 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scry_core::{
-        store::save,
-        Arena,
-    };
+    use scry_core::{store::save, Arena};
     use scry_fsevents::ChangeEvent;
 
     fn build_store_with_n_records(n: usize, dir: &tempfile::TempDir) -> Arc<ArenaStore> {

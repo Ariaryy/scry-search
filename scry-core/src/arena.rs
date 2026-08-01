@@ -90,8 +90,7 @@ fn front_code(names_in_order: &[&[u8]], blob: &mut Vec<u8>, offsets: &mut Vec<u3
         let mut prev = first;
 
         // Remaining entries: shared prefix length + suffix.
-        for i in (start + 1)..end {
-            let cur = names_in_order[i];
+        for cur in names_in_order[(start + 1)..end].iter() {
             let shared = common_prefix_len(prev, cur);
             write_varint(blob, shared as u32);
             let suffix = &cur[shared..];
@@ -105,46 +104,6 @@ fn front_code(names_in_order: &[&[u8]], blob: &mut Vec<u8>, offsets: &mut Vec<u3
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-/// Decode all names in bucket `b` into `out_names` (a reusable scratch buffer
-/// of Vec<u8>s). Returns a slice into `out_names`.
-fn decode_bucket<'a>(
-    blob: &[u8],
-    offsets: &[u32],
-    b: usize,
-    out_names: &'a mut Vec<Vec<u8>>,
-) -> &'a [Vec<u8>] {
-    out_names.clear();
-    let start_offset = offsets[b] as usize;
-    let end_offset = offsets[b + 1] as usize;
-    let bucket_blob = &blob[start_offset..end_offset];
-
-    if bucket_blob.is_empty() {
-        return &out_names[..];
-    }
-
-    let mut pos = 0usize;
-    // First name.
-    let len = read_varint(bucket_blob, &mut pos) as usize;
-    out_names.push(bucket_blob[pos..pos + len].to_vec());
-    pos += len;
-
-    // Subsequent names.
-    while pos < bucket_blob.len() {
-        let shared = read_varint(bucket_blob, &mut pos) as usize;
-        let suffix_len = read_varint(bucket_blob, &mut pos) as usize;
-        let suffix = &bucket_blob[pos..pos + suffix_len];
-        pos += suffix_len;
-
-        let prev = out_names.last().unwrap();
-        let mut name = Vec::with_capacity(shared + suffix_len);
-        name.extend_from_slice(&prev[..shared]);
-        name.extend_from_slice(suffix);
-        out_names.push(name);
-    }
-
-    &out_names[..]
 }
 
 impl ArchivedArena {
@@ -352,8 +311,8 @@ impl ArchivedArena {
             // Check first name
             {
                 let matches = ascii::starts_with_ci(&name_buf, &prefix_lower);
-                let before = ascii::cmp_ci(&name_buf, &prefix_lower) == std::cmp::Ordering::Less
-                    && !matches;
+                let before =
+                    ascii::cmp_ci(&name_buf, &prefix_lower) == std::cmp::Ordering::Less && !matches;
                 if matches {
                     if lo_idx.is_none() {
                         lo_idx = Some(bstart);
@@ -377,8 +336,8 @@ impl ArchivedArena {
 
                 let global_idx = bstart + rel;
                 let matches = ascii::starts_with_ci(&name_buf, &prefix_lower);
-                let before = ascii::cmp_ci(&name_buf, &prefix_lower) == std::cmp::Ordering::Less
-                    && !matches;
+                let before =
+                    ascii::cmp_ci(&name_buf, &prefix_lower) == std::cmp::Ordering::Less && !matches;
 
                 if matches {
                     if lo_idx.is_none() {
@@ -386,10 +345,8 @@ impl ArchivedArena {
                     }
                     hi_idx = Some(global_idx + 1);
                     past_matches = false;
-                } else if !before {
-                    if lo_idx.is_some() {
-                        break 'scan;
-                    }
+                } else if !before && lo_idx.is_some() {
+                    break 'scan;
                 }
             }
         }
@@ -460,8 +417,11 @@ impl ArenaBuilder {
         // 1. Build sort order: ASCII-case-insensitive, ties by insertion index.
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_unstable_by(|&a, &b| {
-            ascii::cmp_ci(self.names[a as usize].as_bytes(), self.names[b as usize].as_bytes())
-                .then(a.cmp(&b))
+            ascii::cmp_ci(
+                self.names[a as usize].as_bytes(),
+                self.names[b as usize].as_bytes(),
+            )
+            .then(a.cmp(&b))
         });
 
         // 2. Build inverse permutation: rank[order[j]] = j.
@@ -480,12 +440,19 @@ impl ArenaBuilder {
                 } else {
                     rank[orig_parent as usize]
                 };
-                FileRecord::new(new_parent, self.dirs[orig as usize], self.mtimes[orig as usize])
+                FileRecord::new(
+                    new_parent,
+                    self.dirs[orig as usize],
+                    self.mtimes[orig as usize],
+                )
             })
             .collect();
 
         // 4. Front-code names in sorted order.
-        let name_refs: Vec<&[u8]> = order.iter().map(|&i| self.names[i as usize].as_bytes()).collect();
+        let name_refs: Vec<&[u8]> = order
+            .iter()
+            .map(|&i| self.names[i as usize].as_bytes())
+            .collect();
         let mut names = Vec::new();
         let mut bucket_offsets = Vec::new();
         front_code(&name_refs, &mut names, &mut bucket_offsets);
@@ -502,7 +469,7 @@ impl ArenaBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{FileRecord, PARENT_NONE};
+    use crate::record::FileRecord;
     use crate::store::save;
 
     fn simple_arena(names: &[&str]) -> Arena {
@@ -596,7 +563,13 @@ mod tests {
     #[test]
     fn prefix_range_matches_a_brute_force_scan() {
         let names: Vec<String> = (0..100)
-            .flat_map(|i| vec![format!("img_{i:04}.jpg"), format!("readme_{i}.txt"), format!("z_{i}")])
+            .flat_map(|i| {
+                vec![
+                    format!("img_{i:04}.jpg"),
+                    format!("readme_{i}.txt"),
+                    format!("z_{i}"),
+                ]
+            })
             .collect();
 
         let mut b = ArenaBuilder::default();
@@ -613,8 +586,7 @@ mod tests {
 
         for prefix in &["img", "readme", "z_", "IMG", "README_0", "x", ""] {
             let range = archived.prefix_range(prefix);
-            let mut range_names: Vec<String> =
-                range.map(|i| archived.name(i)).collect();
+            let mut range_names: Vec<String> = range.map(|i| archived.name(i)).collect();
             range_names.sort();
 
             let prefix_lower = prefix.to_ascii_lowercase();
@@ -626,7 +598,8 @@ mod tests {
 
             assert_eq!(
                 range_names, brute,
-                "prefix_range mismatch for prefix {:?}", prefix
+                "prefix_range mismatch for prefix {:?}",
+                prefix
             );
         }
     }
@@ -664,6 +637,9 @@ mod tests {
 
         // Must not hang; returns something finite.
         let path = archived.full_path(0, '\\');
-        assert!(!path.is_empty(), "full_path should return something even with a cycle");
+        assert!(
+            !path.is_empty(),
+            "full_path should return something even with a cycle"
+        );
     }
 }

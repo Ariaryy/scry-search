@@ -10,5 +10,9 @@ fn bench_size() {
     let path = dir.path().join("bench.rkyv");
     scry_core::store::save(&arena, &path).unwrap();
     let len = std::fs::metadata(&path).unwrap().len();
-    println!("1M entries size: {} bytes, {} bytes/entry", len, len as f64 / 1_000_000.0);
+    println!(
+        "1M entries size: {} bytes, {} bytes/entry",
+        len,
+        len as f64 / 1_000_000.0
+    );
 }

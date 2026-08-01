@@ -14,15 +14,11 @@ pub fn cmp_ci(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn starts_with_ci(hay: &[u8], needle: &[u8]) -> bool {
-    if hay.len() < needle.len() {
-        return false;
-    }
-    for i in 0..needle.len() {
-        if hay[i].to_ascii_lowercase() != needle[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
+    hay.len() >= needle.len()
+        && hay
+            .iter()
+            .zip(needle.iter())
+            .all(|(h, n)| h.eq_ignore_ascii_case(n))
 }
 
 pub fn contains_ci(hay: &[u8], needle_lower: &[u8]) -> bool {

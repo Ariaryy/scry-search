@@ -44,10 +44,7 @@ fn round_trip_through_mmap_store_preserves_data() {
 
     let hits = search(archived, &Query::Prefix("report".into()), 10);
     assert_eq!(hits.len(), 2);
-    let mut names: Vec<String> = hits
-        .iter()
-        .map(|&i| archived.name(i))
-        .collect();
+    let mut names: Vec<String> = hits.iter().map(|&i| archived.name(i)).collect();
     names.sort();
     assert_eq!(names, vec!["report.docx", "report_final.docx"]);
 

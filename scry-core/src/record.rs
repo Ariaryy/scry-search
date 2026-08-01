@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(filetime_to_secs(0), 0);
         assert_eq!(filetime_to_secs(-1), 0);
         assert_eq!(filetime_to_secs(10_000_000), 0); // 1601-01-01T00:00:01Z
-        // Exactly the Unix epoch.
+                                                     // Exactly the Unix epoch.
         assert_eq!(filetime_to_secs(FILETIME_UNIX_EPOCH_SECS * 10_000_000), 0);
         assert_eq!(
             filetime_to_secs((FILETIME_UNIX_EPOCH_SECS + 1) * 10_000_000),

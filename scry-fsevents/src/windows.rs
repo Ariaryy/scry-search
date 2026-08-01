@@ -7,8 +7,8 @@
 //! overlapped I/O so the watcher thread blocks at 0% CPU when the volume is
 //! idle; `JournalHandle::stop` unblocks it deterministically via `CancelIoEx`.
 
+use scry_core::record::filetime_to_secs;
 use scry_core::ArenaBuilder;
-use scry_core::record::{filetime_to_secs, PARENT_NONE};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -100,11 +100,7 @@ impl WindowsBackend {
         let mut frn_to_idx: HashMap<u64, u32> = HashMap::with_capacity(entries.len());
 
         for e in &entries {
-            let idx = builder.push(
-                e.name.clone(),
-                filetime_to_secs(e.mtime),
-                e.is_dir,
-            );
+            let idx = builder.push(e.name.clone(), filetime_to_secs(e.mtime), e.is_dir);
             frn_to_idx.insert(e.frn, idx);
         }
 

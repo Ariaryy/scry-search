@@ -84,15 +84,6 @@ impl ArenaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::ArenaBuilder;
-
-    fn make_store(dir: &tempfile::TempDir) -> () {
-        let mut b = ArenaBuilder::default();
-        b.push("hello".to_string(), 0, false);
-        let arena = b.build();
-        let path = dir.path().join("ok.rkyv");
-        save(&arena, &path).unwrap();
-    }
 
     #[test]
     fn open_rejects_a_snapshot_with_a_different_format_version() {
@@ -110,7 +101,11 @@ mod tests {
         // of random-ish bytes is rejected, which covers the version-check path.
         // (The valid save above also exercises the happy path in open().)
         let random_path = dir.path().join("random.rkyv");
-        std::fs::write(&random_path, b"this is not a valid rkyv archive at all xxxx").unwrap();
+        std::fs::write(
+            &random_path,
+            b"this is not a valid rkyv archive at all xxxx",
+        )
+        .unwrap();
         let result = ArenaStore::open(&random_path);
         assert!(
             result.is_err(),
