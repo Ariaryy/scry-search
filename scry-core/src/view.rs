@@ -8,6 +8,7 @@ use crate::delta::{Delta, ParentRef};
 use crate::protocol::ResultEntry;
 use crate::query::{search_base, Query};
 use crate::store::ArenaStore;
+use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
 
 /// Immutable base-and-overlay pair published through one atomic pointer.
 pub struct IndexView {
@@ -102,6 +103,69 @@ mod tests {
         view.delta = Arc::new(delta);
         assert!(view.delta_path(1).ends_with("X\\y"));
     }
+
+    fn open_compacted(view: &IndexView) -> (tempfile::TempDir, IndexView) {
+        let (arena, mut frns) = view.compact();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compacted.rkyv");
+        crate::store::save_with_sidecar(&arena, &mut frns, &path, |_| {}, |_| {}).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        (dir, IndexView::new(base))
+    }
+
+    #[test]
+    fn compaction_preserves_query_results() {
+        let (_dir, mut view) = base_view(200);
+        let root = view.base.archived().prefix_range("C:").start;
+        let deleted = view.base.archived().prefix_range("match_0042").start;
+        let mut delta = Delta::new(view.base.archived().len());
+        delta.tombstones.set(deleted);
+        delta.added.push(DeltaRecord {
+            name: "match_delta.txt".into(),
+            parent: ParentRef::Base(root),
+            mtime_secs: 0,
+            is_dir: false,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+
+        let before: Vec<Vec<String>> = (0..50)
+            .map(|i| {
+                let mut paths: Vec<_> = view
+                    .search(&Query::Substring(format!("{:02}", i)), usize::MAX)
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect();
+                paths.sort();
+                paths
+            })
+            .collect();
+        let (_compacted_dir, compacted) = open_compacted(&view);
+        for (i, expected) in before.into_iter().enumerate() {
+            let mut actual: Vec<_> = compacted
+                .search(&Query::Substring(format!("{:02}", i)), usize::MAX)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn compaction_removes_tombstones_and_empty_is_identity() {
+        let (_dir, mut view) = base_view(20);
+        let original = view.len();
+        let empty = view.compact().0;
+        assert_eq!(empty.len(), original);
+
+        let mut delta = Delta::new(view.base.archived().len());
+        assert!(delta.tombstones.set(3));
+        assert!(delta.tombstones.set(7));
+        view.delta = Arc::new(delta);
+        let compacted = view.compact().0;
+        assert_eq!(compacted.len(), original - 2);
+    }
 }
 
 impl IndexView {
@@ -192,5 +256,82 @@ impl IndexView {
             Some(parent) => format!("{}\\{suffix}", self.base.archived().full_path(parent, '\\')),
             None => suffix,
         }
+    }
+
+    /// Merge the overlay into a new base without re-enumerating the volume.
+    pub fn compact(&self) -> (Arena, Vec<FrnEntry>) {
+        let arena = self.base.archived();
+        let mut frns_by_base = vec![None; arena.len()];
+        if let Some(map) = &self.base.frn_map {
+            for entry in map.iter() {
+                if let Some(slot) = frns_by_base.get_mut(entry.index as usize) {
+                    *slot = Some(entry.frn);
+                }
+            }
+        }
+        let mut frns_by_delta = vec![None; self.delta.added.len()];
+        for (&frn, &index) in &self.delta.added_frns {
+            frns_by_delta[index as usize] = Some(frn);
+        }
+
+        let live_base = arena.len() - self.delta.tombstones.count_ones() as usize;
+        let live_delta = self.delta.live_added().count();
+        let mut builder = ArenaBuilder::with_capacity(live_base + live_delta, arena.names.len());
+        let mut base_indices = vec![None; arena.len()];
+        let mut delta_indices = vec![None; self.delta.added.len()];
+        let mut name = Vec::new();
+
+        for old in 0..arena.len() as u32 {
+            if self.delta.tombstones.get(old) {
+                continue;
+            }
+            arena.name_into(old, &mut name);
+            let record = &arena.records[old as usize];
+            let new = match frns_by_base[old as usize] {
+                Some(frn) => {
+                    builder.push_bytes_with_frn(&name, record.mtime_secs, record.is_dir(), frn)
+                }
+                None => builder.push_bytes(&name, record.mtime_secs, record.is_dir()),
+            };
+            base_indices[old as usize] = Some(new);
+        }
+        for (old, record) in self.delta.live_added() {
+            let new = match frns_by_delta[old as usize] {
+                Some(frn) => builder.push_bytes_with_frn(
+                    record.name.as_bytes(),
+                    record.mtime_secs,
+                    record.is_dir,
+                    frn,
+                ),
+                None => {
+                    builder.push_bytes(record.name.as_bytes(), record.mtime_secs, record.is_dir)
+                }
+            };
+            delta_indices[old as usize] = Some(new);
+        }
+
+        for old in 0..arena.len() as u32 {
+            let Some(new) = base_indices[old as usize] else {
+                continue;
+            };
+            let parent = arena.records[old as usize].parent();
+            if parent != PARENT_NONE {
+                if let Some(new_parent) = base_indices[parent as usize] {
+                    builder.set_parent(new, new_parent);
+                }
+            }
+        }
+        for (old, record) in self.delta.live_added() {
+            let new = delta_indices[old as usize].unwrap();
+            let parent = match record.parent {
+                ParentRef::Base(index) => base_indices[index as usize],
+                ParentRef::Delta(index) => delta_indices[index as usize],
+                ParentRef::None => None,
+            };
+            if let Some(parent) = parent {
+                builder.set_parent(new, parent);
+            }
+        }
+        builder.build()
     }
 }

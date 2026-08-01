@@ -197,6 +197,54 @@ fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<A
     Ok(Arc::new(IndexView::new(base)))
 }
 
+fn compact_view(
+    view: &IndexView,
+    volume: &str,
+    auxiliary_marking_enabled: bool,
+) -> anyhow::Result<Arc<IndexView>> {
+    let _background = BackgroundModeGuard::enter();
+    let (arena, mut frns) = view.compact();
+    let path = snapshot_path(volume);
+    let volume = volume.to_string();
+    let mark = |file: &std::fs::File| {
+        if auxiliary_marking_enabled {
+            if let Err(error) =
+                scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(file, &volume)
+            {
+                eprintln!("scryd: could not mark compacted index as auxiliary ({error})");
+            }
+        }
+    };
+    scry_core::store::save_with_sidecar(&arena, &mut frns, &path, mark, mark)?;
+    Ok(Arc::new(IndexView::new(Arc::new(ArenaStore::open(&path)?))))
+}
+
+struct BackgroundModeGuard;
+
+impl BackgroundModeGuard {
+    fn enter() -> Self {
+        unsafe {
+            ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_BEGIN);
+        }
+        Self
+    }
+}
+
+impl Drop for BackgroundModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_END);
+        }
+    }
+}
+
+fn trim_working_set() {
+    unsafe {
+        ffi::mi_collect(true);
+        ffi::SetProcessWorkingSetSizeEx(ffi::GetCurrentProcess(), usize::MAX, usize::MAX, 0);
+    }
+}
+
 fn snapshot_path(volume: &str) -> std::path::PathBuf {
     let safe: String = volume.chars().filter(|c| c.is_alphanumeric()).collect();
     std::env::temp_dir().join(format!("scry-index-{safe}.rkyv"))
@@ -334,10 +382,27 @@ fn reindex_on_changes(
         }
 
         if !needs_full_reindex {
-            store.store(Arc::new(IndexView {
+            let next = Arc::new(IndexView {
                 base: view.base.clone(),
                 delta: Arc::new(delta),
-            }));
+            });
+            let changes = next.delta.tombstones.count_ones() as usize + next.delta.added.len();
+            if changes.saturating_mul(20) > next.base.archived().len() {
+                match compact_view(&next, &volume, auxiliary_marking_enabled) {
+                    Ok(compacted) => {
+                        let len = compacted.len();
+                        store.store(compacted);
+                        trim_working_set();
+                        eprintln!("scryd: compacted {volume} ({len} entries)");
+                    }
+                    Err(error) => {
+                        store.store(next);
+                        eprintln!("scryd: compaction failed: {error}");
+                    }
+                }
+            } else {
+                store.store(next);
+            }
             continue;
         }
 
@@ -345,6 +410,7 @@ fn reindex_on_changes(
             Ok(new_view) => {
                 let len = new_view.len();
                 store.store(new_view);
+                trim_working_set();
                 eprintln!("scryd: reindexed {volume} ({len} entries)");
             }
             Err(e) => eprintln!("scryd: reindex failed: {e}"),

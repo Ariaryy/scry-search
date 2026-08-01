@@ -24,6 +24,8 @@ pub const THREAD_POWER_THROTTLING_CURRENT_VERSION: Dword = 1;
 pub const POWER_THROTTLING_EXECUTION_SPEED: Dword = 0x0000_0001;
 
 pub const MEMORY_PRIORITY_LOW: Dword = 2;
+pub const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
+pub const THREAD_MODE_BACKGROUND_END: i32 = 0x0002_0000;
 
 #[repr(C)]
 pub struct ProcessPowerThrottlingState {
@@ -64,4 +66,15 @@ extern "system" {
     ) -> Bool;
 
     pub fn GetLastError() -> Dword;
+    pub fn SetThreadPriority(h_thread: Handle, priority: i32) -> Bool;
+    pub fn SetProcessWorkingSetSizeEx(
+        h_process: Handle,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        flags: Dword,
+    ) -> Bool;
+}
+
+extern "C" {
+    pub fn mi_collect(force: bool);
 }

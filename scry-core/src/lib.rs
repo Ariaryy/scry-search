@@ -13,6 +13,7 @@ pub mod view;
 mod tests;
 
 pub use arena::{ArchivedArena, Arena, ArenaBuilder};
+pub use frnmap::FrnEntry;
 pub use protocol::{QueryKind, Request, ResultEntry};
 pub use query::Query;
 pub use record::{
