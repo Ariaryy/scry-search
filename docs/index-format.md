@@ -1,10 +1,10 @@
-# Index format v2
+# Index format v3
 
 `scry-core::Arena` (`scry-core/src/arena.rs`):
 
 ```rust
 Arena {
-    format_version: u32,     // = 2
+    format_version: u32,     // = 3
     names: Vec<u8>,          // front-coded name blob
     bucket_offsets: Vec<u32>,// len = num_buckets + 1; last entry == names.len()
     records: Vec<FileRecord>, // 8 bytes each, in name-sorted order
@@ -12,11 +12,15 @@ Arena {
 
 FileRecord {
     parent_and_flags: u32,   // bit 31 = is_dir; bits 0..31 = parent record index
-    mtime_secs: u32,         // seconds since 1601-01-01 UTC
+    mtime_secs: u32,         // seconds since 1970-01-01 UTC, clamped to [0, 2^32-1] (year 2106)
 }
 ```
 
-Format v2 is an 8-byte record compact index, name-sorted storage, front-coded name blob.
+Format v3 is an 8-byte record compact index, name-sorted storage, front-coded name blob.
+
+## Changelog
+
+- v3 — mtime_secs rebased from the 1601 FILETIME epoch to the Unix epoch (v2 saturated for all real timestamps).
 
 Serialized with rkyv (`scry_core::store::save`) to a single file: an atomic write via
 `.tmp` + rename. Reading (`ArenaStore::open`) mmaps the file and casts the bytes directly
