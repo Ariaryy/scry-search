@@ -90,7 +90,7 @@ mod tests {
         // Save a valid arena, then corrupt its format_version bytes.
         let dir = tempfile::tempdir().unwrap();
         let mut b = crate::arena::ArenaBuilder::default();
-        b.push("test".to_string(), 0, false);
+        b.push("test", 0, false);
         let arena = b.build();
         let path = dir.path().join("versioned.rkyv");
         save(&arena, &path).unwrap();

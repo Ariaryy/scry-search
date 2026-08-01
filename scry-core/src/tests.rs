@@ -4,14 +4,14 @@ use crate::store::{save, ArenaStore};
 
 fn sample_arena() -> Arena {
     let mut b = Arena::builder();
-    let root = b.push("C:".to_string(), 0, true);
-    let docs = b.push("Documents".to_string(), 0, true);
+    let root = b.push("C:", 0, true);
+    let docs = b.push("Documents", 0, true);
     b.set_parent(docs, root);
-    let r1 = b.push("report.docx".to_string(), 0, false);
+    let r1 = b.push("report.docx", 0, false);
     b.set_parent(r1, docs);
-    let r2 = b.push("report_final.docx".to_string(), 0, false);
+    let r2 = b.push("report_final.docx", 0, false);
     b.set_parent(r2, docs);
-    let readme = b.push("readme.txt".to_string(), 0, false);
+    let readme = b.push("readme.txt", 0, false);
     b.set_parent(readme, root);
     b.build()
 }

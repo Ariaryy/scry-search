@@ -373,23 +373,52 @@ impl ArchivedArena {
 
 #[derive(Default)]
 pub struct ArenaBuilder {
-    names: Vec<String>,
+    /// All names concatenated, no per-name allocation. Sorting operates on a
+    /// permutation of indices into `name_ends`, comparing slices of this blob
+    /// directly — the previous `Vec<String>` cost one heap allocation per
+    /// filename and made a full rebuild the dominant source of the daemon's
+    /// memory spikes.
+    staging_names: Vec<u8>,
+    /// Exclusive end offset of each name in `staging_names`; the start of
+    /// name `i` is `name_ends[i-1]` (or 0 for `i == 0`).
+    name_ends: Vec<u32>,
     parents: Vec<u32>,
     mtimes: Vec<u32>,
     dirs: Vec<bool>,
 }
 
 impl ArenaBuilder {
-    /// Push an entry; returns its provisional index (valid for `set_parent`
-    /// calls before `build()` — `build()` reorders into name order and rewrites
-    /// all parent links).
-    pub fn push(&mut self, name: String, mtime_secs: u32, is_dir: bool) -> u32 {
-        let idx = self.names.len() as u32;
-        self.names.push(name);
+    /// Reserve capacity up front. Callers that know the entry count should
+    /// use this — growth reallocation of the staging blob is the largest
+    /// single transient allocation in a rebuild.
+    pub fn with_capacity(entries: usize, name_bytes: usize) -> Self {
+        ArenaBuilder {
+            staging_names: Vec::with_capacity(name_bytes),
+            name_ends: Vec::with_capacity(entries),
+            parents: Vec::with_capacity(entries),
+            mtimes: Vec::with_capacity(entries),
+            dirs: Vec::with_capacity(entries),
+        }
+    }
+
+    /// Push an entry whose name is given as UTF-8 bytes, copied into the
+    /// staging blob. Returns its provisional index (valid for `set_parent`
+    /// calls before `build()` — `build()` reorders into name order and
+    /// rewrites all parent links).
+    pub fn push_bytes(&mut self, name: &[u8], mtime_secs: u32, is_dir: bool) -> u32 {
+        let idx = self.name_ends.len() as u32;
+        self.staging_names.extend_from_slice(name);
+        self.name_ends.push(self.staging_names.len() as u32);
         self.parents.push(PARENT_NONE);
         self.mtimes.push(mtime_secs);
         self.dirs.push(is_dir);
         idx
+    }
+
+    /// Convenience wrapper for callers that already have a `&str` (tests,
+    /// mostly). Prefer `push_bytes` on the hot path.
+    pub fn push(&mut self, name: &str, mtime_secs: u32, is_dir: bool) -> u32 {
+        self.push_bytes(name.as_bytes(), mtime_secs, is_dir)
     }
 
     pub fn set_parent(&mut self, idx: u32, parent: u32) {
@@ -397,16 +426,23 @@ impl ArenaBuilder {
     }
 
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.name_ends.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.name_ends.is_empty()
+    }
+
+    fn staged_name(&self, i: u32) -> &[u8] {
+        let i = i as usize;
+        let start = if i == 0 { 0 } else { self.name_ends[i - 1] as usize };
+        let end = self.name_ends[i] as usize;
+        &self.staging_names[start..end]
     }
 
     /// Finalize: sort by name, remap parents, front-code names.
-    pub fn build(self) -> Arena {
-        let n = self.names.len();
+    pub fn build(mut self) -> Arena {
+        let n = self.name_ends.len();
         assert!(
             n < PARENT_NONE as usize,
             "arena exceeds maximum capacity ({} entries, limit {})",
@@ -417,11 +453,7 @@ impl ArenaBuilder {
         // 1. Build sort order: ASCII-case-insensitive, ties by insertion index.
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_unstable_by(|&a, &b| {
-            ascii::cmp_ci(
-                self.names[a as usize].as_bytes(),
-                self.names[b as usize].as_bytes(),
-            )
-            .then(a.cmp(&b))
+            ascii::cmp_ci(self.staged_name(a), self.staged_name(b)).then(a.cmp(&b))
         });
 
         // 2. Build inverse permutation: rank[order[j]] = j.
@@ -449,13 +481,18 @@ impl ArenaBuilder {
             .collect();
 
         // 4. Front-code names in sorted order.
-        let name_refs: Vec<&[u8]> = order
-            .iter()
-            .map(|&i| self.names[i as usize].as_bytes())
-            .collect();
+        let name_refs: Vec<&[u8]> = order.iter().map(|&i| self.staged_name(i)).collect();
         let mut names = Vec::new();
         let mut bucket_offsets = Vec::new();
         front_code(&name_refs, &mut names, &mut bucket_offsets);
+
+        // The staging blob and the front-coded output blob briefly coexist
+        // above; drop the staging blob before returning so it isn't held
+        // alongside the (smaller, but still substantial) output for the rest
+        // of the caller's stack frame. Leave this explicit — a "tidy" refactor
+        // that removes it silently regresses peak build memory.
+        drop(std::mem::take(&mut self.staging_names));
+        drop(std::mem::take(&mut self.name_ends));
 
         Arena {
             format_version: crate::record::FORMAT_VERSION,
@@ -475,7 +512,7 @@ mod tests {
     fn simple_arena(names: &[&str]) -> Arena {
         let mut b = ArenaBuilder::default();
         for &name in names {
-            b.push(name.to_string(), 0, false);
+            b.push(name, 0, false);
         }
         b.build()
     }
@@ -504,7 +541,7 @@ mod tests {
 
         let mut b = ArenaBuilder::default();
         for name in &raw {
-            b.push(name.clone(), 0, false);
+            b.push(name, 0, false);
         }
         let arena = b.build();
 
@@ -574,7 +611,7 @@ mod tests {
 
         let mut b = ArenaBuilder::default();
         for n in &names {
-            b.push(n.clone(), 0, false);
+            b.push(n, 0, false);
         }
         let arena = b.build();
 
