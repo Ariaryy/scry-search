@@ -1,6 +1,7 @@
 //! Bounds-checked raw NTFS metadata reader.
 
 pub mod boot;
+pub mod record;
 pub mod runlist;
 
 use thiserror::Error;
