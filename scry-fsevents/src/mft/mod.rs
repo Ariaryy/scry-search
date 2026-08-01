@@ -48,8 +48,14 @@ pub fn enumerate_mft_raw(
         .share_mode(1 | 2)
         .open(path)?;
     let (runs, stream_size) = mft_runs(&mut file, geometry)?;
+    drop(file);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2)
+        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(format!(r"\\.\{volume}"))?;
     let mut report = MftEnumReport::default();
-    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut buffer = AlignedBuffer::new(4 * 1024 * 1024, geometry.physical_sector_size)?;
     let mut stream_position = 0u64;
 
     for run in runs {
@@ -67,14 +73,17 @@ pub fn enumerate_mft_raw(
         while run_position < run_bytes && stream_position < stream_size {
             let remaining_run = run_bytes - run_position;
             let remaining_stream = stream_size - stream_position;
-            let wanted = remaining_run.min(remaining_stream).min(buffer.len() as u64) as usize;
-            let aligned = wanted - wanted % geometry.file_record_size as usize;
+            let wanted = remaining_run.min(buffer.len() as u64) as usize;
+            let aligned = wanted - wanted % geometry.physical_sector_size as usize;
             if aligned == 0 {
                 break;
             }
             file.seek(std::io::SeekFrom::Start(disk_offset + run_position))?;
-            std::io::Read::read_exact(&mut file, &mut buffer[..aligned])?;
-            for (within_chunk, record_bytes) in buffer[..aligned]
+            std::io::Read::read_exact(&mut file, &mut buffer.as_mut_slice()[..aligned])?;
+            let logical = (remaining_stream.min(aligned as u64) as usize)
+                / geometry.file_record_size as usize
+                * geometry.file_record_size as usize;
+            for (within_chunk, record_bytes) in buffer.as_mut_slice()[..logical]
                 .chunks_exact_mut(geometry.file_record_size as usize)
                 .enumerate()
             {
@@ -97,6 +106,73 @@ pub fn enumerate_mft_raw(
         }
     }
     Ok(report)
+}
+
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_RELEASE: u32 = 0x8000;
+const PAGE_READWRITE: u32 = 0x04;
+
+struct AlignedBuffer {
+    pointer: *mut u8,
+    length: usize,
+}
+
+impl AlignedBuffer {
+    fn new(length: usize, alignment: u32) -> Result<Self, MftError> {
+        let pointer = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                length,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        if pointer.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if !(pointer as usize).is_multiple_of(alignment as usize) {
+            unsafe {
+                VirtualFree(pointer.cast(), 0, MEM_RELEASE);
+            }
+            return Err(MftError::Invalid(
+                "VirtualAlloc buffer is not sector-aligned",
+            ));
+        }
+        Ok(Self { pointer, length })
+    }
+
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the allocation owns `length` writable bytes and this method
+        // requires the unique mutable borrow of the owner.
+        unsafe { std::slice::from_raw_parts_mut(self.pointer, self.length) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            VirtualFree(self.pointer.cast(), 0, MEM_RELEASE);
+        }
+    }
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAlloc(
+        address: *mut std::ffi::c_void,
+        size: usize,
+        allocation_type: u32,
+        protect: u32,
+    ) -> *mut std::ffi::c_void;
+    fn VirtualFree(address: *mut std::ffi::c_void, size: usize, free_type: u32) -> i32;
 }
 
 fn mft_runs(
