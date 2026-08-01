@@ -9,7 +9,6 @@
 
 use scry_core::record::filetime_to_secs;
 use scry_core::ArenaBuilder;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -94,15 +93,25 @@ impl WindowsBackend {
     /// journal's enumeration ioctl, bypassing per-file stat()/directory walks.
     /// Requires the process to hold `SeBackupPrivilege` (i.e. run elevated).
     pub fn bulk_index_volume(volume: &str) -> Result<scry_core::Arena, WindowsBackendError> {
-        let entries = enumerate_mft(volume)?;
+        // Arbitrary initial guess (200k entries / 4 MB of names) that avoids
+        // the first several reallocations of the staging blob without
+        // over-committing on small volumes.
+        let mut builder = ArenaBuilder::with_capacity(200_000, 4 * 1024 * 1024);
+        // (frn, provisional index), sorted after enumeration for binary
+        // search. A hashmap keyed by frn costs ~18 MB at a million entries
+        // once hashbrown's load factor is accounted for, with random-access
+        // probe behaviour; a sorted Vec is 12 bytes per entry, contiguous,
+        // and built with one sort.
+        let mut frn_table: Vec<(u64, u32)> = Vec::new();
+        // Parallel to record order: each entry's parent FRN, needed once all
+        // entries (and therefore all indices) are known.
+        let mut parent_frns: Vec<u64> = Vec::new();
 
-        let mut builder = ArenaBuilder::default();
-        let mut frn_to_idx: HashMap<u64, u32> = HashMap::with_capacity(entries.len());
-
-        for e in &entries {
-            let idx = builder.push(e.name.clone(), filetime_to_secs(e.mtime), e.is_dir);
-            frn_to_idx.insert(e.frn, idx);
-        }
+        enumerate_mft(volume, |frn, parent_frn, name, is_dir, mtime| {
+            let idx = builder.push_bytes(name, filetime_to_secs(mtime), is_dir);
+            frn_table.push((frn, idx));
+            parent_frns.push(parent_frn);
+        })?;
 
         // The NTFS root record (self-parented, or simply never referenced by
         // any child's parent FRN, depending on what the enumeration yields)
@@ -110,26 +119,25 @@ impl WindowsBackend {
         // entry's parent chain would just stop, dropping the drive letter.
         // Give every "no real parent" entry an explicit volume-root node
         // so full_path() always includes the drive letter.
-        let root_idx = builder.push(volume.to_string(), 0, true);
+        let root_idx = builder.push(volume, 0, true);
 
-        for (i, e) in entries.iter().enumerate() {
+        frn_table.sort_unstable_by_key(|&(frn, _)| frn);
+
+        for (i, &parent_frn) in parent_frns.iter().enumerate() {
             let idx = i as u32;
-            match frn_to_idx.get(&e.parent_frn) {
-                Some(&p) if p != idx => builder.set_parent(idx, p),
+            match frn_table.binary_search_by_key(&parent_frn, |&(frn, _)| frn) {
+                Ok(pos) if frn_table[pos].1 != idx => builder.set_parent(idx, frn_table[pos].1),
                 _ => builder.set_parent(idx, root_idx),
             }
         }
 
+        // Released before build()'s sort allocates its permutation — ~20 MB
+        // freed ahead of the next big transient.
+        drop(frn_table);
+        drop(parent_frns);
+
         Ok(builder.build())
     }
-}
-
-struct RawEntry {
-    frn: u64,
-    parent_frn: u64,
-    name: String,
-    is_dir: bool,
-    mtime: i64,
 }
 
 fn open_volume(volume: &str, flags: ffi::Dword) -> Result<ffi::Handle, WindowsBackendError> {
@@ -256,16 +264,29 @@ pub fn mark_handle_as_auxiliary(file: &std::fs::File, volume: &str) -> Result<()
     result
 }
 
-fn enumerate_mft(volume: &str) -> Result<Vec<RawEntry>, WindowsBackendError> {
+/// Bulk-enumerates the volume's MFT, handing each entry to `sink` as it is
+/// parsed. Streaming rather than returning a `Vec<RawEntry>` is what keeps a
+/// rebuild from holding a `String` per file: the caller copies the name into
+/// its own staging blob and the ioctl buffer is immediately reused.
+///
+/// `sink` receives: FRN, parent FRN, UTF-8 name bytes, is-directory, and the
+/// raw FILETIME mtime.
+fn enumerate_mft(
+    volume: &str,
+    mut sink: impl FnMut(u64, u64, &[u8], bool, i64),
+) -> Result<(), WindowsBackendError> {
     let handle = open_volume(volume, 0)?;
 
     let result = (|| {
-        let mut entries = Vec::new();
         let mut start_frn: u64 = 0;
-        // 64KiB output buffer: large enough to amortize the syscall over many
-        // records per call, small enough to keep RSS low even if several
-        // enumerations run concurrently.
-        let mut out_buf = vec![0u8; 64 * 1024];
+        // 1 MiB output buffer. The ioctl's per-call cost is a kernel
+        // transition plus MFT seek setup, so a larger buffer directly
+        // reduces syscall count and wall time on a full enumeration. One
+        // megabyte is immaterial against the ~14 MB steady-state index; the
+        // earlier 64 KiB choice was optimising the wrong side of that
+        // tradeoff.
+        let mut out_buf = vec![0u8; 1024 * 1024];
+        let mut name = String::new();
 
         loop {
             let input = ffi::MftEnumDataV0 {
@@ -302,15 +323,16 @@ fn enumerate_mft(volume: &str) -> Result<Vec<RawEntry>, WindowsBackendError> {
             // First 8 bytes: FRN to resume from on the next call.
             let next_start = u64::from_ne_bytes(out_buf[0..8].try_into().unwrap());
 
-            for (header, name) in parse_usn_records(&out_buf, bytes_returned as usize) {
-                entries.push(RawEntry {
-                    frn: header.file_reference_number,
-                    parent_frn: header.parent_file_reference_number,
-                    name,
-                    is_dir: header.file_attributes & ffi::FILE_ATTRIBUTE_DIRECTORY != 0,
-                    mtime: header.time_stamp,
-                });
-            }
+            for_each_usn_record(&out_buf, bytes_returned as usize, |header, name_bytes| {
+                decode_name_into(name_bytes, &mut name);
+                sink(
+                    header.file_reference_number,
+                    header.parent_file_reference_number,
+                    name.as_bytes(),
+                    header.file_attributes & ffi::FILE_ATTRIBUTE_DIRECTORY != 0,
+                    header.time_stamp,
+                );
+            });
 
             if next_start == start_frn {
                 break;
@@ -318,19 +340,28 @@ fn enumerate_mft(volume: &str) -> Result<Vec<RawEntry>, WindowsBackendError> {
             start_frn = next_start;
         }
 
-        Ok(entries)
+        Ok(())
     })();
 
     unsafe { ffi::CloseHandle(handle) };
     result
 }
 
-/// Parses a `FSCTL_ENUM_USN_DATA`/`FSCTL_READ_USN_JOURNAL` output buffer into
-/// its USN_RECORD_V2 entries. Both ioctls share this exact wire format (an
-/// 8-byte cursor followed by a packed sequence of variable-length records),
-/// so enumeration and live-journal reads reuse the same parser.
-fn parse_usn_records(buf: &[u8], bytes_returned: usize) -> Vec<(ffi::UsnRecordV2Header, String)> {
-    let mut out = Vec::new();
+/// Walks the USN_RECORD_V2 entries in an ioctl output buffer, handing each
+/// header and its raw UTF-16LE filename bytes to `f` without allocating.
+///
+/// The previous signature returned `Vec<(Header, String)>`, which allocated a
+/// vector and a `String` per record per 64 KiB buffer — tens of millions of
+/// transient allocations across a full MFT enumeration.
+///
+/// Both `FSCTL_ENUM_USN_DATA` and `FSCTL_READ_USN_JOURNAL` share this exact
+/// wire format (an 8-byte cursor followed by packed variable-length records),
+/// so enumeration and live-journal reads both use this.
+fn for_each_usn_record(
+    buf: &[u8],
+    bytes_returned: usize,
+    mut f: impl FnMut(&ffi::UsnRecordV2Header, &[u8]),
+) {
     let mut offset = 8usize;
     while offset + std::mem::size_of::<ffi::UsnRecordV2Header>() <= bytes_returned {
         let header: ffi::UsnRecordV2Header =
@@ -338,24 +369,42 @@ fn parse_usn_records(buf: &[u8], bytes_returned: usize) -> Vec<(ffi::UsnRecordV2
         if header.record_length == 0 {
             break;
         }
+        // A malformed record_length smaller than the header itself would
+        // make `offset` fail to advance and spin forever.
+        if (header.record_length as usize) < std::mem::size_of::<ffi::UsnRecordV2Header>() {
+            break;
+        }
 
+        // `buf` is the full ioctl allocation, not the valid region — the
+        // bound must be `bytes_returned`, not `buf.len()`. Checking against
+        // `buf.len()` let a truncated final record read stale bytes left
+        // over from a previous call and yield a garbage filename instead of
+        // being skipped.
+        let record_end = offset + header.record_length as usize;
+        if record_end > bytes_returned {
+            break;
+        }
         let name_start = offset + header.file_name_offset as usize;
         let name_end = name_start + header.file_name_length as usize;
-        let name = if name_end <= buf.len() {
-            let name_bytes = &buf[name_start..name_end];
-            let utf16: Vec<u16> = name_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16_lossy(&utf16)
-        } else {
-            String::new()
-        };
+        if name_end > record_end {
+            break;
+        }
 
-        out.push((header, name));
-        offset += header.record_length as usize;
+        f(&header, &buf[name_start..name_end]);
+        offset = record_end;
     }
-    out
+}
+
+/// Decodes UTF-16LE name bytes into `out` (cleared first) as UTF-8, replacing
+/// unpaired surrogates. NTFS filenames are UCS-2 and may contain unpaired
+/// surrogates, so lossy conversion is correct, not a shortcut.
+fn decode_name_into(name_bytes: &[u8], out: &mut String) {
+    out.clear();
+    let utf16: Vec<u16> = name_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .collect();
+    out.push_str(&String::from_utf16_lossy(&utf16));
 }
 
 /// Issues a `DeviceIoControl` on a handle opened with `FILE_FLAG_OVERLAPPED`
@@ -456,6 +505,8 @@ fn watch(
         let journal = query_journal(handle)?;
         let mut start_usn = journal.next_usn;
         let mut out_buf = vec![0u8; 64 * 1024];
+        let mut name = String::new();
+        let mut events = Vec::new();
 
         while !should_stop.load(Ordering::Relaxed) {
             let input = ffi::ReadUsnJournalDataV0 {
@@ -493,8 +544,12 @@ fn watch(
             let next_usn = i64::from_ne_bytes(out_buf[0..8].try_into().unwrap());
             start_usn = next_usn;
 
-            for (header, name) in parse_usn_records(&out_buf, bytes_returned as usize) {
-                let event = classify(&header, name);
+            events.clear();
+            for_each_usn_record(&out_buf, bytes_returned as usize, |header, name_bytes| {
+                decode_name_into(name_bytes, &mut name);
+                events.push(classify(header, name.clone()));
+            });
+            for event in events.drain(..) {
                 match tx.try_send(event) {
                     Ok(()) => {}
                     Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
@@ -890,5 +945,138 @@ mod tests {
             panic!("expected Created");
         };
         assert!(!is_auxiliary);
+    }
+
+    const HEADER_SIZE: usize = std::mem::size_of::<ffi::UsnRecordV2Header>();
+
+    /// Appends one well-formed USN_RECORD_V2 record (header + UTF-16LE name)
+    /// to `buf` and returns the record's total byte length.
+    fn append_record(buf: &mut Vec<u8>, name: &str) -> usize {
+        let name_utf16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let record_len = HEADER_SIZE + name_utf16.len();
+        let h = ffi::UsnRecordV2Header {
+            record_length: record_len as u32,
+            major_version: 2,
+            minor_version: 0,
+            file_reference_number: 1,
+            parent_file_reference_number: 2,
+            usn: 0,
+            time_stamp: 0,
+            reason: ffi::USN_REASON_FILE_CREATE,
+            source_info: 0,
+            security_id: 0,
+            file_attributes: 0,
+            file_name_length: name_utf16.len() as u16,
+            file_name_offset: HEADER_SIZE as u16,
+        };
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&h as *const ffi::UsnRecordV2Header) as *const u8,
+                HEADER_SIZE,
+            )
+        };
+        buf.extend_from_slice(header_bytes);
+        buf.extend_from_slice(&name_utf16);
+        record_len
+    }
+
+    #[test]
+    fn truncated_trailing_record_is_skipped_not_misread() {
+        let mut buf = vec![0u8; 8]; // 8-byte resume cursor
+        append_record(&mut buf, "valid.txt");
+
+        // A second header claiming a record_length that extends past the
+        // buffer's valid region (bytes_returned) — must be skipped, not read.
+        let bad_start = buf.len();
+        let bad = ffi::UsnRecordV2Header {
+            record_length: 4096,
+            major_version: 2,
+            minor_version: 0,
+            file_reference_number: 3,
+            parent_file_reference_number: 2,
+            usn: 0,
+            time_stamp: 0,
+            reason: ffi::USN_REASON_FILE_CREATE,
+            source_info: 0,
+            security_id: 0,
+            file_attributes: 0,
+            file_name_length: 8,
+            file_name_offset: HEADER_SIZE as u16,
+        };
+        let bad_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&bad as *const ffi::UsnRecordV2Header) as *const u8,
+                HEADER_SIZE,
+            )
+        };
+        buf.extend_from_slice(bad_bytes);
+        // Pad so the buffer is real allocated memory beyond bytes_returned,
+        // simulating stale bytes left over from a previous ioctl call.
+        buf.extend_from_slice(&[0xAAu8; 64]);
+        let bytes_returned = bad_start + HEADER_SIZE; // truncated: no room for the name
+
+        let mut calls = 0;
+        for_each_usn_record(&buf, bytes_returned, |_h, _name| {
+            calls += 1;
+        });
+        assert_eq!(
+            calls, 1,
+            "only the first, well-formed record should be visited"
+        );
+    }
+
+    #[test]
+    fn zero_or_undersized_record_length_terminates() {
+        let mut buf = vec![0u8; 8];
+        let bad = ffi::UsnRecordV2Header {
+            record_length: 4,
+            major_version: 2,
+            minor_version: 0,
+            file_reference_number: 1,
+            parent_file_reference_number: 2,
+            usn: 0,
+            time_stamp: 0,
+            reason: ffi::USN_REASON_FILE_CREATE,
+            source_info: 0,
+            security_id: 0,
+            file_attributes: 0,
+            file_name_length: 0,
+            file_name_offset: 0,
+        };
+        let bad_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&bad as *const ffi::UsnRecordV2Header) as *const u8,
+                HEADER_SIZE,
+            )
+        };
+        buf.extend_from_slice(bad_bytes);
+        buf.extend_from_slice(&[0u8; 256]);
+        let bytes_returned = buf.len();
+
+        let mut calls = 0;
+        for_each_usn_record(&buf, bytes_returned, |_h, _name| {
+            calls += 1;
+        });
+        assert_eq!(
+            calls, 0,
+            "an undersized record_length must not spin forever"
+        );
+    }
+
+    #[test]
+    fn decode_name_into_handles_unpaired_surrogates() {
+        // NTFS names are UCS-2 and may contain an unpaired surrogate, which
+        // is not valid UTF-16. Lossy decoding must not panic.
+        let mut valid: Vec<u16> = "readme".encode_utf16().collect();
+        valid.push(0xD800); // unpaired high surrogate, no low surrogate follows
+        let bytes: Vec<u8> = valid.iter().flat_map(|u| u.to_le_bytes()).collect();
+
+        let mut out = String::new();
+        decode_name_into(&bytes, &mut out);
+        assert!(out.starts_with("readme"));
+        assert!(
+            out.contains('\u{FFFD}'),
+            "unpaired surrogate should become U+FFFD"
+        );
     }
 }
