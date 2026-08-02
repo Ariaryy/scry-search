@@ -548,9 +548,16 @@ fn reindex_on_changes(
 
     loop {
         // Block until something changes...
-        let Ok(first) = rx.recv() else {
-            eprintln!("scryd: journal watcher channel closed, live updates stopped");
-            return;
+        let first = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(event) => event,
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                persist_idle_view(&store, &volume, auxiliary_marking_enabled);
+                continue;
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                eprintln!("scryd: journal watcher channel closed, live updates stopped");
+                return;
+            }
         };
         let mut batch = Vec::new();
         if is_real_change(&first, &mut filter) {
@@ -626,6 +633,21 @@ fn reindex_on_changes(
             }
             Err(e) => eprintln!("scryd: reindex failed: {e}"),
         }
+    }
+}
+
+fn persist_idle_view(store: &SharedStore, volume: &str, auxiliary_marking_enabled: bool) {
+    let view = store.load_full();
+    if view.delta.tombstones.count_ones() == 0 && view.delta.added.is_empty() {
+        return;
+    }
+    match compact_view(&view, volume, auxiliary_marking_enabled) {
+        Ok(compacted) => {
+            store.store(compacted);
+            trim_working_set();
+            eprintln!("scryd: persisted idle snapshot for {volume}");
+        }
+        Err(error) => eprintln!("scryd: idle snapshot persistence failed: {error}"),
     }
 }
 
