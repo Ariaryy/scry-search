@@ -1,17 +1,17 @@
 //! Borrowed rank/select over an LSB-first bitmap.
 //!
-//! Rank samples store cumulative popcounts every 512 bits, bounding a rank
-//! query to eight `u64::count_ones` operations. Select uses binary search over
+//! Rank samples store cumulative popcounts every 16 bits, bounding a rank
+//! query to one byte popcount. Select uses binary search over
 //! positions backed by rank. A larger select-sampling index could make select
 //! constant-time, but would spend persistent space to save nanoseconds on
 //! operations that occur only while walking a tree path.
 
-pub const SUPERBLOCK_BITS: usize = 512;
+pub const SUPERBLOCK_BITS: usize = 16;
 
 pub fn build_superblocks(bits: &[u8]) -> Vec<u32> {
     let mut samples = Vec::with_capacity(bits.len().div_ceil(64) + 1);
     let mut cumulative = 0u32;
-    for chunk in bits.chunks(64) {
+    for chunk in bits.chunks(SUPERBLOCK_BITS / 8) {
         samples.push(cumulative);
         cumulative += chunk.iter().map(|byte| byte.count_ones()).sum::<u32>();
     }
@@ -35,9 +35,10 @@ impl<'a> RankSelect<'a> {
         let end = i.min(self.bits.len() * 8);
         let superblock = end / SUPERBLOCK_BITS;
         let mut count = self.superblocks.get(superblock).copied().unwrap_or(0) as usize;
-        let start_byte = superblock * 64;
+        let start_byte = superblock * (SUPERBLOCK_BITS / 8);
         let full_bytes = end / 8;
-        count += self.bits[start_byte.min(self.bits.len())..full_bytes.min(self.bits.len())]
+        let bytes = &self.bits[start_byte.min(self.bits.len())..full_bytes.min(self.bits.len())];
+        count += bytes
             .iter()
             .map(|byte| byte.count_ones() as usize)
             .sum::<usize>();

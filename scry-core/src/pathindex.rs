@@ -3,14 +3,95 @@ use crate::delta::{Delta, ParentRef};
 use crate::{ArchivedArena, PARENT_NONE};
 
 const NO_DIR: u32 = u32::MAX;
+const PACKED_PARENT_BITS: usize = 20;
+const PACKED_NO_DIR: u32 = (1 << PACKED_PARENT_BITS) - 1;
+
+enum DirParents {
+    Packed20 { words: Vec<u64>, len: usize },
+    Wide(Vec<u32>),
+}
+
+impl DirParents {
+    fn new(parents: Vec<u32>) -> Self {
+        if parents.len() >= PACKED_NO_DIR as usize {
+            return Self::Wide(parents);
+        }
+        let len = parents.len();
+        let mut words = vec![0u64; (len * PACKED_PARENT_BITS).div_ceil(64)];
+        for (index, parent) in parents.into_iter().enumerate() {
+            let value = if parent == NO_DIR {
+                PACKED_NO_DIR
+            } else {
+                parent
+            } as u64;
+            let bit = index * PACKED_PARENT_BITS;
+            let word = bit / 64;
+            let shift = bit % 64;
+            words[word] |= value << shift;
+            if shift + PACKED_PARENT_BITS > 64 {
+                words[word + 1] |= value >> (64 - shift);
+            }
+        }
+        Self::Packed20 { words, len }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Packed20 { len, .. } => *len,
+            Self::Wide(parents) => parents.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> u32 {
+        match self {
+            Self::Packed20 { words, len } => {
+                debug_assert!(index < *len);
+                let bit = index * PACKED_PARENT_BITS;
+                let word = bit / 64;
+                let shift = bit % 64;
+                let mut value = words[word] >> shift;
+                if shift + PACKED_PARENT_BITS > 64 {
+                    value |= words[word + 1] << (64 - shift);
+                }
+                let value = value as u32 & PACKED_NO_DIR;
+                if value == PACKED_NO_DIR {
+                    NO_DIR
+                } else {
+                    value
+                }
+            }
+            Self::Wide(parents) => parents[index],
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Packed20 { words, .. } => words.len() * std::mem::size_of::<u64>(),
+            Self::Wide(parents) => parents.len() * std::mem::size_of::<u32>(),
+        }
+    }
+}
 
 /// Derived directory topology in dense directory-ordinal space.
 pub struct PathIndex {
     dir_bits: Vec<u8>,
     dir_superblocks: Vec<u32>,
-    dir_parent: Vec<u32>,
-    dir_order: Vec<u32>,
+    dir_parent: DirParents,
     records: usize,
+}
+
+#[derive(Default)]
+pub struct PathClosureScratch {
+    resolved: Vec<u8>,
+    stack: Vec<u32>,
+}
+
+impl PathClosureScratch {
+    fn reset(&mut self, directories: usize) {
+        self.resolved.resize(directories.div_ceil(8), 0);
+        self.resolved.fill(0);
+        self.stack.clear();
+    }
 }
 
 impl PathIndex {
@@ -43,29 +124,10 @@ impl PathIndex {
                 }
             }
         }
-        let depths: Vec<u16> = (0..directories as u32)
-            .map(|directory| depth(directory, &dir_parent))
-            .collect();
-        let mut counts = [0usize; 513];
-        for &value in &depths {
-            counts[value as usize] += 1;
-        }
-        let mut offsets = [0usize; 513];
-        let mut next = 0usize;
-        for (offset, count) in offsets.iter_mut().zip(counts) {
-            *offset = next;
-            next += count;
-        }
-        let mut dir_order = vec![0u32; directories];
-        for (directory, &value) in depths.iter().enumerate() {
-            dir_order[offsets[value as usize]] = directory as u32;
-            offsets[value as usize] += 1;
-        }
         Self {
             dir_bits,
             dir_superblocks,
-            dir_parent,
-            dir_order,
+            dir_parent: DirParents::new(dir_parent),
             records,
         }
     }
@@ -84,6 +146,10 @@ impl PathIndex {
         combined_parent(arena, delta, record).and_then(|parent| self.dir_ord(parent))
     }
 
+    pub fn parent_record(&self, arena: &ArchivedArena, delta: &Delta, record: u32) -> Option<u32> {
+        combined_parent(arena, delta, record)
+    }
+
     pub fn directory_count(&self) -> usize {
         self.dir_parent.len()
     }
@@ -91,35 +157,74 @@ impl PathIndex {
     pub fn heap_bytes(&self) -> usize {
         self.dir_bits.len()
             + self.dir_superblocks.len() * std::mem::size_of::<u32>()
-            + self.dir_parent.len() * std::mem::size_of::<u32>()
-            + self.dir_order.len() * std::mem::size_of::<u32>()
+            + self.dir_parent.heap_bytes()
     }
 
     pub fn closure(&self, mask: &mut [u16]) {
-        assert_eq!(mask.len(), self.dir_parent.len());
-        for &directory in &self.dir_order {
-            let parent = self.dir_parent[directory as usize];
-            if parent != NO_DIR && parent != directory {
-                mask[directory as usize] |= mask[parent as usize];
-            }
-        }
+        self.closure_sparse(mask, &mut Vec::new(), &mut PathClosureScratch::default());
     }
 
-    pub fn closure_sparse(&self, mask: &mut [u16], touched: &mut Vec<u32>) {
+    pub fn closure_sparse(
+        &self,
+        mask: &mut [u16],
+        touched: &mut Vec<u32>,
+        scratch: &mut PathClosureScratch,
+    ) {
         assert_eq!(mask.len(), self.dir_parent.len());
-        for &directory in &self.dir_order {
-            let index = directory as usize;
-            let parent = self.dir_parent[index];
-            if parent == NO_DIR || parent == directory {
+        scratch.reset(self.dir_parent.len());
+        for start in 0..self.dir_parent.len() as u32 {
+            if bit(&scratch.resolved, start as usize) {
                 continue;
             }
-            let old = mask[index];
-            mask[index] |= mask[parent as usize];
-            if old == 0 && mask[index] != 0 {
-                touched.push(directory);
+            scratch.stack.clear();
+            let mut current = start;
+            for _ in 0..512 {
+                if bit(&scratch.resolved, current as usize) {
+                    break;
+                }
+                if let Some(cycle_start) = scratch.stack.iter().position(|&dir| dir == current) {
+                    let cycle_mask = scratch.stack[cycle_start..]
+                        .iter()
+                        .fold(0u16, |combined, &dir| combined | mask[dir as usize]);
+                    for &directory in &scratch.stack[cycle_start..] {
+                        let old = mask[directory as usize];
+                        mask[directory as usize] = cycle_mask;
+                        set_bit(&mut scratch.resolved, directory as usize);
+                        if old == 0 && cycle_mask != 0 {
+                            touched.push(directory);
+                        }
+                    }
+                    scratch.stack.truncate(cycle_start);
+                    break;
+                }
+                scratch.stack.push(current);
+                let parent = self.dir_parent.get(current as usize);
+                if parent == NO_DIR || parent == current {
+                    break;
+                }
+                current = parent;
+            }
+
+            while let Some(directory) = scratch.stack.pop() {
+                let old = mask[directory as usize];
+                let parent = self.dir_parent.get(directory as usize);
+                if parent != NO_DIR
+                    && parent != directory
+                    && bit(&scratch.resolved, parent as usize)
+                {
+                    mask[directory as usize] |= mask[parent as usize];
+                }
+                set_bit(&mut scratch.resolved, directory as usize);
+                if old == 0 && mask[directory as usize] != 0 {
+                    touched.push(directory);
+                }
             }
         }
     }
+}
+
+fn set_bit(bits: &mut [u8], position: usize) {
+    bits[position / 8] |= 1 << (position % 8);
 }
 
 fn bit(bits: &[u8], position: usize) -> bool {
@@ -138,19 +243,6 @@ fn combined_parent(arena: &ArchivedArena, delta: &Delta, record: u32) -> Option<
         ParentRef::Delta(parent) => Some(arena.len() as u32 + parent),
         ParentRef::None => None,
     }
-}
-
-fn depth(mut directory: u32, parents: &[u32]) -> u16 {
-    let mut depth = 0u16;
-    for _ in 0..512 {
-        let parent = parents[directory as usize];
-        if parent == NO_DIR || parent == directory {
-            return depth;
-        }
-        directory = parent;
-        depth = depth.saturating_add(1);
-    }
-    512
 }
 
 #[cfg(test)]
@@ -175,6 +267,18 @@ mod tests {
         assert_eq!(index.dir_ord(0), Some(0));
         assert_eq!(index.dir_ord(1), None);
         assert_eq!(index.dir_ord(2), Some(1));
+    }
+
+    #[test]
+    fn packed_directory_parents_round_trip_word_boundaries() {
+        let expected: Vec<u32> = (0..257)
+            .map(|index| if index % 17 == 0 { NO_DIR } else { index - 1 })
+            .collect();
+        let packed = DirParents::new(expected.clone());
+        assert_eq!(packed.len(), expected.len());
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(packed.get(index), value);
+        }
     }
 
     #[test]
@@ -209,7 +313,7 @@ mod tests {
         let mut touched = vec![root];
         mask[root as usize] = 1;
 
-        index.closure_sparse(&mut mask, &mut touched);
+        index.closure_sparse(&mut mask, &mut touched, &mut PathClosureScratch::default());
         assert_eq!(mask, vec![1, 1, 1]);
         assert_eq!(touched.len(), 3);
 
@@ -217,5 +321,47 @@ mod tests {
             mask[directory as usize] = 0;
         }
         assert!(mask.iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn compressed_closure_matches_a_direct_parent_walk() {
+        let mut builder = Arena::builder();
+        let mut records = Vec::new();
+        for index in 0..1_000u32 {
+            records.push(builder.push(
+                &format!("dir_{:04}", index.wrapping_mul(613) % 1_009),
+                0,
+                true,
+            ));
+        }
+        for index in 1..records.len() {
+            builder.set_parent(records[index], records[(index - 1) / 2]);
+        }
+        let arena = archived(&builder.build().0);
+        let delta = Delta::new(arena.len());
+        let index = PathIndex::build(arena, &delta);
+        let direct: Vec<u16> = (0..index.directory_count())
+            .map(|directory| match directory {
+                value if value % 97 == 0 => 1,
+                value if value % 131 == 0 => 2,
+                _ => 0,
+            })
+            .collect();
+        let mut expected = direct.clone();
+        for (directory, expected_mask) in expected.iter_mut().enumerate() {
+            let mut current = directory as u32;
+            for _ in 0..512 {
+                let parent = index.dir_parent.get(current as usize);
+                if parent == NO_DIR || parent == current {
+                    break;
+                }
+                *expected_mask |= direct[parent as usize];
+                current = parent;
+            }
+        }
+
+        let mut actual = direct;
+        index.closure(&mut actual);
+        assert_eq!(actual, expected);
     }
 }

@@ -6,7 +6,7 @@ use regex_automata::util::syntax;
 
 use crate::ascii;
 use crate::delta::{Delta, ParentRef};
-use crate::pathindex::PathIndex;
+use crate::pathindex::{PathClosureScratch, PathIndex};
 use crate::protocol::ResultEntry;
 use crate::query::{search_base, Query};
 use crate::store::ArenaStore;
@@ -635,6 +635,8 @@ struct PathSearchScratch {
     hits: Vec<(u32, u16)>,
     dir_mask: Vec<u16>,
     touched_dirs: Vec<u32>,
+    closure: PathClosureScratch,
+    parent_cache: ParentRankCache,
     candidate_blocks: Vec<u32>,
     term_blocks: Vec<u32>,
     candidate_bitmap: Vec<u8>,
@@ -659,6 +661,7 @@ impl PathSearchScratch {
         self.trigram_hashes.clear();
         self.heap.clear();
         self.name.clear();
+        self.parent_cache.clear();
         let target = limit.min(4096);
         if self.heap.capacity() < target {
             self.heap.reserve(target);
@@ -671,6 +674,31 @@ impl PathSearchScratch {
             self.touched_dirs.push(directory);
         }
         *mask |= bits;
+    }
+}
+
+const PARENT_CACHE_SLOTS: usize = 4096;
+
+#[derive(Default)]
+struct ParentRankCache {
+    keys: Vec<u32>,
+    values: Vec<u32>,
+}
+
+impl ParentRankCache {
+    fn clear(&mut self) {
+        self.keys.resize(PARENT_CACHE_SLOTS, PARENT_NONE);
+        self.keys.fill(PARENT_NONE);
+        self.values.resize(PARENT_CACHE_SLOTS, PARENT_NONE);
+    }
+
+    fn dir_ord(&mut self, path_index: &PathIndex, parent: u32) -> Option<u32> {
+        let slot = parent.wrapping_mul(2_654_435_761) as usize & (PARENT_CACHE_SLOTS - 1);
+        if self.keys[slot] != parent {
+            self.keys[slot] = parent;
+            self.values[slot] = path_index.dir_ord(parent).unwrap_or(PARENT_NONE);
+        }
+        (self.values[slot] != PARENT_NONE).then_some(self.values[slot])
     }
 }
 
@@ -924,7 +952,11 @@ fn search_path_terms_with_scratch(
             }
         }
     }
-    path_index.closure_sparse(&mut scratch.dir_mask, &mut scratch.touched_dirs);
+    path_index.closure_sparse(
+        &mut scratch.dir_mask,
+        &mut scratch.touched_dirs,
+        &mut scratch.closure,
+    );
 
     let full_mask = if terms.len() == 16 {
         u16::MAX
@@ -957,7 +989,8 @@ fn search_path_terms_with_scratch(
             .filter(|hit| hit.0 == record)
             .map_or(0, |hit| hit.1);
         let inherited = path_index
-            .parent_dir_ord(arena, delta, record)
+            .parent_record(arena, delta, record)
+            .and_then(|parent| scratch.parent_cache.dir_ord(path_index, parent))
             .map_or(0, |directory| scratch.dir_mask[directory as usize]);
         if own | inherited == full_mask {
             let name_len = if record < arena.len() as u32 {
