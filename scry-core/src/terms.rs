@@ -3,8 +3,9 @@ pub const MAX_TERMS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyTerms;
 
-/// Split whitespace-separated terms while preserving quoted phrases.
-/// Unterminated quotes are accepted so interactive typing remains searchable.
+/// Split whitespace-separated terms while preserving quoted phrases and path
+/// components. Unterminated quotes are accepted so interactive typing remains
+/// searchable.
 pub fn parse_terms(input: &str) -> Result<Vec<String>, TooManyTerms> {
     let mut terms = Vec::new();
     let mut current = String::new();
@@ -12,7 +13,7 @@ pub fn parse_terms(input: &str) -> Result<Vec<String>, TooManyTerms> {
     for character in input.chars() {
         match character {
             '"' => quoted = !quoted,
-            character if character.is_whitespace() && !quoted => {
+            character if character.is_whitespace() && !quoted && !current.contains(['\\', '/']) => {
                 if !current.is_empty() {
                     terms.push(std::mem::take(&mut current));
                 }
@@ -26,6 +27,15 @@ pub fn parse_terms(input: &str) -> Result<Vec<String>, TooManyTerms> {
     if !current.is_empty() {
         terms.push(current);
     }
+    let terms: Vec<_> = terms
+        .into_iter()
+        .flat_map(|term| {
+            term.split(['\\', '/'])
+                .filter(|component| !component.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     (terms.len() <= MAX_TERMS)
         .then_some(terms)
         .ok_or(TooManyTerms)
@@ -44,6 +54,22 @@ mod tests {
         );
         assert_eq!(parse_terms("\"still typing").unwrap(), ["still typing"]);
         assert!(parse_terms("   \t ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_terms_expands_common_absolute_path_forms() {
+        for input in [
+            r"C:\Program Files",
+            r"C:\\Program Files",
+            "C:/Program Files",
+            r#""C:\Program Files""#,
+        ] {
+            assert_eq!(
+                parse_terms(input).unwrap(),
+                ["C:", "Program Files"],
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

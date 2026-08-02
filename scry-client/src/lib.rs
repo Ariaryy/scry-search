@@ -3,10 +3,8 @@
 //! just this crate with a formatter on top, and a future C ABI layer would
 //! be a thin wrapper around the same `Client::query` call.
 
-pub use scry_core::protocol::ResultEntry;
-use scry_core::protocol::{
-    decode_results, decode_shared_index, encode_request, QueryKind, Request,
-};
+use scry_core::protocol::{decode_results, decode_shared_index, encode_request, Request};
+pub use scry_core::protocol::{QueryKind, ResultEntry};
 
 struct LocalIndex {
     view: scry_ipc::SectionView,

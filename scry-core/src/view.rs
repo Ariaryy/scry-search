@@ -261,6 +261,32 @@ mod tests {
     }
 
     #[test]
+    fn path_terms_match_descendants_of_an_absolute_path() {
+        let mut builder = Arena::builder();
+        let root = builder.push("C:", 0, true);
+        let program_files = builder.push("Program Files", 0, true);
+        let app = builder.push("app.exe", 0, false);
+        let outside = builder.push("outside.txt", 0, false);
+        builder.set_parent(program_files, root);
+        builder.set_parent(app, program_files);
+        builder.set_parent(outside, root);
+        let arena = builder.build().0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absolute-path.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+
+        let terms = crate::terms::parse_terms(r"C:\\Program Files").unwrap();
+        let results = view.search(&Query::PathTerms(terms), 50);
+        assert!(results
+            .iter()
+            .any(|entry| entry.path.ends_with("Program Files\\app.exe")));
+        assert!(results
+            .iter()
+            .all(|entry| !entry.path.ends_with("outside.txt")));
+    }
+
+    #[test]
     fn path_terms_matches_a_brute_force_full_path_scan() {
         let (_dir, view) = nested_view();
         for terms in [
