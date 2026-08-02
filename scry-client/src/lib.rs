@@ -11,7 +11,7 @@ use scry_core::protocol::{
 struct LocalIndex {
     view: scry_ipc::SectionView,
     delta: scry_core::delta::Delta,
-    path_index: scry_core::pathindex::PathIndex,
+    path_index: Option<scry_core::pathindex::PathIndex>,
     generation: u64,
 }
 
@@ -92,11 +92,10 @@ impl Client {
                 let delta =
                     scry_core::delta::Delta::decode_query_overlay(&shared.overlay, arena.len())
                         .ok_or_else(|| anyhow::anyhow!("malformed shared delta"))?;
-                let path_index = scry_core::pathindex::PathIndex::build(arena, &delta);
                 Ok(LocalIndex {
                     view: incoming,
                     delta,
-                    path_index,
+                    path_index: None,
                     generation: shared.generation,
                 })
             })();
@@ -112,11 +111,10 @@ impl Client {
             return self.query(kind, pattern, limit);
         }
 
-        let local = self.local.as_ref().unwrap();
-        let arena = match scry_core::store::archived_bytes(local.view.as_bytes()) {
-            Ok(arena) => arena,
-            Err(_) => return self.query(kind, pattern, limit),
-        };
+        let local = self.local.as_mut().unwrap();
+        // Safety: this immutable mapping was validated when this generation
+        // was installed above and remains owned by `local.view`.
+        let arena = unsafe { scry_core::store::archived_bytes_validated(local.view.as_bytes()) };
         let query = match kind {
             QueryKind::Prefix => scry_core::Query::Prefix(pattern.to_owned()),
             QueryKind::Substring => scry_core::Query::Substring(pattern.to_owned()),
@@ -127,10 +125,13 @@ impl Client {
             QueryKind::ShareIndex => unreachable!(),
         };
         if let scry_core::Query::PathTerms(terms) = &query {
+            let path_index = local
+                .path_index
+                .get_or_insert_with(|| scry_core::pathindex::PathIndex::build(arena, &local.delta));
             return Ok(scry_core::view::search_path_terms(
                 arena,
                 &local.delta,
-                &local.path_index,
+                path_index,
                 terms,
                 limit as usize,
             ));

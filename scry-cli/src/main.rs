@@ -7,13 +7,14 @@ use scry_client::Client;
 use scry_core::protocol::QueryKind;
 
 fn main() -> anyhow::Result<()> {
-    let mut no_shared = false;
+    let mut shared = false;
     let mut verbose = false;
     let mut explicit_kind = None;
     let mut terms = Vec::new();
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
-            "--no-shared-index" => no_shared = true,
+            "--shared-index" => shared = true,
+            "--no-shared-index" => shared = false,
             "--verbose" => verbose = true,
             "--prefix" => explicit_kind = Some(QueryKind::Prefix),
             "--substring" => explicit_kind = Some(QueryKind::Substring),
@@ -31,16 +32,16 @@ fn main() -> anyhow::Result<()> {
 
     let kind = explicit_kind.unwrap_or(QueryKind::PathTerms);
 
-    let results = if no_shared {
-        if verbose {
-            eprintln!("scry: RPC query path");
-        }
-        client.query(kind, &query, 200)?
-    } else {
+    let results = if shared {
         if verbose {
             eprintln!("scry: shared-index query path (automatic RPC fallback)");
         }
         client.search_local(kind, &query, 200)?
+    } else {
+        if verbose {
+            eprintln!("scry: RPC query path");
+        }
+        client.query(kind, &query, 200)?
     };
     if results.is_empty() {
         println!("no matches");

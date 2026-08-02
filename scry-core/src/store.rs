@@ -127,6 +127,17 @@ pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
     Ok(unsafe { rkyv::archived_root::<Arena>(bytes) })
 }
 
+/// Return the archived root after the caller has validated this exact,
+/// immutable byte mapping with [`archived_bytes`].
+///
+/// # Safety
+///
+/// `bytes` must be the same bytes previously accepted by [`archived_bytes`]
+/// and must not have changed since validation.
+pub unsafe fn archived_bytes_validated(bytes: &[u8]) -> &ArchivedArena {
+    unsafe { rkyv::archived_root::<Arena>(bytes) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
