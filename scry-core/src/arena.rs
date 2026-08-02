@@ -404,6 +404,8 @@ impl ArchivedArena {
     /// Guarded against cycles and corrupt parent links: stops after 512 hops
     /// and returns whatever has been collected.
     pub fn full_path(&self, mut idx: u32, sep: char) -> String {
+        #[cfg(test)]
+        FULL_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut parts: Vec<Vec<u8>> = Vec::new();
         let mut name_buf = Vec::new();
         for _ in 0..512 {
@@ -559,6 +561,21 @@ impl ArchivedArena {
         let len = read_varint(bucket_blob, &mut p) as usize;
         bucket_blob[p..p + len].to_vec()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_PATH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_path_calls() {
+    FULL_PATH_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_path_calls() -> usize {
+    FULL_PATH_CALLS.with(std::cell::Cell::get)
 }
 
 #[derive(Default)]

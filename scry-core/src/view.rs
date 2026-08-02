@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -261,13 +262,24 @@ mod tests {
                     expected.push(path);
                 }
             }
-            let actual: Vec<_> = view
+            let mut actual: Vec<_> = view
                 .search(&Query::PathTerms(terms.clone()), usize::MAX)
                 .into_iter()
                 .map(|entry| entry.path)
                 .collect();
+            expected.sort();
+            actual.sort();
             assert_eq!(actual, expected, "{terms:?}");
         }
+    }
+
+    #[test]
+    fn search_allocates_no_path_for_a_non_result() {
+        let (_dir, view) = base_view(20_000);
+        crate::arena::reset_full_path_calls();
+        let results = view.search(&Query::Substring("match".into()), 10);
+        assert_eq!(results.len(), 10);
+        assert!(crate::arena::full_path_calls() <= 10);
     }
 }
 
@@ -306,54 +318,7 @@ impl IndexView {
                 limit,
             );
         }
-        let arena = self.base.archived();
-        let mut entries = Vec::new();
-        for index in search_base(arena, query, usize::MAX) {
-            if self.delta.tombstones.get(index) {
-                continue;
-            }
-            entries.push(ResultEntry {
-                path: arena.full_path(index, '\\'),
-                size: arena.size_bytes(index),
-                is_dir: arena.is_dir(index),
-            });
-        }
-
-        let regex = match query {
-            Query::Regex(pattern) => Regex::builder()
-                .syntax(syntax::Config::new().case_insensitive(true))
-                .build(pattern)
-                .ok(),
-            _ => None,
-        };
-        let substring_lower = match query {
-            Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
-            _ => None,
-        };
-        for (index, record) in self.delta.live_added() {
-            let matches = match query {
-                Query::Prefix(prefix) => {
-                    ascii::starts_with_ci(record.name.as_bytes(), prefix.as_bytes())
-                }
-                Query::Substring(_) => ascii::contains_ci(
-                    record.name.as_bytes(),
-                    substring_lower.as_ref().unwrap().as_bytes(),
-                ),
-                Query::Regex(_) => regex
-                    .as_ref()
-                    .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
-                Query::PathTerms(_) => unreachable!(),
-            };
-            if matches {
-                entries.push(ResultEntry {
-                    path: self.delta_path(index),
-                    size: record.size_bytes,
-                    is_dir: record.is_dir,
-                });
-            }
-        }
-        entries.truncate(limit);
-        entries
+        search_ranked(self.base.archived(), &self.delta, query, limit)
     }
 
     pub fn delta_path(&self, mut index: u32) -> String {
@@ -488,23 +453,87 @@ pub fn search_archived_with_delta(
         let path_index = PathIndex::build(arena, delta);
         return search_path_terms(arena, delta, &path_index, terms, limit);
     }
-    let base_hits = search_base(arena, query, usize::MAX);
-    let mut entries = Vec::with_capacity(base_hits.len().min(limit));
-    for index in base_hits {
+    search_ranked(arena, delta, query, limit)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RankedHit {
+    quality: u8,
+    name_len: u32,
+    record: u32,
+}
+
+impl Ord for RankedHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.quality, self.name_len, self.record).cmp(&(
+            other.quality,
+            other.name_len,
+            other.record,
+        ))
+    }
+}
+
+impl PartialOrd for RankedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn retain_hit(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(hit);
+    } else if heap.peek().is_some_and(|worst| hit < *worst) {
+        heap.pop();
+        heap.push(hit);
+    }
+}
+
+fn match_quality(query: &Query, name: &[u8]) -> u8 {
+    let pattern = match query {
+        Query::Prefix(pattern) | Query::Substring(pattern) => pattern.as_bytes(),
+        Query::Regex(_) => return 2,
+        Query::PathTerms(_) => unreachable!(),
+    };
+    if ascii::cmp_ci(name, pattern).is_eq() {
+        0
+    } else if ascii::starts_with_ci(name, pattern) {
+        1
+    } else {
+        2
+    }
+}
+
+fn search_ranked(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    query: &Query,
+    limit: usize,
+) -> Vec<ResultEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
+    let mut name = Vec::new();
+    for index in search_base(arena, query, usize::MAX) {
         if delta.tombstones.get(index) {
             continue;
         }
-        entries.push(ResultEntry {
-            path: arena.full_path(index, '\\'),
-            size: arena.size_bytes(index),
-            is_dir: arena.is_dir(index),
-        });
-        if entries.len() >= limit {
-            return entries;
-        }
+        arena.name_into(index, &mut name);
+        retain_hit(
+            &mut heap,
+            RankedHit {
+                quality: match_quality(query, &name),
+                name_len: name.len() as u32,
+                record: index,
+            },
+            limit,
+        );
     }
 
-    let compiled = match query {
+    let regex = match query {
         Query::Regex(pattern) => Regex::builder()
             .syntax(syntax::Config::new().case_insensitive(true))
             .build(pattern)
@@ -524,23 +553,46 @@ pub fn search_archived_with_delta(
                 record.name.as_bytes(),
                 substring_lower.as_ref().unwrap().as_bytes(),
             ),
-            Query::Regex(_) => compiled
+            Query::Regex(_) => regex
                 .as_ref()
-                .is_some_and(|regex| regex.is_match(record.name.as_bytes())),
+                .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
             Query::PathTerms(_) => unreachable!(),
         };
         if matched {
-            entries.push(ResultEntry {
-                path: delta_path(arena, delta, index),
-                size: record.size_bytes,
-                is_dir: record.is_dir,
-            });
-            if entries.len() >= limit {
-                break;
-            }
+            retain_hit(
+                &mut heap,
+                RankedHit {
+                    quality: match_quality(query, record.name.as_bytes()),
+                    name_len: record.name.len() as u32,
+                    record: arena.len() as u32 + index,
+                },
+                limit,
+            );
         }
     }
-    entries
+
+    heap.into_sorted_vec()
+        .into_iter()
+        .map(|hit| materialize(arena, delta, hit.record))
+        .collect()
+}
+
+fn materialize(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> ResultEntry {
+    if record < arena.len() as u32 {
+        ResultEntry {
+            path: arena.full_path(record, '\\'),
+            size: arena.size_bytes(record),
+            is_dir: arena.is_dir(record),
+        }
+    } else {
+        let index = record - arena.len() as u32;
+        let added = &delta.added[index as usize];
+        ResultEntry {
+            path: delta_path(arena, delta, index),
+            size: added.size_bytes,
+            is_dir: added.is_dir,
+        }
+    }
 }
 
 pub fn search_path_terms(
@@ -602,8 +654,9 @@ pub fn search_path_terms(
     } else {
         (1u16 << terms.len()) - 1
     };
-    let mut results = Vec::new();
+    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut hit_position = 0usize;
+    let mut name = Vec::new();
     for record in 0..path_index.records() as u32 {
         let live = if record < arena.len() as u32 {
             !delta.tombstones.get(record)
@@ -627,27 +680,28 @@ pub fn search_path_terms(
             .parent_dir_ord(arena, delta, record)
             .map_or(0, |directory| dir_mask[directory as usize]);
         if own | inherited == full_mask {
-            if record < arena.len() as u32 {
-                results.push(ResultEntry {
-                    path: arena.full_path(record, '\\'),
-                    size: arena.size_bytes(record),
-                    is_dir: arena.is_dir(record),
-                });
+            let name_len = if record < arena.len() as u32 {
+                arena.name_into(record, &mut name);
+                name.len()
             } else {
                 let index = record - arena.len() as u32;
-                let added = &delta.added[index as usize];
-                results.push(ResultEntry {
-                    path: delta_path(arena, delta, index),
-                    size: added.size_bytes,
-                    is_dir: added.is_dir,
-                });
-            }
-            if results.len() >= limit {
-                break;
-            }
+                delta.added[index as usize].name.len()
+            };
+            retain_hit(
+                &mut heap,
+                RankedHit {
+                    quality: (terms.len() as u32 - own.count_ones()) as u8,
+                    name_len: name_len as u32,
+                    record,
+                },
+                limit,
+            );
         }
     }
-    results
+    heap.into_sorted_vec()
+        .into_iter()
+        .map(|hit| materialize(arena, delta, hit.record))
+        .collect()
 }
 
 fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {
