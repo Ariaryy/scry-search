@@ -386,6 +386,9 @@ fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<S
         arena.volume_serial = cursor.volume_serial;
     }
     let path = snapshot_path(volume);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let volume = volume.to_string();
     let mark = |f: &std::fs::File| {
         if auxiliary_marking_enabled {
@@ -413,6 +416,9 @@ fn compact_view(
     arena.next_usn = view.next_usn;
     arena.volume_serial = view.volume_serial;
     let path = snapshot_path(volume);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let volume = volume.to_string();
     let mark = |file: &std::fs::File| {
         if auxiliary_marking_enabled {
@@ -455,7 +461,11 @@ fn trim_working_set() {
 
 fn snapshot_path(volume: &str) -> std::path::PathBuf {
     let safe: String = volume.chars().filter(|c| c.is_alphanumeric()).collect();
-    std::path::PathBuf::from(format!("{volume}\\")).join(format!(".scry-index-{safe}.rkyv"))
+    let app_data = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    app_data.join("scry").join(format!("index-{safe}.rkyv"))
 }
 
 /// Holds the state `is_real_change` needs to recognize the daemon's own
@@ -925,6 +935,13 @@ mod tests {
         );
         assert!(batch.is_empty());
         assert_eq!(next_usn, Some(42));
+    }
+
+    #[test]
+    fn snapshots_use_the_per_user_data_directory() {
+        let path = snapshot_path("C:");
+        assert_eq!(path.file_name().unwrap(), "index-C.rkyv");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "scry");
     }
 
     /// Struct sizes must match their Win32 counterparts exactly — a mismatch
