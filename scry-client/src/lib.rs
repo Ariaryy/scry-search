@@ -11,6 +11,7 @@ use scry_core::protocol::{
 struct LocalIndex {
     view: scry_ipc::SectionView,
     delta: scry_core::delta::Delta,
+    path_index: scry_core::pathindex::PathIndex,
     generation: u64,
 }
 
@@ -91,9 +92,11 @@ impl Client {
                 let delta =
                     scry_core::delta::Delta::decode_query_overlay(&shared.overlay, arena.len())
                         .ok_or_else(|| anyhow::anyhow!("malformed shared delta"))?;
+                let path_index = scry_core::pathindex::PathIndex::build(arena, &delta);
                 Ok(LocalIndex {
                     view: incoming,
                     delta,
+                    path_index,
                     generation: shared.generation,
                 })
             })();
@@ -118,8 +121,20 @@ impl Client {
             QueryKind::Prefix => scry_core::Query::Prefix(pattern.to_owned()),
             QueryKind::Substring => scry_core::Query::Substring(pattern.to_owned()),
             QueryKind::Wildcard => scry_core::Query::wildcard(pattern),
+            QueryKind::PathTerms => scry_core::Query::PathTerms(
+                scry_core::terms::parse_terms(pattern).unwrap_or_default(),
+            ),
             QueryKind::ShareIndex => unreachable!(),
         };
+        if let scry_core::Query::PathTerms(terms) = &query {
+            return Ok(scry_core::view::search_path_terms(
+                arena,
+                &local.delta,
+                &local.path_index,
+                terms,
+                limit as usize,
+            ));
+        }
         Ok(scry_core::view::search_archived_with_delta(
             arena,
             &local.delta,
@@ -138,5 +153,9 @@ impl Client {
 
     pub fn wildcard(&self, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {
         self.query(QueryKind::Wildcard, pattern, limit)
+    }
+
+    pub fn path_terms(&self, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {
+        self.query(QueryKind::PathTerms, pattern, limit)
     }
 }

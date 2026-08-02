@@ -25,6 +25,7 @@ regex-automata = "0.4"
 regex-syntax = "0.8"
 arc-swap = "1"
 memchr = "2"
+aho-corasick = "1"
 
 [profile.release]
 opt-level = 3

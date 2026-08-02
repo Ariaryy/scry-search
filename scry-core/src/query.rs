@@ -11,6 +11,8 @@ pub enum Query {
     Substring(String),
     /// Wildcard (`*`/`?`) or regex, compiled to a DFA once and reused across the scan.
     Regex(String),
+    /// AND-ed literal terms that may match the leaf or any ancestor.
+    PathTerms(Vec<String>),
 }
 
 impl Query {
@@ -114,6 +116,7 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
             }
             results
         }
+        Query::PathTerms(_) => Vec::new(),
     }
 }
 

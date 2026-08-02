@@ -43,6 +43,11 @@
   receive only `FILE_MAP_READ | SECTION_QUERY`, validate every fresh mapping,
   and fall back to RPC when sharing is unavailable. Path-term discriminant 3 is
   reserved; the internal share request uses 4.
+- **Path-term queries publish their derived `PathIndex` atomically with base and
+  delta.** It densely numbers directories with rank over `dir_bits`, propagates
+  term masks parent-before-child, and is rebuilt for every delta publication.
+  Never intersect trigram candidate blocks across terms: different terms may
+  be satisfied by different ancestor records.
 - **Substring search uses a trigram block filter** (16,384 rows × one bit per
   1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full

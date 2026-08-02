@@ -10,6 +10,7 @@ pub enum QueryKind {
     Prefix = 0,
     Substring = 1,
     Wildcard = 2,
+    PathTerms = 3,
     /// Internal capability request; path terms retain discriminant 3.
     ShareIndex = 4,
 }
@@ -20,6 +21,7 @@ impl QueryKind {
             0 => Some(QueryKind::Prefix),
             1 => Some(QueryKind::Substring),
             2 => Some(QueryKind::Wildcard),
+            3 => Some(QueryKind::PathTerms),
             4 => Some(QueryKind::ShareIndex),
             _ => None,
         }

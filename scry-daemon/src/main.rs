@@ -386,6 +386,10 @@ fn reindex_on_changes(
         if !needs_full_reindex {
             let next = Arc::new(IndexView {
                 base: view.base.clone(),
+                path_index: Arc::new(scry_core::pathindex::PathIndex::build(
+                    view.base.archived(),
+                    &delta,
+                )),
                 delta: Arc::new(delta),
                 generation: scry_core::view::fresh_generation(),
             });
@@ -490,6 +494,9 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
             QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
             QueryKind::Substring => Query::Substring(req.pattern.clone()),
             QueryKind::Wildcard => Query::wildcard(&req.pattern),
+            QueryKind::PathTerms => {
+                Query::PathTerms(scry_core::terms::parse_terms(&req.pattern).unwrap_or_default())
+            }
             QueryKind::ShareIndex => unreachable!(),
         };
         let entries: Vec<ResultEntry> = snapshot.search(&query, req.limit as usize);

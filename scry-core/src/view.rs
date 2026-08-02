@@ -5,6 +5,7 @@ use regex_automata::util::syntax;
 
 use crate::ascii;
 use crate::delta::{Delta, ParentRef};
+use crate::pathindex::PathIndex;
 use crate::protocol::ResultEntry;
 use crate::query::{search_base, Query};
 use crate::store::ArenaStore;
@@ -15,6 +16,7 @@ pub struct IndexView {
     pub base: Arc<ArenaStore>,
     pub delta: Arc<Delta>,
     pub generation: u64,
+    pub path_index: Arc<PathIndex>,
 }
 
 #[cfg(test)]
@@ -202,15 +204,83 @@ mod tests {
             );
         }
     }
+
+    fn nested_view() -> (tempfile::TempDir, IndexView) {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        let projects = builder.push("Projects", 0, true);
+        builder.set_parent(projects, root);
+        let documents = builder.push("Documents", 0, true);
+        builder.set_parent(documents, projects);
+        let reports = builder.push("Reports", 0, true);
+        builder.set_parent(reports, documents);
+        let file = builder.push("quarterly.pdf", 0, false);
+        builder.set_parent(file, reports);
+        let unrelated = builder.push("notes.txt", 0, false);
+        builder.set_parent(unrelated, root);
+        let arena = builder.build().0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        (dir, IndexView::new(base))
+    }
+
+    #[test]
+    fn path_terms_finds_ancestor_only_matches() {
+        let (_dir, view) = nested_view();
+        let results = view.search(
+            &Query::PathTerms(vec!["projects".into(), "reports".into()]),
+            50,
+        );
+        assert!(results
+            .iter()
+            .any(|entry| entry.path.ends_with("Reports\\quarterly.pdf")));
+        assert!(results
+            .iter()
+            .all(|entry| !entry.path.ends_with("notes.txt")));
+    }
+
+    #[test]
+    fn path_terms_matches_a_brute_force_full_path_scan() {
+        let (_dir, view) = nested_view();
+        for terms in [
+            vec!["projects".to_string()],
+            vec!["documents".to_string(), "pdf".to_string()],
+            vec!["c:".to_string(), "notes".to_string()],
+            vec!["missing".to_string()],
+        ] {
+            let mut expected = Vec::new();
+            for record in 0..view.base.archived().len() as u32 {
+                let path = view.base.archived().full_path(record, '\\');
+                let lower = path.to_ascii_lowercase();
+                if terms
+                    .iter()
+                    .all(|term| lower.contains(&term.to_ascii_lowercase()))
+                {
+                    expected.push(path);
+                }
+            }
+            let actual: Vec<_> = view
+                .search(&Query::PathTerms(terms.clone()), usize::MAX)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            assert_eq!(actual, expected, "{terms:?}");
+        }
+    }
 }
 
 impl IndexView {
     pub fn new(base: Arc<ArenaStore>) -> Self {
         let records = base.archived().len();
+        let delta = Arc::new(Delta::new(records));
+        let path_index = Arc::new(PathIndex::build(base.archived(), &delta));
         Self {
             base,
-            delta: Arc::new(Delta::new(records)),
+            delta,
             generation: fresh_generation(),
+            path_index,
         }
     }
 
@@ -227,6 +297,15 @@ impl IndexView {
     /// creation order. The combined result is intentionally not globally
     /// sorted while the overlay remains uncompacted.
     pub fn search(&self, query: &Query, limit: usize) -> Vec<ResultEntry> {
+        if let Query::PathTerms(terms) = query {
+            return search_path_terms(
+                self.base.archived(),
+                &self.delta,
+                &self.path_index,
+                terms,
+                limit,
+            );
+        }
         let arena = self.base.archived();
         let mut entries = Vec::new();
         for index in search_base(arena, query, usize::MAX) {
@@ -263,6 +342,7 @@ impl IndexView {
                 Query::Regex(_) => regex
                     .as_ref()
                     .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
+                Query::PathTerms(_) => unreachable!(),
             };
             if matches {
                 entries.push(ResultEntry {
@@ -404,6 +484,10 @@ pub fn search_archived_with_delta(
     query: &Query,
     limit: usize,
 ) -> Vec<ResultEntry> {
+    if let Query::PathTerms(terms) = query {
+        let path_index = PathIndex::build(arena, delta);
+        return search_path_terms(arena, delta, &path_index, terms, limit);
+    }
     let base_hits = search_base(arena, query, usize::MAX);
     let mut entries = Vec::with_capacity(base_hits.len().min(limit));
     for index in base_hits {
@@ -443,6 +527,7 @@ pub fn search_archived_with_delta(
             Query::Regex(_) => compiled
                 .as_ref()
                 .is_some_and(|regex| regex.is_match(record.name.as_bytes())),
+            Query::PathTerms(_) => unreachable!(),
         };
         if matched {
             entries.push(ResultEntry {
@@ -456,6 +541,113 @@ pub fn search_archived_with_delta(
         }
     }
     entries
+}
+
+pub fn search_path_terms(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    path_index: &PathIndex,
+    terms: &[String],
+    limit: usize,
+) -> Vec<ResultEntry> {
+    if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS || limit == 0 {
+        return Vec::new();
+    }
+    let automaton = match aho_corasick::AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(terms)
+    {
+        Ok(automaton) => automaton,
+        Err(_) => return Vec::new(),
+    };
+    let mask_for = |name: &[u8]| {
+        automaton
+            .find_overlapping_iter(name)
+            .fold(0u16, |mask, found| {
+                mask | (1u16 << found.pattern().as_usize())
+            })
+    };
+
+    let mut hits = Vec::<(u32, u16)>::new();
+    let mut dir_mask = vec![0u16; path_index.directory_count()];
+    arena.for_each_name(|record, name| {
+        if !delta.tombstones.get(record) {
+            let mask = mask_for(name);
+            if mask != 0 {
+                hits.push((record, mask));
+                if let Some(directory) = path_index.dir_ord(record) {
+                    dir_mask[directory as usize] |= mask;
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    for (index, record) in delta.added.iter().enumerate() {
+        if !record.live {
+            continue;
+        }
+        let combined = arena.len() as u32 + index as u32;
+        let mask = mask_for(record.name.as_bytes());
+        if mask != 0 {
+            hits.push((combined, mask));
+            if let Some(directory) = path_index.dir_ord(combined) {
+                dir_mask[directory as usize] |= mask;
+            }
+        }
+    }
+    path_index.closure(&mut dir_mask);
+
+    let full_mask = if terms.len() == 16 {
+        u16::MAX
+    } else {
+        (1u16 << terms.len()) - 1
+    };
+    let mut results = Vec::new();
+    let mut hit_position = 0usize;
+    for record in 0..path_index.records() as u32 {
+        let live = if record < arena.len() as u32 {
+            !delta.tombstones.get(record)
+        } else {
+            delta
+                .added
+                .get(record as usize - arena.len())
+                .is_some_and(|record| record.live)
+        };
+        if !live {
+            continue;
+        }
+        while hits.get(hit_position).is_some_and(|hit| hit.0 < record) {
+            hit_position += 1;
+        }
+        let own = hits
+            .get(hit_position)
+            .filter(|hit| hit.0 == record)
+            .map_or(0, |hit| hit.1);
+        let inherited = path_index
+            .parent_dir_ord(arena, delta, record)
+            .map_or(0, |directory| dir_mask[directory as usize]);
+        if own | inherited == full_mask {
+            if record < arena.len() as u32 {
+                results.push(ResultEntry {
+                    path: arena.full_path(record, '\\'),
+                    size: arena.size_bytes(record),
+                    is_dir: arena.is_dir(record),
+                });
+            } else {
+                let index = record - arena.len() as u32;
+                let added = &delta.added[index as usize];
+                results.push(ResultEntry {
+                    path: delta_path(arena, delta, index),
+                    size: added.size_bytes,
+                    is_dir: added.is_dir,
+                });
+            }
+            if results.len() >= limit {
+                break;
+            }
+        }
+    }
+    results
 }
 
 fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {

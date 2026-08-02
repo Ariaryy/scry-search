@@ -4,10 +4,12 @@ pub mod bitvec;
 pub mod delta;
 pub mod frnmap;
 mod literals;
+pub mod pathindex;
 pub mod protocol;
 pub mod query;
 pub mod record;
 pub mod store;
+pub mod terms;
 pub mod trigram;
 pub mod view;
 
