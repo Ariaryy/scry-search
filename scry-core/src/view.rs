@@ -18,6 +18,9 @@ pub struct IndexView {
     pub delta: Arc<Delta>,
     pub generation: u64,
     pub path_index: Arc<PathIndex>,
+    pub journal_id: u64,
+    pub next_usn: i64,
+    pub volume_serial: u64,
 }
 
 #[cfg(test)]
@@ -453,6 +456,9 @@ mod tests {
 impl IndexView {
     pub fn new(base: Arc<ArenaStore>) -> Self {
         let records = base.archived().len();
+        let journal_id = base.archived().journal_id;
+        let next_usn = base.archived().next_usn;
+        let volume_serial = base.archived().volume_serial;
         let delta = Arc::new(Delta::new(records));
         let path_index = Arc::new(PathIndex::build(base.archived(), &delta));
         Self {
@@ -460,6 +466,9 @@ impl IndexView {
             delta,
             generation: fresh_generation(),
             path_index,
+            journal_id,
+            next_usn,
+            volume_serial,
         }
     }
 

@@ -75,6 +75,10 @@ pub enum ChangeEvent {
         frn: u64,
         is_auxiliary: bool,
     },
+    /// Confirms every prior event in this read batch has been delivered.
+    Advanced {
+        next_usn: i64,
+    },
 }
 
 impl ChangeEvent {
@@ -84,6 +88,7 @@ impl ChangeEvent {
             | ChangeEvent::Deleted { is_auxiliary, .. }
             | ChangeEvent::Renamed { is_auxiliary, .. }
             | ChangeEvent::Modified { is_auxiliary, .. } => *is_auxiliary,
+            ChangeEvent::Advanced { .. } => false,
         }
     }
 }
@@ -837,6 +842,14 @@ fn watch(
                         // individual events would silently desync the index, so
                         // instead record that a full resync is required; the
                         // consumer treats the flag as "reindex regardless".
+                        overflowed.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            if let Err(error) = tx.try_send(ChangeEvent::Advanced { next_usn }) {
+                match error {
+                    crossbeam::channel::TrySendError::Disconnected(_) => break,
+                    crossbeam::channel::TrySendError::Full(_) => {
                         overflowed.store(true, Ordering::Relaxed);
                     }
                 }

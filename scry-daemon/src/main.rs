@@ -368,6 +368,9 @@ fn resume_view(
             path_index: Arc::new(scry_core::pathindex::PathIndex::build(archived, &delta)),
             delta: Arc::new(delta),
             generation: scry_core::view::fresh_generation(),
+            journal_id: cursor.journal_id,
+            next_usn: cursor.next_usn,
+            volume_serial: cursor.volume_serial,
         }),
         cursor: Some(cursor),
     }))
@@ -406,10 +409,9 @@ fn compact_view(
 ) -> anyhow::Result<Arc<IndexView>> {
     let _background = BackgroundModeGuard::enter();
     let (mut arena, mut frns) = view.compact();
-    let archived = view.base.archived();
-    arena.journal_id = archived.journal_id;
-    arena.next_usn = archived.next_usn;
-    arena.volume_serial = archived.volume_serial;
+    arena.journal_id = view.journal_id;
+    arena.next_usn = view.next_usn;
+    arena.volume_serial = view.volume_serial;
     let path = snapshot_path(volume);
     let volume = volume.to_string();
     let mark = |file: &std::fs::File| {
@@ -529,11 +531,24 @@ fn is_real_change(ev: &scry_fsevents::ChangeEvent, state: &mut SelfWriteFilter) 
         // stores names, parent links and mtime only, and mtime isn't
         // queryable. Reindexing on Modified is what made the daemon rebuild
         // continuously on an active volume.
-        ChangeEvent::Modified { .. } => false,
+        ChangeEvent::Modified { .. } | ChangeEvent::Advanced { .. } => false,
         ChangeEvent::Deleted { frn, .. } => {
             let was_self = state.self_frns.remove(frn);
             !was_self
         }
+    }
+}
+
+fn collect_change(
+    event: &scry_fsevents::ChangeEvent,
+    filter: &mut SelfWriteFilter,
+    batch: &mut Vec<scry_fsevents::ChangeEvent>,
+    replay_next_usn: &mut Option<i64>,
+) {
+    if let scry_fsevents::ChangeEvent::Advanced { next_usn } = event {
+        *replay_next_usn = Some(*next_usn);
+    } else if is_real_change(event, filter) {
+        batch.push(event.clone());
     }
 }
 
@@ -560,17 +575,14 @@ fn reindex_on_changes(
             }
         };
         let mut batch = Vec::new();
-        if is_real_change(&first, &mut filter) {
-            batch.push(first);
-        }
+        let mut replay_next_usn = None;
+        collect_change(&first, &mut filter, &mut batch, &mut replay_next_usn);
 
         // ...then absorb a short burst of further changes before paying for
         // a full reindex, so e.g. extracting a zip doesn't trigger thousands
         // of back-to-back rebuilds.
         while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            if is_real_change(&ev, &mut filter) {
-                batch.push(ev);
-            }
+            collect_change(&ev, &mut filter, &mut batch, &mut replay_next_usn);
         }
 
         // The channel filled up while we were mid-reindex; a structural
@@ -578,7 +590,7 @@ fn reindex_on_changes(
         // the drained events looked like.
         let mut needs_full_reindex = watcher.take_overflow();
 
-        if batch.is_empty() && !needs_full_reindex {
+        if batch.is_empty() && replay_next_usn.is_none() && !needs_full_reindex {
             continue;
         }
 
@@ -603,6 +615,9 @@ fn reindex_on_changes(
                 )),
                 delta: Arc::new(delta),
                 generation: scry_core::view::fresh_generation(),
+                journal_id: view.journal_id,
+                next_usn: replay_next_usn.unwrap_or(view.next_usn),
+                volume_serial: view.volume_serial,
             });
             let changes = next.delta.tombstones.count_ones() as usize + next.delta.added.len();
             if changes.saturating_mul(20) > next.base.archived().len() {
@@ -638,7 +653,13 @@ fn reindex_on_changes(
 
 fn persist_idle_view(store: &SharedStore, volume: &str, auxiliary_marking_enabled: bool) {
     let view = store.load_full();
-    if view.delta.tombstones.count_ones() == 0 && view.delta.added.is_empty() {
+    let archived = view.base.archived();
+    if view.delta.tombstones.count_ones() == 0
+        && view.delta.added.is_empty()
+        && view.journal_id == archived.journal_id
+        && view.next_usn == archived.next_usn
+        && view.volume_serial == archived.volume_serial
+    {
         return;
     }
     match compact_view(&view, volume, auxiliary_marking_enabled) {
@@ -679,7 +700,7 @@ fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
             parent_frn: *parent_frn,
             name: name.clone(),
         }),
-        ChangeEvent::Modified { .. } => None,
+        ChangeEvent::Modified { .. } | ChangeEvent::Advanced { .. } => None,
     }
 }
 
@@ -889,6 +910,21 @@ mod tests {
             is_auxiliary: false,
         };
         assert!(is_real_change(&real_created, &mut filter));
+    }
+
+    #[test]
+    fn journal_advance_is_retained_without_creating_a_delta_event() {
+        let mut filter = SelfWriteFilter::new("C:", false);
+        let mut batch = Vec::new();
+        let mut next_usn = None;
+        collect_change(
+            &ChangeEvent::Advanced { next_usn: 42 },
+            &mut filter,
+            &mut batch,
+            &mut next_usn,
+        );
+        assert!(batch.is_empty());
+        assert_eq!(next_usn, Some(42));
     }
 
     /// Struct sizes must match their Win32 counterparts exactly — a mismatch
