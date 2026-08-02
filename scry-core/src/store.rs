@@ -109,6 +109,22 @@ impl ArenaStore {
         // Safety: validated in `open` via check_archived_root.
         unsafe { rkyv::archived_root::<Arena>(&self.mmap[..]) }
     }
+
+    pub fn archive_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+}
+
+pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
+    let archived = rkyv::check_archived_root::<Arena>(bytes)
+        .map_err(|e| StoreError::Validation(e.to_string()))?;
+    if archived.format_version != FORMAT_VERSION {
+        return Err(StoreError::VersionMismatch {
+            found: archived.format_version,
+            expected: FORMAT_VERSION,
+        });
+    }
+    Ok(unsafe { rkyv::archived_root::<Arena>(bytes) })
 }
 
 #[cfg(test)]

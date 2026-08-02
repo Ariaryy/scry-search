@@ -14,6 +14,7 @@ use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
 pub struct IndexView {
     pub base: Arc<ArenaStore>,
     pub delta: Arc<Delta>,
+    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -171,6 +172,36 @@ mod tests {
         let compacted = view.compact().0;
         assert_eq!(compacted.len(), original - 2);
     }
+
+    #[test]
+    fn shared_overlay_search_matches_rpc_search() {
+        let (_dir, mut view) = base_view(200);
+        let root = view.base.archived().prefix_range("C:").start;
+        let deleted = view.base.archived().prefix_range("match_0042").start;
+        let mut delta = Delta::new(view.base.archived().len());
+        assert!(delta.tombstones.set(deleted));
+        delta.added.push(DeltaRecord {
+            name: "match_delta.txt".into(),
+            parent: ParentRef::Base(root),
+            mtime_secs: 0,
+            is_dir: false,
+            size_bytes: 17,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+        let encoded = view.delta.encode_query_overlay();
+        let decoded = Delta::decode_query_overlay(&encoded, view.base.archived().len()).unwrap();
+        for query in [
+            Query::Prefix("match".into()),
+            Query::Substring("DELTA".into()),
+            Query::wildcard("*.txt"),
+        ] {
+            assert_eq!(
+                search_archived_with_delta(view.base.archived(), &decoded, &query, 100),
+                view.search(&query, 100)
+            );
+        }
+    }
 }
 
 impl IndexView {
@@ -179,6 +210,7 @@ impl IndexView {
         Self {
             base,
             delta: Arc::new(Delta::new(records)),
+            generation: fresh_generation(),
         }
     }
 
@@ -356,5 +388,95 @@ impl IndexView {
             }
         }
         builder.build()
+    }
+}
+
+pub fn fresh_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Search a validated archived base together with its coherent delta overlay.
+pub fn search_archived_with_delta(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    query: &Query,
+    limit: usize,
+) -> Vec<ResultEntry> {
+    let base_hits = search_base(arena, query, usize::MAX);
+    let mut entries = Vec::with_capacity(base_hits.len().min(limit));
+    for index in base_hits {
+        if delta.tombstones.get(index) {
+            continue;
+        }
+        entries.push(ResultEntry {
+            path: arena.full_path(index, '\\'),
+            size: arena.size_bytes(index),
+            is_dir: arena.is_dir(index),
+        });
+        if entries.len() >= limit {
+            return entries;
+        }
+    }
+
+    let compiled = match query {
+        Query::Regex(pattern) => Regex::builder()
+            .syntax(syntax::Config::new().case_insensitive(true))
+            .build(pattern)
+            .ok(),
+        _ => None,
+    };
+    let substring_lower = match query {
+        Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
+        _ => None,
+    };
+    for (index, record) in delta.live_added() {
+        let matched = match query {
+            Query::Prefix(prefix) => {
+                ascii::starts_with_ci(record.name.as_bytes(), prefix.as_bytes())
+            }
+            Query::Substring(_) => ascii::contains_ci(
+                record.name.as_bytes(),
+                substring_lower.as_ref().unwrap().as_bytes(),
+            ),
+            Query::Regex(_) => compiled
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(record.name.as_bytes())),
+        };
+        if matched {
+            entries.push(ResultEntry {
+                path: delta_path(arena, delta, index),
+                size: record.size_bytes,
+                is_dir: record.is_dir,
+            });
+            if entries.len() >= limit {
+                break;
+            }
+        }
+    }
+    entries
+}
+
+fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {
+    let mut parts = Vec::new();
+    let mut base_parent = None;
+    for _ in 0..512 {
+        let record = &delta.added[index as usize];
+        parts.push(record.name.clone());
+        match record.parent {
+            ParentRef::Base(parent) => {
+                base_parent = Some(parent);
+                break;
+            }
+            ParentRef::Delta(parent) => index = parent,
+            ParentRef::None => break,
+        }
+    }
+    parts.reverse();
+    let suffix = parts.join("\\");
+    match base_parent {
+        Some(parent) => format!("{}\\{suffix}", arena.full_path(parent, '\\')),
+        None => suffix,
     }
 }

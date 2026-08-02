@@ -10,6 +10,8 @@ pub enum QueryKind {
     Prefix = 0,
     Substring = 1,
     Wildcard = 2,
+    /// Internal capability request; path terms retain discriminant 3.
+    ShareIndex = 4,
 }
 
 impl QueryKind {
@@ -18,9 +20,51 @@ impl QueryKind {
             0 => Some(QueryKind::Prefix),
             1 => Some(QueryKind::Substring),
             2 => Some(QueryKind::Wildcard),
+            4 => Some(QueryKind::ShareIndex),
             _ => None,
         }
     }
+}
+
+pub struct SharedIndexResponse {
+    pub handle: u64,
+    pub len: u64,
+    pub generation: u64,
+    pub overlay: Vec<u8>,
+}
+
+const SHARED_INDEX_MAGIC: &[u8; 8] = b"SCRYSHR1";
+
+pub fn encode_shared_index(response: &SharedIndexResponse) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36 + response.overlay.len());
+    out.extend_from_slice(SHARED_INDEX_MAGIC);
+    out.extend_from_slice(&response.handle.to_le_bytes());
+    out.extend_from_slice(&response.len.to_le_bytes());
+    out.extend_from_slice(&response.generation.to_le_bytes());
+    out.extend_from_slice(&(response.overlay.len() as u32).to_le_bytes());
+    out.extend_from_slice(&response.overlay);
+    out
+}
+
+pub fn decode_shared_index(bytes: &[u8]) -> Option<SharedIndexResponse> {
+    if bytes.get(..8)? != SHARED_INDEX_MAGIC {
+        return None;
+    }
+    let mut cursor = Cursor::new(&bytes[8..]);
+    let handle = cursor.read_u64()?;
+    let len = cursor.read_u64()?;
+    let generation = cursor.read_u64()?;
+    let overlay_len = cursor.read_u32()? as usize;
+    let overlay = cursor
+        .buf
+        .get(cursor.pos..cursor.pos.checked_add(overlay_len)?)?
+        .to_vec();
+    (cursor.pos + overlay_len == cursor.buf.len()).then_some(SharedIndexResponse {
+        handle,
+        len,
+        generation,
+        overlay,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +74,7 @@ pub struct Request {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultEntry {
     pub path: String,
     pub size: u64,
@@ -165,5 +209,21 @@ mod tests {
     fn decode_rejects_truncated_input() {
         assert!(decode_request(&[0, 1, 2]).is_none());
         assert!(decode_results(&[0, 0]).is_none());
+    }
+
+    #[test]
+    fn shared_index_response_round_trips() {
+        let encoded = encode_shared_index(&SharedIndexResponse {
+            handle: 17,
+            len: 4096,
+            generation: 9,
+            overlay: vec![1, 2, 3],
+        });
+        let decoded = decode_shared_index(&encoded).unwrap();
+        assert_eq!(decoded.handle, 17);
+        assert_eq!(decoded.len, 4096);
+        assert_eq!(decoded.generation, 9);
+        assert_eq!(decoded.overlay, [1, 2, 3]);
+        assert!(decode_shared_index(&encoded[..encoded.len() - 1]).is_none());
     }
 }

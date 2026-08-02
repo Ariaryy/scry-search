@@ -19,7 +19,10 @@ mod ffi;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use scry_core::delta::{ApplyOutcome, DeltaEvent};
-use scry_core::protocol::{decode_request, encode_results, QueryKind, ResultEntry};
+use scry_core::protocol::{
+    decode_request, encode_results, encode_shared_index, QueryKind, ResultEntry,
+    SharedIndexResponse,
+};
 use scry_core::{ArenaStore, IndexView, Query};
 use std::sync::Arc;
 
@@ -384,6 +387,7 @@ fn reindex_on_changes(
             let next = Arc::new(IndexView {
                 base: view.base.clone(),
                 delta: Arc::new(delta),
+                generation: scry_core::view::fresh_generation(),
             });
             let changes = next.delta.tombstones.count_ones() as usize + next.delta.added.len();
             if changes.saturating_mul(20) > next.base.archived().len() {
@@ -462,10 +466,31 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
         // `load_full` clones the Arc, keeping this index alive for the whole
         // query even if the reindex thread swaps in a new one mid-search.
         let snapshot = store.load_full();
+        if req.kind == QueryKind::ShareIndex {
+            if req.pattern.parse::<u64>().ok() == Some(snapshot.generation) {
+                pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
+                    handle: 0,
+                    len: 0,
+                    generation: snapshot.generation,
+                    overlay: Vec::new(),
+                }))?;
+                continue;
+            }
+            let section = shared_section(&snapshot)?;
+            let handle = section.duplicate_for(pipe.client_process_id()?)?;
+            pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
+                handle,
+                len: section.len() as u64,
+                generation: snapshot.generation,
+                overlay: snapshot.delta.encode_query_overlay(),
+            }))?;
+            continue;
+        }
         let query = match req.kind {
             QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
             QueryKind::Substring => Query::Substring(req.pattern.clone()),
             QueryKind::Wildcard => Query::wildcard(&req.pattern),
+            QueryKind::ShareIndex => unreachable!(),
         };
         let entries: Vec<ResultEntry> = snapshot.search(&query, req.limit as usize);
 
@@ -473,9 +498,67 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
     }
 }
 
+fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
+    use std::sync::{Mutex, OnceLock};
+    type SectionCache = Mutex<Option<(usize, Arc<scry_ipc::Section>)>>;
+    static CACHE: OnceLock<SectionCache> = OnceLock::new();
+    let key = Arc::as_ptr(&view.base) as usize;
+    let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some((cached_key, section)) = &*cache {
+        if *cached_key == key {
+            return Ok(section.clone());
+        }
+    }
+    let section = Arc::new(scry_ipc::Section::create(view.base.archive_bytes())?);
+    *cache = Some((key, section.clone()));
+    Ok(section)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_local_matches_search_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_store_with_n_records(200, &dir);
+        let expected = view.search(&Query::Substring("file".into()), 50);
+        let store = Arc::new(arc_swap::ArcSwap::from(view));
+        let pipe_name = format!(
+            r"\\.\pipe\scry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let server_store = store.clone();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            handle_connection(pipe, &server_store).unwrap();
+        });
+        let mut client = (0..100)
+            .find_map(|_| {
+                scry_client::Client::connect_to(&pipe_name)
+                    .ok()
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        None
+                    })
+            })
+            .expect("test pipe did not become ready");
+        let actual = client
+            .search_local(QueryKind::Substring, "file", 50)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let cached = client
+            .search_local(QueryKind::Substring, "file", 50)
+            .unwrap();
+        assert_eq!(cached, expected);
+        drop(client);
+        thread.join().unwrap();
+    }
     use scry_core::{store::save, Arena};
     use scry_fsevents::ChangeEvent;
 

@@ -4,10 +4,20 @@
 //! be a thin wrapper around the same `Client::query` call.
 
 pub use scry_core::protocol::ResultEntry;
-use scry_core::protocol::{decode_results, encode_request, QueryKind, Request};
+use scry_core::protocol::{
+    decode_results, decode_shared_index, encode_request, QueryKind, Request,
+};
+
+struct LocalIndex {
+    view: scry_ipc::SectionView,
+    delta: scry_core::delta::Delta,
+    generation: u64,
+}
 
 pub struct Client {
     pipe: scry_ipc::Pipe,
+    pipe_name: String,
+    local: Option<LocalIndex>,
 }
 
 impl Client {
@@ -18,7 +28,11 @@ impl Client {
     pub fn connect_to(pipe_name: &str) -> anyhow::Result<Self> {
         let pipe = scry_ipc::connect_client(pipe_name)
             .map_err(|e| anyhow::anyhow!("connecting to scryd at {pipe_name}: {e}"))?;
-        Ok(Self { pipe })
+        Ok(Self {
+            pipe,
+            pipe_name: pipe_name.to_owned(),
+            local: None,
+        })
     }
 
     pub fn query(
@@ -35,6 +49,83 @@ impl Client {
         self.pipe.write_frame(&encode_request(&req))?;
         let resp = self.pipe.read_frame()?;
         decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
+    }
+
+    /// Search a coherent base+delta generation in this process, falling back
+    /// to daemon RPC when section sharing is unavailable.
+    pub fn search_local(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<ResultEntry>> {
+        if kind == QueryKind::ShareIndex {
+            return Err(anyhow::anyhow!("invalid search kind"));
+        }
+        let request = Request {
+            kind: QueryKind::ShareIndex,
+            pattern: self
+                .local
+                .as_ref()
+                .map(|local| local.generation.to_string())
+                .unwrap_or_default(),
+            limit: 0,
+        };
+        let shared = (|| -> anyhow::Result<_> {
+            self.pipe.write_frame(&encode_request(&request))?;
+            let frame = self.pipe.read_frame()?;
+            decode_shared_index(&frame).ok_or_else(|| anyhow::anyhow!("sharing unsupported"))
+        })();
+        let shared = match shared {
+            Ok(shared) => shared,
+            Err(_) => {
+                self.pipe = scry_ipc::connect_client(&self.pipe_name)?;
+                return self.query(kind, pattern, limit);
+            }
+        };
+
+        if shared.handle != 0 {
+            let mapped = (|| -> anyhow::Result<LocalIndex> {
+                let incoming = scry_ipc::SectionView::map(shared.handle, shared.len as usize)?;
+                let arena = scry_core::store::archived_bytes(incoming.as_bytes())?;
+                let delta =
+                    scry_core::delta::Delta::decode_query_overlay(&shared.overlay, arena.len())
+                        .ok_or_else(|| anyhow::anyhow!("malformed shared delta"))?;
+                Ok(LocalIndex {
+                    view: incoming,
+                    delta,
+                    generation: shared.generation,
+                })
+            })();
+            match mapped {
+                Ok(local) => self.local = Some(local),
+                Err(_) => return self.query(kind, pattern, limit),
+            }
+        } else if self
+            .local
+            .as_ref()
+            .is_none_or(|local| local.generation != shared.generation)
+        {
+            return self.query(kind, pattern, limit);
+        }
+
+        let local = self.local.as_ref().unwrap();
+        let arena = match scry_core::store::archived_bytes(local.view.as_bytes()) {
+            Ok(arena) => arena,
+            Err(_) => return self.query(kind, pattern, limit),
+        };
+        let query = match kind {
+            QueryKind::Prefix => scry_core::Query::Prefix(pattern.to_owned()),
+            QueryKind::Substring => scry_core::Query::Substring(pattern.to_owned()),
+            QueryKind::Wildcard => scry_core::Query::wildcard(pattern),
+            QueryKind::ShareIndex => unreachable!(),
+        };
+        Ok(scry_core::view::search_archived_with_delta(
+            arena,
+            &local.delta,
+            &query,
+            limit as usize,
+        ))
     }
 
     pub fn prefix(&self, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {

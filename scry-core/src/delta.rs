@@ -36,6 +36,10 @@ impl Bitset {
     pub fn count_ones(&self) -> u32 {
         self.ones
     }
+
+    fn words(&self) -> &[u64] {
+        &self.words
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +217,112 @@ impl Delta {
     }
 }
 
+impl Delta {
+    pub fn encode_query_overlay(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.tombstones.words().len() as u32).to_le_bytes());
+        for &word in self.tombstones.words() {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.added.len() as u32).to_le_bytes());
+        for record in &self.added {
+            out.push(record.live as u8);
+            match record.parent {
+                ParentRef::None => out.push(0),
+                ParentRef::Base(index) => {
+                    out.push(1);
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
+                ParentRef::Delta(index) => {
+                    out.push(2);
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&record.mtime_secs.to_le_bytes());
+            out.push(record.is_dir as u8);
+            out.extend_from_slice(&record.size_bytes.to_le_bytes());
+            out.extend_from_slice(&(record.name.len() as u32).to_le_bytes());
+            out.extend_from_slice(record.name.as_bytes());
+        }
+        out
+    }
+
+    pub fn decode_query_overlay(bytes: &[u8], base_records: usize) -> Option<Self> {
+        fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+            let value = bytes.get(..len)?;
+            *bytes = bytes.get(len..)?;
+            Some(value)
+        }
+        fn u32_value(bytes: &mut &[u8]) -> Option<u32> {
+            Some(u32::from_le_bytes(take(bytes, 4)?.try_into().ok()?))
+        }
+        fn u64_value(bytes: &mut &[u8]) -> Option<u64> {
+            Some(u64::from_le_bytes(take(bytes, 8)?.try_into().ok()?))
+        }
+
+        let mut input = bytes;
+        let word_count = u32_value(&mut input)? as usize;
+        if word_count != base_records.div_ceil(64) {
+            return None;
+        }
+        let mut tombstones = Bitset::new(base_records);
+        for word_index in 0..word_count {
+            let word = u64_value(&mut input)?;
+            for bit in 0..64 {
+                if word & (1 << bit) != 0 {
+                    let index = word_index * 64 + bit;
+                    if index < base_records {
+                        tombstones.set(index as u32);
+                    }
+                }
+            }
+        }
+        let count = u32_value(&mut input)? as usize;
+        if count > base_records / 10 + 1_000_000 {
+            return None;
+        }
+        let mut added = Vec::with_capacity(count);
+        for index in 0..count {
+            let live = *take(&mut input, 1)?.first()? != 0;
+            let parent = match *take(&mut input, 1)?.first()? {
+                0 => ParentRef::None,
+                1 => ParentRef::Base(u32_value(&mut input)?),
+                2 => {
+                    let parent = u32_value(&mut input)?;
+                    if parent as usize >= index {
+                        return None;
+                    }
+                    ParentRef::Delta(parent)
+                }
+                _ => return None,
+            };
+            let mtime_secs = u32_value(&mut input)?;
+            let is_dir = *take(&mut input, 1)?.first()? != 0;
+            let size_bytes = u64_value(&mut input)?;
+            let name_len = u32_value(&mut input)? as usize;
+            let name = std::str::from_utf8(take(&mut input, name_len)?)
+                .ok()?
+                .to_owned();
+            added.push(DeltaRecord {
+                name,
+                parent,
+                mtime_secs,
+                is_dir,
+                size_bytes,
+                live,
+            });
+        }
+        if !input.is_empty() {
+            return None;
+        }
+        Some(Self {
+            tombstones,
+            added,
+            added_frns: HashMap::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +442,33 @@ mod tests {
                 &base,
             ),
             ApplyOutcome::NeedsFullReindex
+        );
+    }
+
+    #[test]
+    fn query_overlay_round_trips_and_rejects_truncation() {
+        let (_dir, base) = base_store();
+        let mut delta = Delta::new(base.archived().len());
+        assert_eq!(
+            delta.apply(
+                &DeltaEvent::Created {
+                    frn: 20,
+                    parent_frn: 5,
+                    name: "new.txt".into(),
+                    is_dir: false,
+                    mtime_secs: 7,
+                },
+                &base,
+            ),
+            ApplyOutcome::Applied
+        );
+        let encoded = delta.encode_query_overlay();
+        let decoded = Delta::decode_query_overlay(&encoded, base.archived().len()).unwrap();
+        assert_eq!(decoded.added[0].name, "new.txt");
+        assert_eq!(decoded.added[0].mtime_secs, 7);
+        assert!(
+            Delta::decode_query_overlay(&encoded[..encoded.len() - 1], base.archived().len())
+                .is_none()
         );
     }
 }

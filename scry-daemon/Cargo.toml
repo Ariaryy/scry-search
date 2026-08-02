@@ -20,3 +20,4 @@ mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+scry-client = { path = "../scry-client" }

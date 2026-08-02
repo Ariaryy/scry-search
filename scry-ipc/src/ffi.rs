@@ -21,6 +21,11 @@ pub const PIPE_UNLIMITED_INSTANCES: Dword = 255;
 
 pub const ERROR_PIPE_CONNECTED: Dword = 535;
 pub const ERROR_PIPE_BUSY: Dword = 231;
+pub const PAGE_READWRITE: Dword = 0x04;
+pub const FILE_MAP_READ: Dword = 0x0004;
+pub const FILE_MAP_WRITE: Dword = 0x0002;
+pub const SECTION_QUERY: Dword = 0x0001;
+pub const PROCESS_DUP_HANDLE: Dword = 0x0040;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -66,6 +71,36 @@ extern "system" {
     pub fn CloseHandle(h_object: Handle) -> Bool;
 
     pub fn WaitNamedPipeW(lp_named_pipe_name: *const u16, n_time_out: Dword) -> Bool;
+    pub fn CreateFileMappingW(
+        h_file: Handle,
+        attributes: *mut c_void,
+        protect: Dword,
+        maximum_size_high: Dword,
+        maximum_size_low: Dword,
+        name: *const u16,
+    ) -> Handle;
+    pub fn MapViewOfFile(
+        mapping: Handle,
+        desired_access: Dword,
+        offset_high: Dword,
+        offset_low: Dword,
+        bytes: usize,
+    ) -> *mut c_void;
+    pub fn UnmapViewOfFile(base: *const c_void) -> Bool;
+    pub fn OpenProcess(desired_access: Dword, inherit: Bool, process_id: Dword) -> Handle;
+    pub fn GetCurrentProcess() -> Handle;
+    pub fn DuplicateHandle(
+        source_process: Handle,
+        source: Handle,
+        target_process: Handle,
+        target: *mut Handle,
+        desired_access: Dword,
+        inherit: Bool,
+        options: Dword,
+    ) -> Bool;
+    pub fn GetNamedPipeClientProcessId(pipe: Handle, client_process_id: *mut Dword) -> Bool;
+    #[cfg(test)]
+    pub fn GetProcessHandleCount(process: Handle, handle_count: *mut Dword) -> Bool;
 
     pub fn LocalFree(h_mem: Handle) -> Handle;
 

@@ -37,6 +37,12 @@
   fallback whenever an event can't be applied confidently, whenever the event
   channel overflowed, and on startup. Deletes use an FRN-to-index `.frn`
   sidecar kept out of the hot mmap so it stays evicted between bursts.
+- **Client-local queries use an anonymous read-only section** for the immutable
+  base plus a serialized delta overlay in the same generation response. Handle
+  duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients
+  receive only `FILE_MAP_READ | SECTION_QUERY`, validate every fresh mapping,
+  and fall back to RPC when sharing is unavailable. Path-term discriminant 3 is
+  reserved; the internal share request uses 4.
 - **Substring search uses a trigram block filter** (16,384 rows × one bit per
   1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full

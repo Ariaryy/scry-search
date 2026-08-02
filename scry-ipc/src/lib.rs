@@ -3,6 +3,9 @@
 //! loop only exists once.
 
 mod ffi;
+mod section;
+
+pub use section::{Section, SectionView};
 
 use std::ffi::c_void;
 use std::io;
@@ -21,6 +24,14 @@ pub struct Pipe(ffi::Handle);
 unsafe impl Send for Pipe {}
 
 impl Pipe {
+    pub fn client_process_id(&self) -> io::Result<u32> {
+        let mut process_id = 0;
+        let ok = unsafe { ffi::GetNamedPipeClientProcessId(self.0, &mut process_id) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(process_id)
+    }
     pub fn read_frame(&self) -> io::Result<Vec<u8>> {
         let mut len_buf = [0u8; 4];
         self.read_exact(&mut len_buf)?;
