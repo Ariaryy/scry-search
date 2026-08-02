@@ -27,6 +27,10 @@ pub enum WindowsBackendError {
     ReadJournal { code: u32 },
     #[error("GetVolumeInformationW failed: win32 error {code}")]
     VolumeInformation { code: u32 },
+    #[error("USN journal identity changed")]
+    JournalChanged,
+    #[error("requested USN cursor has aged out of the journal")]
+    JournalAgedOut,
 }
 
 /// Identity and replay position for an NTFS USN journal.
@@ -90,6 +94,14 @@ impl WindowsBackend {
     /// Captures the active journal identity before an index enumeration.
     pub fn journal_cursor(volume: &str) -> Result<JournalCursor, WindowsBackendError> {
         journal_cursor(volume)
+    }
+    /// Reads structural journal records from `cursor` through the current
+    /// cursor. The returned cursor is safe to persist after all events apply.
+    pub fn replay_journal(
+        volume: &str,
+        cursor: JournalCursor,
+    ) -> Result<(JournalCursor, Vec<ChangeEvent>), WindowsBackendError> {
+        replay_journal(volume, cursor)
     }
     /// Enumerates accessible fixed NTFS drive roots. Failed probes are omitted;
     /// callers can continue indexing the remaining volumes.
@@ -619,6 +631,113 @@ fn journal_cursor(volume: &str) -> Result<JournalCursor, WindowsBackendError> {
     })
 }
 
+fn replay_journal(
+    volume: &str,
+    cursor: JournalCursor,
+) -> Result<(JournalCursor, Vec<ChangeEvent>), WindowsBackendError> {
+    let handle = open_volume(volume, 0)?;
+    let result = (|| {
+        let journal = query_journal(handle)?;
+        let current = JournalCursor {
+            journal_id: journal.usn_journal_id,
+            first_usn: journal.first_usn,
+            next_usn: journal.next_usn,
+            volume_serial: volume_serial(volume)?,
+        };
+        validate_replay_cursor(cursor, current)?;
+
+        let mut start_usn = cursor.next_usn;
+        let mut out_buf = vec![0u8; 64 * 1024];
+        let mut name = String::new();
+        let mut events = Vec::new();
+
+        while start_usn < current.next_usn {
+            let input = ffi::ReadUsnJournalDataV0 {
+                start_usn,
+                reason_mask: ffi::USN_STRUCTURAL_REASONS,
+                return_only_on_close: 0,
+                timeout: 0,
+                bytes_to_wait_for: 0,
+                usn_journal_id: current.journal_id,
+            };
+            let bytes_returned = unsafe {
+                ioctl_overlapped(
+                    handle,
+                    ffi::FSCTL_READ_USN_JOURNAL,
+                    &input as *const _ as *const c_void,
+                    std::mem::size_of::<ffi::ReadUsnJournalDataV0>() as u32,
+                    out_buf.as_mut_ptr() as *mut c_void,
+                    out_buf.len() as u32,
+                    std::ptr::null_mut(),
+                )
+            }
+            .map_err(|code| WindowsBackendError::ReadJournal { code })?;
+            if bytes_returned < 8 {
+                return Err(WindowsBackendError::ReadJournal {
+                    code: ffi::ERROR_INVALID_DATA,
+                });
+            }
+            let next_usn = i64::from_ne_bytes(out_buf[0..8].try_into().unwrap());
+            if next_usn <= start_usn {
+                return Err(WindowsBackendError::ReadJournal {
+                    code: ffi::ERROR_INVALID_DATA,
+                });
+            }
+            for_each_usn_record(&out_buf, bytes_returned as usize, |header, name_bytes| {
+                if header.usn >= current.next_usn {
+                    return;
+                }
+                decode_name_into(name_bytes, &mut name);
+                events.push(classify(header, name.clone()));
+            });
+            start_usn = next_usn;
+        }
+        Ok((current, events))
+    })();
+    unsafe { ffi::CloseHandle(handle) };
+    result
+}
+
+fn validate_replay_cursor(
+    cursor: JournalCursor,
+    current: JournalCursor,
+) -> Result<(), WindowsBackendError> {
+    if cursor.volume_serial != current.volume_serial || cursor.journal_id != current.journal_id {
+        return Err(WindowsBackendError::JournalChanged);
+    }
+    if cursor.next_usn < current.first_usn {
+        return Err(WindowsBackendError::JournalAgedOut);
+    }
+    if cursor.next_usn > current.next_usn {
+        return Err(WindowsBackendError::JournalChanged);
+    }
+    Ok(())
+}
+
+fn volume_serial(volume: &str) -> Result<u64, WindowsBackendError> {
+    let root = format!("{volume}\\");
+    let wide = to_wide(&root);
+    let mut serial = 0;
+    let ok = unsafe {
+        ffi::GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(WindowsBackendError::VolumeInformation {
+            code: unsafe { ffi::GetLastError() },
+        });
+    }
+    Ok(serial.into())
+}
+
 /// Blocks the calling thread, translating USN journal change records into
 /// [`ChangeEvent`]s on `tx` until `should_stop` is set or `tx`'s receiver is
 /// dropped. Starts from "now" (the journal's current USN) — it does not
@@ -638,6 +757,7 @@ pub fn is_structural_reason(reason: u32) -> bool {
 
 fn watch(
     volume: &str,
+    start_cursor: Option<JournalCursor>,
     tx: &crossbeam::channel::Sender<ChangeEvent>,
     should_stop: &AtomicBool,
     watch_handle: &AtomicUsize,
@@ -648,7 +768,19 @@ fn watch(
 
     let result = (|| {
         let journal = query_journal(handle)?;
-        let mut start_usn = journal.next_usn;
+        let current = JournalCursor {
+            journal_id: journal.usn_journal_id,
+            first_usn: journal.first_usn,
+            next_usn: journal.next_usn,
+            volume_serial: volume_serial(volume)?,
+        };
+        let mut start_usn = match start_cursor {
+            Some(cursor) => {
+                validate_replay_cursor(cursor, current)?;
+                cursor.next_usn
+            }
+            None => current.next_usn,
+        };
         let mut out_buf = vec![0u8; 64 * 1024];
         let mut name = String::new();
         let mut events = Vec::new();
@@ -799,6 +931,17 @@ impl WindowsBackend {
         volume: &str,
         tx: crossbeam::channel::Sender<ChangeEvent>,
     ) -> JournalHandle {
+        Self::spawn_watcher_from(volume, None, tx)
+    }
+
+    /// Spawns a watcher at a cursor captured before the base enumeration or
+    /// returned by replay. This closes the interval between producing a view
+    /// and starting its live updates.
+    pub fn spawn_watcher_from(
+        volume: &str,
+        cursor: Option<JournalCursor>,
+        tx: crossbeam::channel::Sender<ChangeEvent>,
+    ) -> JournalHandle {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let watch_handle = Arc::new(AtomicUsize::new(0));
@@ -809,6 +952,7 @@ impl WindowsBackend {
         let join = std::thread::spawn(move || {
             watch(
                 &volume,
+                cursor,
                 &tx,
                 &stop_thread,
                 &watch_handle_thread,
@@ -846,6 +990,7 @@ mod ffi {
     pub const FILE_SHARE_WRITE: Dword = 0x0000_0002;
     pub const OPEN_EXISTING: Dword = 3;
     pub const ERROR_HANDLE_EOF: Dword = 38;
+    pub const ERROR_INVALID_DATA: Dword = 13;
     pub const DRIVE_FIXED: Dword = 3;
     pub const FILE_ATTRIBUTE_DIRECTORY: Dword = 0x10;
     /// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 44, METHOD_NEITHER, FILE_ANY_ACCESS)
@@ -1071,6 +1216,41 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cursor(journal_id: u64, first_usn: i64, next_usn: i64, volume_serial: u64) -> JournalCursor {
+        JournalCursor {
+            journal_id,
+            first_usn,
+            next_usn,
+            volume_serial,
+        }
+    }
+
+    #[test]
+    fn replay_cursor_rejects_a_changed_journal_or_volume() {
+        let current = cursor(2, 100, 200, 3);
+        assert!(matches!(
+            validate_replay_cursor(cursor(1, 0, 150, 3), current),
+            Err(WindowsBackendError::JournalChanged)
+        ));
+        assert!(matches!(
+            validate_replay_cursor(cursor(2, 0, 150, 4), current),
+            Err(WindowsBackendError::JournalChanged)
+        ));
+    }
+
+    #[test]
+    fn replay_cursor_rejects_an_aged_out_position() {
+        assert!(matches!(
+            validate_replay_cursor(cursor(2, 0, 99, 3), cursor(2, 100, 200, 3)),
+            Err(WindowsBackendError::JournalAgedOut)
+        ));
+    }
+
+    #[test]
+    fn replay_cursor_accepts_an_available_position() {
+        assert!(validate_replay_cursor(cursor(2, 0, 150, 3), cursor(2, 100, 200, 3)).is_ok());
+    }
 
     fn header(reason: u32, source_info: u32) -> ffi::UsnRecordV2Header {
         ffi::UsnRecordV2Header {

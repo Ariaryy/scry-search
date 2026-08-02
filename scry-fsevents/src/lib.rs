@@ -16,6 +16,6 @@ pub fn configure_index_read_cap(bytes_per_second: u64) {
 
 #[cfg(windows)]
 pub use windows::{
-    enumerate_mft_usn, is_structural_reason, ChangeEvent, JournalHandle, WindowsBackend,
-    WindowsBackendError,
+    enumerate_mft_usn, is_structural_reason, ChangeEvent, JournalCursor, JournalHandle,
+    WindowsBackend, WindowsBackendError,
 };

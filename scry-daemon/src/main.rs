@@ -37,6 +37,12 @@ type SharedStore = Arc<arc_swap::ArcSwap<IndexView>>;
 struct VolumeIndex {
     volume: String,
     store: SharedStore,
+    cursor: Option<scry_fsevents::JournalCursor>,
+}
+
+struct StartupView {
+    view: Arc<IndexView>,
+    cursor: Option<scry_fsevents::JournalCursor>,
 }
 
 type VolumeIndexes = Arc<Vec<VolumeIndex>>;
@@ -123,17 +129,18 @@ fn main() -> anyhow::Result<()> {
     let mut indexed = Vec::new();
     for volume in volume_names {
         eprintln!("scryd: indexing {volume}...");
-        let initial = match build_view(&volume, auxiliary_marking_enabled) {
+        let initial = match build_or_resume_view(&volume, auxiliary_marking_enabled) {
             Ok(view) => view,
             Err(error) => {
                 eprintln!("scryd: skipping {volume}: {error}");
                 continue;
             }
         };
-        eprintln!("scryd: indexed {} entries on {volume}", initial.len());
+        eprintln!("scryd: indexed {} entries on {volume}", initial.view.len());
         indexed.push(VolumeIndex {
             volume,
-            store: Arc::new(initial.into()),
+            store: Arc::new(initial.view.into()),
+            cursor: initial.cursor,
         });
     }
     if indexed.is_empty() {
@@ -144,17 +151,19 @@ fn main() -> anyhow::Result<()> {
         spawn_volume_watcher(
             index.volume.clone(),
             index.store.clone(),
+            index.cursor,
             auxiliary_marking_enabled,
         );
     }
     let store = indexes[0].store.clone();
     let volume = indexes[0].volume.clone();
+    let cursor = indexes[0].cursor;
 
     {
         let store = store.clone();
         let volume = volume.clone();
         let (tx, rx) = crossbeam::channel::bounded(16_384);
-        let watcher = scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx);
+        let watcher = scry_fsevents::WindowsBackend::spawn_watcher_from(&volume, cursor, tx);
         // Leaked intentionally: the watcher runs for the daemon's whole
         // lifetime, same as the pipe server loop below never returning.
         let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
@@ -194,9 +203,14 @@ fn main() -> anyhow::Result<()> {
 /// Both are best-effort. Failures are logged and ignored — an older Windows
 /// build simply doesn't support them, and that is not a reason to refuse to
 /// run.
-fn spawn_volume_watcher(volume: String, store: SharedStore, auxiliary_marking_enabled: bool) {
+fn spawn_volume_watcher(
+    volume: String,
+    store: SharedStore,
+    cursor: Option<scry_fsevents::JournalCursor>,
+    auxiliary_marking_enabled: bool,
+) {
     let (tx, rx) = crossbeam::channel::bounded(16_384);
-    let watcher = scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx);
+    let watcher = scry_fsevents::WindowsBackend::spawn_watcher_from(&volume, cursor, tx);
     // The daemon owns watchers for its whole process lifetime.
     let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
     std::thread::spawn(move || {
@@ -290,7 +304,76 @@ fn configure_background_thread_qos() {
     }
 }
 
-fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<IndexView>> {
+fn build_or_resume_view(
+    volume: &str,
+    auxiliary_marking_enabled: bool,
+) -> anyhow::Result<StartupView> {
+    match resume_view(volume, auxiliary_marking_enabled) {
+        Ok(Some(view)) => {
+            eprintln!(
+                "scryd: resumed {volume} from journal at {}",
+                view.cursor.unwrap().next_usn
+            );
+            Ok(view)
+        }
+        Ok(None) => build_view(volume, auxiliary_marking_enabled),
+        Err(error) => {
+            eprintln!("scryd: full reindex for {volume}: {error}");
+            build_view(volume, auxiliary_marking_enabled)
+        }
+    }
+}
+
+fn resume_view(
+    volume: &str,
+    auxiliary_marking_enabled: bool,
+) -> anyhow::Result<Option<StartupView>> {
+    let path = snapshot_path(volume);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let base = Arc::new(ArenaStore::open(&path)?);
+    let archived = base.archived();
+    if archived.journal_id == 0 || archived.volume_serial == 0 {
+        return Ok(None);
+    }
+    let stored = scry_fsevents::JournalCursor {
+        journal_id: archived.journal_id,
+        first_usn: 0,
+        next_usn: archived.next_usn,
+        volume_serial: archived.volume_serial,
+    };
+    let (cursor, events) = scry_fsevents::WindowsBackend::replay_journal(volume, stored)
+        .map_err(|error| anyhow::anyhow!("cannot replay snapshot: {error}"))?;
+    if events.len().saturating_mul(20) > archived.len() {
+        return Err(anyhow::anyhow!("replay exceeds the compaction threshold"));
+    }
+
+    let mut filter = SelfWriteFilter::new(volume, auxiliary_marking_enabled);
+    let mut delta = scry_core::delta::Delta::new(archived.len());
+    for change in &events {
+        if !is_real_change(change, &mut filter) {
+            continue;
+        }
+        let Some(event) = delta_event(change) else {
+            continue;
+        };
+        if delta.apply(&event, &base) == ApplyOutcome::NeedsFullReindex {
+            return Err(anyhow::anyhow!("replay cannot be applied to this snapshot"));
+        }
+    }
+    Ok(Some(StartupView {
+        view: Arc::new(IndexView {
+            base: base.clone(),
+            path_index: Arc::new(scry_core::pathindex::PathIndex::build(archived, &delta)),
+            delta: Arc::new(delta),
+            generation: scry_core::view::fresh_generation(),
+        }),
+        cursor: Some(cursor),
+    }))
+}
+
+fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<StartupView> {
     let cursor = scry_fsevents::WindowsBackend::journal_cursor(volume).ok();
     let (mut arena, mut frns) = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
         .map_err(|e| anyhow::anyhow!("indexing {volume} failed: {e}"))?;
@@ -310,7 +393,10 @@ fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<A
     };
     scry_core::store::save_with_sidecar(&arena, &mut frns, &path, mark, mark)?;
     let base = Arc::new(ArenaStore::open(&path)?);
-    Ok(Arc::new(IndexView::new(base)))
+    Ok(StartupView {
+        view: Arc::new(IndexView::new(base)),
+        cursor,
+    })
 }
 
 fn compact_view(
@@ -533,8 +619,8 @@ fn reindex_on_changes(
 
         match build_view(&volume, auxiliary_marking_enabled) {
             Ok(new_view) => {
-                let len = new_view.len();
-                store.store(new_view);
+                let len = new_view.view.len();
+                store.store(new_view.view);
                 trim_working_set();
                 eprintln!("scryd: reindexed {volume} ({len} entries)");
             }
@@ -700,6 +786,7 @@ mod tests {
         let indexes = Arc::new(vec![VolumeIndex {
             volume: "C:".to_string(),
             store: Arc::new(arc_swap::ArcSwap::from(view)),
+            cursor: None,
         }]);
         let pipe_name = format!(
             r"\\.\pipe\scry-test-{}-{}",
