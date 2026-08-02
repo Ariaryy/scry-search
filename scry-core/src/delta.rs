@@ -139,6 +139,15 @@ impl Delta {
                 parent_frn,
                 name,
             } => {
+                if let (Some(&index), Some(parent)) = (
+                    self.added_frns.get(frn),
+                    self.resolve_parent(*parent_frn, base),
+                ) {
+                    let record = &self.added[index as usize];
+                    if record.live && record.parent == parent && record.name == *name {
+                        return ApplyOutcome::Applied;
+                    }
+                }
                 let Some((is_dir, mtime_secs, size_bytes)) = self.metadata(*frn, base) else {
                     return ApplyOutcome::NeedsFullReindex;
                 };
@@ -175,6 +184,18 @@ impl Delta {
         metadata: (bool, u32, u64),
         base: &ArenaStore,
     ) -> ApplyOutcome {
+        if self
+            .added_frns
+            .get(&frn)
+            .is_some_and(|&index| self.added[index as usize].live)
+        {
+            return ApplyOutcome::Applied;
+        }
+        if let Some(index) = base.frn_map.as_ref().and_then(|map| map.lookup(frn)) {
+            if !self.tombstones.get(index) {
+                return ApplyOutcome::Applied;
+            }
+        }
         let Some(parent) = self.resolve_parent(parent_frn, base) else {
             return ApplyOutcome::NeedsFullReindex;
         };
@@ -391,6 +412,35 @@ mod tests {
         delta.apply(&DeltaEvent::Deleted { frn: 10 }, &base);
         let old_index = base.frn_map.as_ref().unwrap().lookup(10).unwrap();
         assert!(delta.tombstones.get(old_index));
+    }
+
+    #[test]
+    fn replaying_events_is_idempotent() {
+        let (_dir, base) = base_store();
+        let events = [
+            DeltaEvent::Created {
+                frn: 20,
+                parent_frn: 5,
+                name: "new.txt".into(),
+                is_dir: false,
+                mtime_secs: 1,
+            },
+            DeltaEvent::Renamed {
+                frn: 20,
+                parent_frn: 5,
+                name: "renamed.txt".into(),
+            },
+            DeltaEvent::Deleted { frn: 10 },
+        ];
+        let mut delta = Delta::new(base.archived().len());
+        for event in &events {
+            assert_eq!(delta.apply(event, &base), ApplyOutcome::Applied);
+        }
+        let once = delta.encode_query_overlay();
+        for event in &events {
+            assert_eq!(delta.apply(event, &base), ApplyOutcome::Applied);
+        }
+        assert_eq!(delta.encode_query_overlay(), once);
     }
 
     #[test]
