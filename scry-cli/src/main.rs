@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut client = Client::connect().map_err(|e| anyhow::anyhow!("{e}\nis scryd running?"))?;
 
-    let kind = explicit_kind.unwrap_or(QueryKind::PathTerms);
+    let kind = infer_query_kind(explicit_kind, &query);
 
     let results = if shared {
         if verbose {
@@ -52,4 +52,42 @@ fn main() -> anyhow::Result<()> {
         println!("{}{marker}\t{}", entry.path, entry.size);
     }
     Ok(())
+}
+
+fn infer_query_kind(explicit_kind: Option<QueryKind>, query: &str) -> QueryKind {
+    explicit_kind.unwrap_or_else(|| {
+        if query.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
+            QueryKind::Wildcard
+        } else {
+            QueryKind::PathTerms
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_wildcard_from_glob_metacharacters() {
+        assert_eq!(infer_query_kind(None, "*.pdf"), QueryKind::Wildcard);
+        assert_eq!(infer_query_kind(None, "report.*"), QueryKind::Wildcard);
+        assert_eq!(infer_query_kind(None, "report?.pdf"), QueryKind::Wildcard);
+    }
+
+    #[test]
+    fn defaults_plain_queries_to_path_terms() {
+        assert_eq!(
+            infer_query_kind(None, "project notes"),
+            QueryKind::PathTerms
+        );
+    }
+
+    #[test]
+    fn explicit_kind_takes_precedence() {
+        assert_eq!(
+            infer_query_kind(Some(QueryKind::Prefix), "*.pdf"),
+            QueryKind::Prefix
+        );
+    }
 }
