@@ -291,8 +291,14 @@ fn configure_background_thread_qos() {
 }
 
 fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<Arc<IndexView>> {
-    let (arena, mut frns) = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
+    let cursor = scry_fsevents::WindowsBackend::journal_cursor(volume).ok();
+    let (mut arena, mut frns) = scry_fsevents::WindowsBackend::bulk_index_volume(volume)
         .map_err(|e| anyhow::anyhow!("indexing {volume} failed: {e}"))?;
+    if let Some(cursor) = cursor {
+        arena.journal_id = cursor.journal_id;
+        arena.next_usn = cursor.next_usn;
+        arena.volume_serial = cursor.volume_serial;
+    }
     let path = snapshot_path(volume);
     let volume = volume.to_string();
     let mark = |f: &std::fs::File| {
@@ -313,7 +319,11 @@ fn compact_view(
     auxiliary_marking_enabled: bool,
 ) -> anyhow::Result<Arc<IndexView>> {
     let _background = BackgroundModeGuard::enter();
-    let (arena, mut frns) = view.compact();
+    let (mut arena, mut frns) = view.compact();
+    let archived = view.base.archived();
+    arena.journal_id = archived.journal_id;
+    arena.next_usn = archived.next_usn;
+    arena.volume_serial = archived.volume_serial;
     let path = snapshot_path(volume);
     let volume = volume.to_string();
     let mark = |file: &std::fs::File| {

@@ -25,6 +25,17 @@ pub enum WindowsBackendError {
     QueryJournal { code: u32 },
     #[error("DeviceIoControl(FSCTL_READ_USN_JOURNAL) failed: win32 error {code}")]
     ReadJournal { code: u32 },
+    #[error("GetVolumeInformationW failed: win32 error {code}")]
+    VolumeInformation { code: u32 },
+}
+
+/// Identity and replay position for an NTFS USN journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalCursor {
+    pub journal_id: u64,
+    pub first_usn: i64,
+    pub next_usn: i64,
+    pub volume_serial: u64,
 }
 
 /// A change observed on the volume's USN journal, coarsened down to what the
@@ -76,6 +87,10 @@ impl ChangeEvent {
 pub struct WindowsBackend;
 
 impl WindowsBackend {
+    /// Captures the active journal identity before an index enumeration.
+    pub fn journal_cursor(volume: &str) -> Result<JournalCursor, WindowsBackendError> {
+        journal_cursor(volume)
+    }
     /// Enumerates accessible fixed NTFS drive roots. Failed probes are omitted;
     /// callers can continue indexing the remaining volumes.
     pub fn fixed_ntfs_volumes() -> Vec<String> {
@@ -568,6 +583,40 @@ fn query_journal(handle: ffi::Handle) -> Result<ffi::UsnJournalDataV0, WindowsBa
     result
         .map(|_| out)
         .map_err(|code| WindowsBackendError::QueryJournal { code })
+}
+
+fn journal_cursor(volume: &str) -> Result<JournalCursor, WindowsBackendError> {
+    let handle = open_volume(volume, 0)?;
+    let journal = query_journal(handle);
+    unsafe { ffi::CloseHandle(handle) };
+    let journal = journal?;
+
+    let root = format!("{volume}\\");
+    let wide = to_wide(&root);
+    let mut serial = 0u32;
+    let ok = unsafe {
+        ffi::GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(WindowsBackendError::VolumeInformation {
+            code: unsafe { ffi::GetLastError() },
+        });
+    }
+    Ok(JournalCursor {
+        journal_id: journal.usn_journal_id,
+        first_usn: journal.first_usn,
+        next_usn: journal.next_usn,
+        volume_serial: serial.into(),
+    })
 }
 
 /// Blocks the calling thread, translating USN journal change records into

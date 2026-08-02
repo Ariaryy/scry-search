@@ -30,6 +30,12 @@ pub struct Arena {
     /// FORMAT_VERSION constant, stamped here so `ArenaStore::open` can reject
     /// stale snapshots before any other field is read.
     pub format_version: u32,
+    /// USN journal identity captured before this snapshot's enumeration.
+    pub journal_id: u64,
+    /// First journal position not necessarily reflected by this snapshot.
+    pub next_usn: i64,
+    /// Serial number of the volume that produced this snapshot.
+    pub volume_serial: u64,
     /// Front-coded name blob. Names are stored in name-sorted order (matching
     /// `parents`). Decode via `bucket_offsets` + the LEB128 encoding below.
     pub names: Vec<u8>,
@@ -612,6 +618,9 @@ pub struct ArenaBuilder {
     dirs: Vec<bool>,
     sizes: Vec<u64>,
     frns: Vec<Option<u64>>,
+    journal_id: u64,
+    next_usn: i64,
+    volume_serial: u64,
 }
 
 impl ArenaBuilder {
@@ -627,6 +636,9 @@ impl ArenaBuilder {
             dirs: Vec::with_capacity(entries),
             sizes: Vec::with_capacity(entries),
             frns: Vec::with_capacity(entries),
+            journal_id: 0,
+            next_usn: 0,
+            volume_serial: 0,
         }
     }
 
@@ -685,6 +697,13 @@ impl ArenaBuilder {
 
     pub fn set_parent(&mut self, idx: u32, parent: u32) {
         self.parents[idx as usize] = parent;
+    }
+
+    /// Stamps the journal cursor captured before enumeration.
+    pub fn set_snapshot_cursor(&mut self, journal_id: u64, next_usn: i64, volume_serial: u64) {
+        self.journal_id = journal_id;
+        self.next_usn = next_usn;
+        self.volume_serial = volume_serial;
     }
 
     pub fn len(&self) -> usize {
@@ -785,6 +804,9 @@ impl ArenaBuilder {
         (
             Arena {
                 format_version: crate::record::FORMAT_VERSION,
+                journal_id: self.journal_id,
+                next_usn: self.next_usn,
+                volume_serial: self.volume_serial,
                 names,
                 bucket_offsets,
                 parents: out_parents,
@@ -930,6 +952,21 @@ mod tests {
         let archived = store.archived();
         let file = archived.prefix_range("report.pdf").start;
         assert_eq!(archived.full_path(file, '\\'), "C:\\report.pdf");
+    }
+
+    #[test]
+    fn snapshot_cursor_survives_archive_round_trip() {
+        let mut builder = ArenaBuilder::default();
+        builder.set_snapshot_cursor(7, 11, 13);
+        builder.push("C:", 0, true);
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.rkyv");
+        save(&arena, &path).unwrap();
+        let archived = crate::store::ArenaStore::open(&path).unwrap();
+        assert_eq!(archived.archived().journal_id, 7);
+        assert_eq!(archived.archived().next_usn, 11);
+        assert_eq!(archived.archived().volume_serial, 13);
     }
 
     /// Ignored release benchmark for `full_path` cache-locality.
@@ -1125,6 +1162,9 @@ mod tests {
         };
         let arena = Arena {
             format_version: crate::record::FORMAT_VERSION,
+            journal_id: 0,
+            next_usn: 0,
+            volume_serial: 0,
             names,
             bucket_offsets,
             parents: vec![
