@@ -1,8 +1,10 @@
 use crate::ffi;
 use std::ffi::c_void;
+use std::fs::File;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 
-/// Anonymous pagefile-backed section sealed to read-only handouts after creation.
+/// Read-only-shareable section backed by either the pagefile or an immutable file.
 pub struct Section {
     handle: ffi::Handle,
     len: usize,
@@ -58,6 +60,32 @@ impl Section {
             handle,
             len: bytes.len(),
         })
+    }
+
+    pub fn from_file(file: &File) -> io::Result<Self> {
+        let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "section file is too large")
+        })?;
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty section file",
+            ));
+        }
+        let handle = unsafe {
+            ffi::CreateFileMappingW(
+                file.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                ffi::PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle, len })
     }
 
     pub fn len(&self) -> usize {
@@ -154,6 +182,19 @@ mod tests {
             view.as_bytes().as_ptr() as usize % std::mem::align_of::<u64>(),
             0
         );
+    }
+
+    #[test]
+    fn file_backed_section_roundtrip_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("section.bin");
+        let bytes: Vec<u8> = (0..1_048_576).map(|i| (i % 239) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(path).unwrap();
+        let section = Section::from_file(&file).unwrap();
+        let handle = section.duplicate_for(std::process::id()).unwrap();
+        let view = SectionView::map(handle, section.len()).unwrap();
+        assert_eq!(view.as_bytes(), bytes);
     }
 
     fn handle_count() -> u32 {

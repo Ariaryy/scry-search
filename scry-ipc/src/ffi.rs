@@ -22,6 +22,7 @@ pub const PIPE_UNLIMITED_INSTANCES: Dword = 255;
 pub const ERROR_PIPE_CONNECTED: Dword = 535;
 pub const ERROR_PIPE_BUSY: Dword = 231;
 pub const PAGE_READWRITE: Dword = 0x04;
+pub const PAGE_READONLY: Dword = 0x02;
 pub const FILE_MAP_READ: Dword = 0x0004;
 pub const FILE_MAP_WRITE: Dword = 0x0002;
 pub const SECTION_QUERY: Dword = 0x0001;

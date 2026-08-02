@@ -71,6 +71,7 @@ where
 /// keeps `open()` from faulting the whole file into RSS — which the pre-v2
 /// layout did, despite this comment previously claiming otherwise.
 pub struct ArenaStore {
+    file: File,
     mmap: Mmap,
     pub frn_map: Option<FrnMap>,
 }
@@ -101,7 +102,11 @@ impl ArenaStore {
                 None
             }
         };
-        Ok(Self { mmap, frn_map })
+        Ok(Self {
+            file,
+            mmap,
+            frn_map,
+        })
     }
 
     #[inline]
@@ -112,6 +117,10 @@ impl ArenaStore {
 
     pub fn archive_bytes(&self) -> &[u8] {
         &self.mmap
+    }
+
+    pub fn snapshot_file(&self) -> &File {
+        &self.file
     }
 }
 

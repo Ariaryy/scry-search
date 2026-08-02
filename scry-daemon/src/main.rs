@@ -516,7 +516,7 @@ fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
             return Ok(section.clone());
         }
     }
-    let section = Arc::new(scry_ipc::Section::create(view.base.archive_bytes())?);
+    let section = Arc::new(scry_ipc::Section::from_file(view.base.snapshot_file())?);
     *cache = Some((key, section.clone()));
     Ok(section)
 }
