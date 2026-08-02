@@ -637,6 +637,8 @@ struct PathSearchScratch {
     touched_dirs: Vec<u32>,
     closure: PathClosureScratch,
     parent_cache: ParentRankCache,
+    relevant_parents: Vec<u8>,
+    touched_parent_bytes: Vec<u32>,
     candidate_blocks: Vec<u32>,
     term_blocks: Vec<u32>,
     candidate_bitmap: Vec<u8>,
@@ -662,6 +664,11 @@ impl PathSearchScratch {
         self.heap.clear();
         self.name.clear();
         self.parent_cache.clear();
+        for byte in self.touched_parent_bytes.drain(..) {
+            if let Some(bits) = self.relevant_parents.get_mut(byte as usize) {
+                *bits = 0;
+            }
+        }
         let target = limit.min(4096);
         if self.heap.capacity() < target {
             self.heap.reserve(target);
@@ -674,6 +681,24 @@ impl PathSearchScratch {
             self.touched_dirs.push(directory);
         }
         *mask |= bits;
+    }
+
+    fn prepare_parent_filter(&mut self, records: usize) {
+        self.relevant_parents.resize(records.div_ceil(8), 0);
+        self.relevant_parents.truncate(records.div_ceil(8));
+    }
+
+    fn mark_relevant_parent(&mut self, record: u32) {
+        let byte = record as usize / 8;
+        let bit = 1 << (record % 8);
+        if self.relevant_parents[byte] == 0 {
+            self.touched_parent_bytes.push(byte as u32);
+        }
+        self.relevant_parents[byte] |= bit;
+    }
+
+    fn parent_is_relevant(&self, record: u32) -> bool {
+        self.relevant_parents[record as usize / 8] & (1 << (record % 8)) != 0
     }
 }
 
@@ -957,6 +982,15 @@ fn search_path_terms_with_scratch(
         &mut scratch.touched_dirs,
         &mut scratch.closure,
     );
+    let filter_parents = scratch.touched_dirs.len() < path_index.directory_count().div_ceil(4);
+    if filter_parents {
+        scratch.prepare_parent_filter(path_index.records());
+        for touched in 0..scratch.touched_dirs.len() {
+            if let Some(record) = path_index.dir_record(scratch.touched_dirs[touched]) {
+                scratch.mark_relevant_parent(record);
+            }
+        }
+    }
 
     let full_mask = if terms.len() == 16 {
         u16::MAX
@@ -990,6 +1024,7 @@ fn search_path_terms_with_scratch(
             .map_or(0, |hit| hit.1);
         let inherited = path_index
             .parent_record(arena, delta, record)
+            .filter(|&parent| !filter_parents || scratch.parent_is_relevant(parent))
             .and_then(|parent| scratch.parent_cache.dir_ord(path_index, parent))
             .map_or(0, |directory| scratch.dir_mask[directory as usize]);
         if own | inherited == full_mask {

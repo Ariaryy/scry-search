@@ -142,6 +142,12 @@ impl PathIndex {
         })
     }
 
+    pub fn dir_record(&self, directory: u32) -> Option<u32> {
+        RankSelect::new(&self.dir_bits, &self.dir_superblocks)
+            .select1(directory as usize)
+            .map(|record| record as u32)
+    }
+
     pub fn parent_dir_ord(&self, arena: &ArchivedArena, delta: &Delta, record: u32) -> Option<u32> {
         combined_parent(arena, delta, record).and_then(|parent| self.dir_ord(parent))
     }
@@ -267,6 +273,8 @@ mod tests {
         assert_eq!(index.dir_ord(0), Some(0));
         assert_eq!(index.dir_ord(1), None);
         assert_eq!(index.dir_ord(2), Some(1));
+        assert_eq!(index.dir_record(0), Some(0));
+        assert_eq!(index.dir_record(1), Some(2));
     }
 
     #[test]
