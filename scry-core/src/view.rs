@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cell::RefCell, cmp::Ordering, collections::BinaryHeap};
 
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -281,6 +281,173 @@ mod tests {
         assert_eq!(results.len(), 10);
         assert!(crate::arena::full_path_calls() <= 10);
     }
+
+    #[test]
+    fn path_term_block_union_matches_a_forced_full_scan() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("000_root", 0, true);
+        let ancestor = builder.push("aaa_ancestorqzxv", 0, true);
+        builder.set_parent(ancestor, root);
+        for index in 0..2_300 {
+            let filler = builder.push(&format!("mmm_component_{index:04}.dll"), 0, false);
+            builder.set_parent(filler, root);
+        }
+        let leaf = builder.push("zzz_leafwkyp.dll", 0, false);
+        builder.set_parent(leaf, ancestor);
+
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block-union.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let view = IndexView::new(base);
+        let terms = vec!["ancestorqzxv".to_owned(), "leafwkyp".to_owned()];
+
+        let filtered = search_path_terms_with_scratch(
+            view.base.archived(),
+            &view.delta,
+            &view.path_index,
+            &terms,
+            usize::MAX,
+            &mut PathSearchScratch::default(),
+            true,
+        );
+        let full = search_path_terms_with_scratch(
+            view.base.archived(),
+            &view.delta,
+            &view.path_index,
+            &terms,
+            usize::MAX,
+            &mut PathSearchScratch::default(),
+            false,
+        );
+
+        assert_eq!(filtered, full);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0]
+            .path
+            .ends_with("aaa_ancestorqzxv\\zzz_leafwkyp.dll"));
+    }
+
+    #[test]
+    fn path_term_scratch_clears_masks_across_different_indexes() {
+        let (_large_dir, large) = base_view(2_000);
+        let (_small_dir, small) = nested_view();
+        let mut scratch = PathSearchScratch::default();
+
+        let absent = search_path_terms_with_scratch(
+            large.base.archived(),
+            &large.delta,
+            &large.path_index,
+            &["match".to_owned()],
+            10,
+            &mut scratch,
+            true,
+        );
+        assert_eq!(absent.len(), 10);
+
+        let results = search_path_terms_with_scratch(
+            small.base.archived(),
+            &small.delta,
+            &small.path_index,
+            &["definitely_absent_qzxv".to_owned()],
+            10,
+            &mut scratch,
+            true,
+        );
+        assert!(results.is_empty());
+        assert!(scratch
+            .touched_dirs
+            .iter()
+            .all(|&directory| directory < small.path_index.directory_count() as u32));
+    }
+
+    #[test]
+    #[ignore = "million-record release benchmark"]
+    fn benchmark_path_term_candidate_blocks() {
+        const GROUPS: usize = 128;
+        const FILES_PER_GROUP: usize = 8_192;
+        const SAMPLES: usize = 9;
+
+        let mut builder = crate::ArenaBuilder::with_capacity(
+            GROUPS * FILES_PER_GROUP + GROUPS + 1,
+            32 * GROUPS * FILES_PER_GROUP,
+        );
+        let root = builder.push("root", 0, true);
+        for group in 0..GROUPS {
+            let directory = builder.push(&format!("component_{group:03}_qzxv"), 0, true);
+            builder.set_parent(directory, root);
+            for file in 0..FILES_PER_GROUP {
+                let record =
+                    builder.push(&format!("module_{group:03}_{file:06}_wkyp.dll"), 0, false);
+                builder.set_parent(record, directory);
+            }
+        }
+
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("path-term-benchmark.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let view = IndexView::new(base);
+        let terms = vec![
+            "component_073_qzxv".to_owned(),
+            "073_000042_wkyp".to_owned(),
+        ];
+
+        let mut selected = Vec::new();
+        for term in &terms {
+            selected.extend(
+                view.base
+                    .archived()
+                    .candidate_blocks(term.as_bytes())
+                    .unwrap(),
+            );
+        }
+        selected.sort_unstable();
+        selected.dedup();
+        let total_blocks = view
+            .base
+            .archived()
+            .len()
+            .div_ceil(crate::trigram::TRIGRAM_BLOCK);
+
+        let run = |filtered, scratch: &mut PathSearchScratch| {
+            let start = std::time::Instant::now();
+            let results = search_path_terms_with_scratch(
+                view.base.archived(),
+                &view.delta,
+                &view.path_index,
+                &terms,
+                50,
+                scratch,
+                filtered,
+            );
+            (start.elapsed(), results)
+        };
+        let (_, expected) = run(false, &mut PathSearchScratch::default());
+        let (_, actual) = run(true, &mut PathSearchScratch::default());
+        assert_eq!(actual, expected);
+
+        let mut filtered_times = Vec::with_capacity(SAMPLES);
+        let mut full_times = Vec::with_capacity(SAMPLES);
+        let mut filtered_scratch = PathSearchScratch::default();
+        let mut full_scratch = PathSearchScratch::default();
+        for _ in 0..SAMPLES {
+            filtered_times.push(run(true, &mut filtered_scratch).0);
+            full_times.push(run(false, &mut full_scratch).0);
+        }
+        filtered_times.sort_unstable();
+        full_times.sort_unstable();
+        let median = SAMPLES / 2;
+        eprintln!(
+            "path terms: filtered={:?}, full={:?}, blocks={}/{total_blocks} ({:.2}%)",
+            filtered_times[median],
+            full_times[median],
+            selected.len(),
+            selected.len() as f64 * 100.0 / total_blocks as f64,
+        );
+    }
 }
 
 impl IndexView {
@@ -463,6 +630,55 @@ struct RankedHit {
     record: u32,
 }
 
+#[derive(Default)]
+struct PathSearchScratch {
+    hits: Vec<(u32, u16)>,
+    dir_mask: Vec<u16>,
+    touched_dirs: Vec<u32>,
+    candidate_blocks: Vec<u32>,
+    term_blocks: Vec<u32>,
+    candidate_bitmap: Vec<u8>,
+    trigram_hashes: Vec<usize>,
+    heap: BinaryHeap<RankedHit>,
+    name: Vec<u8>,
+}
+
+impl PathSearchScratch {
+    fn reset(&mut self, directories: usize, limit: usize) {
+        for directory in self.touched_dirs.drain(..) {
+            if let Some(mask) = self.dir_mask.get_mut(directory as usize) {
+                *mask = 0;
+            }
+        }
+        self.dir_mask.resize(directories, 0);
+        self.dir_mask.truncate(directories);
+        self.hits.clear();
+        self.candidate_blocks.clear();
+        self.term_blocks.clear();
+        self.candidate_bitmap.clear();
+        self.trigram_hashes.clear();
+        self.heap.clear();
+        self.name.clear();
+        let target = limit.min(4096);
+        if self.heap.capacity() < target {
+            self.heap.reserve(target);
+        }
+    }
+
+    fn merge_directory_mask(&mut self, directory: u32, bits: u16) {
+        let mask = &mut self.dir_mask[directory as usize];
+        if *mask == 0 {
+            self.touched_dirs.push(directory);
+        }
+        *mask |= bits;
+    }
+}
+
+thread_local! {
+    static PATH_SEARCH_SCRATCH: RefCell<PathSearchScratch> =
+        RefCell::new(PathSearchScratch::default());
+}
+
 impl Ord for RankedHit {
     fn cmp(&self, other: &Self) -> Ordering {
         (self.quality, self.name_len, self.record).cmp(&(
@@ -602,9 +818,32 @@ pub fn search_path_terms(
     terms: &[String],
     limit: usize,
 ) -> Vec<ResultEntry> {
+    PATH_SEARCH_SCRATCH.with(|scratch| {
+        search_path_terms_with_scratch(
+            arena,
+            delta,
+            path_index,
+            terms,
+            limit,
+            &mut scratch.borrow_mut(),
+            true,
+        )
+    })
+}
+
+fn search_path_terms_with_scratch(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    path_index: &PathIndex,
+    terms: &[String],
+    limit: usize,
+    scratch: &mut PathSearchScratch,
+    use_filter: bool,
+) -> Vec<ResultEntry> {
     if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS || limit == 0 {
         return Vec::new();
     }
+    scratch.reset(path_index.directory_count(), limit);
     let automaton = match aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
         .build(terms)
@@ -620,20 +859,58 @@ pub fn search_path_terms(
             })
     };
 
-    let mut hits = Vec::<(u32, u16)>::new();
-    let mut dir_mask = vec![0u16; path_index.directory_count()];
-    arena.for_each_name(|record, name| {
-        if !delta.tombstones.get(record) {
-            let mask = mask_for(name);
-            if mask != 0 {
-                hits.push((record, mask));
-                if let Some(directory) = path_index.dir_ord(record) {
-                    dir_mask[directory as usize] |= mask;
+    let mut filtered = use_filter;
+    if filtered {
+        for term in terms {
+            if !arena.candidate_blocks_into(
+                term.as_bytes(),
+                &mut scratch.term_blocks,
+                &mut scratch.candidate_bitmap,
+                &mut scratch.trigram_hashes,
+            ) {
+                filtered = false;
+                scratch.candidate_blocks.clear();
+                break;
+            }
+            scratch
+                .candidate_blocks
+                .extend_from_slice(&scratch.term_blocks);
+        }
+    }
+    if filtered {
+        scratch.candidate_blocks.sort_unstable();
+        scratch.candidate_blocks.dedup();
+        for block_index in 0..scratch.candidate_blocks.len() {
+            let block = scratch.candidate_blocks[block_index];
+            let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
+            let end = start.saturating_add(crate::trigram::TRIGRAM_BLOCK as u32);
+            arena.for_each_name_in(start..end, |record, name| {
+                if !delta.tombstones.get(record) {
+                    let mask = mask_for(name);
+                    if mask != 0 {
+                        scratch.hits.push((record, mask));
+                        if let Some(directory) = path_index.dir_ord(record) {
+                            scratch.merge_directory_mask(directory, mask);
+                        }
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+        }
+    } else {
+        arena.for_each_name(|record, name| {
+            if !delta.tombstones.get(record) {
+                let mask = mask_for(name);
+                if mask != 0 {
+                    scratch.hits.push((record, mask));
+                    if let Some(directory) = path_index.dir_ord(record) {
+                        scratch.merge_directory_mask(directory, mask);
+                    }
                 }
             }
-        }
-        std::ops::ControlFlow::Continue(())
-    });
+            std::ops::ControlFlow::Continue(())
+        });
+    }
     for (index, record) in delta.added.iter().enumerate() {
         if !record.live {
             continue;
@@ -641,22 +918,20 @@ pub fn search_path_terms(
         let combined = arena.len() as u32 + index as u32;
         let mask = mask_for(record.name.as_bytes());
         if mask != 0 {
-            hits.push((combined, mask));
+            scratch.hits.push((combined, mask));
             if let Some(directory) = path_index.dir_ord(combined) {
-                dir_mask[directory as usize] |= mask;
+                scratch.merge_directory_mask(directory, mask);
             }
         }
     }
-    path_index.closure(&mut dir_mask);
+    path_index.closure_sparse(&mut scratch.dir_mask, &mut scratch.touched_dirs);
 
     let full_mask = if terms.len() == 16 {
         u16::MAX
     } else {
         (1u16 << terms.len()) - 1
     };
-    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut hit_position = 0usize;
-    let mut name = Vec::new();
     for record in 0..path_index.records() as u32 {
         let live = if record < arena.len() as u32 {
             !delta.tombstones.get(record)
@@ -669,26 +944,31 @@ pub fn search_path_terms(
         if !live {
             continue;
         }
-        while hits.get(hit_position).is_some_and(|hit| hit.0 < record) {
+        while scratch
+            .hits
+            .get(hit_position)
+            .is_some_and(|hit| hit.0 < record)
+        {
             hit_position += 1;
         }
-        let own = hits
+        let own = scratch
+            .hits
             .get(hit_position)
             .filter(|hit| hit.0 == record)
             .map_or(0, |hit| hit.1);
         let inherited = path_index
             .parent_dir_ord(arena, delta, record)
-            .map_or(0, |directory| dir_mask[directory as usize]);
+            .map_or(0, |directory| scratch.dir_mask[directory as usize]);
         if own | inherited == full_mask {
             let name_len = if record < arena.len() as u32 {
-                arena.name_into(record, &mut name);
-                name.len()
+                arena.name_into(record, &mut scratch.name);
+                scratch.name.len()
             } else {
                 let index = record - arena.len() as u32;
                 delta.added[index as usize].name.len()
             };
             retain_hit(
-                &mut heap,
+                &mut scratch.heap,
                 RankedHit {
                     quality: (terms.len() as u32 - own.count_ones()) as u8,
                     name_len: name_len as u32,
@@ -698,10 +978,12 @@ pub fn search_path_terms(
             );
         }
     }
-    heap.into_sorted_vec()
-        .into_iter()
-        .map(|hit| materialize(arena, delta, hit.record))
-        .collect()
+    let mut results = Vec::with_capacity(scratch.heap.len());
+    while let Some(hit) = scratch.heap.pop() {
+        results.push(materialize(arena, delta, hit.record));
+    }
+    results.reverse();
+    results
 }
 
 fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {

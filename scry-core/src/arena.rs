@@ -325,28 +325,45 @@ impl ArchivedArena {
 
     /// Return blocks that can contain every trigram in `needle_lower`.
     pub fn candidate_blocks(&self, needle_lower: &[u8]) -> Option<Vec<u32>> {
+        let mut blocks = Vec::new();
+        let mut candidates = Vec::new();
+        let mut hashes = Vec::new();
+        self.candidate_blocks_into(needle_lower, &mut blocks, &mut candidates, &mut hashes)
+            .then_some(blocks)
+    }
+
+    pub(crate) fn candidate_blocks_into(
+        &self,
+        needle_lower: &[u8],
+        output: &mut Vec<u32>,
+        candidates: &mut Vec<u8>,
+        hashes: &mut Vec<usize>,
+    ) -> bool {
+        output.clear();
+        candidates.clear();
+        hashes.clear();
         if needle_lower.len() < 3 || self.trigram_index.is_empty() {
-            return None;
+            return false;
         }
+
         let blocks = num_blocks(self.parents.len());
         let bytes = row_bytes(blocks);
-        let mut hashes = Vec::new();
+        candidates.resize(bytes, u8::MAX);
         for_each_trigram(needle_lower, |hash| hashes.push(hash as usize));
         hashes.sort_unstable();
         hashes.dedup();
-        let mut candidates = vec![u8::MAX; bytes];
-        for hash in hashes {
+        for &hash in hashes.iter() {
             let row = &self.trigram_index.as_slice()[hash * bytes..(hash + 1) * bytes];
             for (candidate, &value) in candidates.iter_mut().zip(row) {
                 *candidate &= value;
             }
         }
-        Some(
+        output.extend(
             (0..blocks)
                 .filter(|&block| candidates[block / 8] & (1 << (block % 8)) != 0)
-                .map(|block| block as u32)
-                .collect(),
-        )
+                .map(|block| block as u32),
+        );
+        true
     }
 
     /// Evaluate an AND-of-OR required-literal proof directly over trigram rows.

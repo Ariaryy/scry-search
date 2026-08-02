@@ -104,6 +104,22 @@ impl PathIndex {
             }
         }
     }
+
+    pub fn closure_sparse(&self, mask: &mut [u16], touched: &mut Vec<u32>) {
+        assert_eq!(mask.len(), self.dir_parent.len());
+        for &directory in &self.dir_order {
+            let index = directory as usize;
+            let parent = self.dir_parent[index];
+            if parent == NO_DIR || parent == directory {
+                continue;
+            }
+            let old = mask[index];
+            mask[index] |= mask[parent as usize];
+            if old == 0 && mask[index] != 0 {
+                touched.push(directory);
+            }
+        }
+    }
 }
 
 fn bit(bits: &[u8], position: usize) -> bool {
@@ -175,5 +191,31 @@ mod tests {
         mask[0] = 1;
         index.closure(&mut mask);
         assert_eq!(mask.len(), 2);
+    }
+
+    #[test]
+    fn sparse_closure_tracks_every_nonzero_directory_for_clearing() {
+        let mut builder = Arena::builder();
+        let root = builder.push("root", 0, true);
+        let child = builder.push("child", 0, true);
+        let grandchild = builder.push("grandchild", 0, true);
+        builder.set_parent(child, root);
+        builder.set_parent(grandchild, child);
+        let arena = archived(&builder.build().0);
+        let delta = Delta::new(arena.len());
+        let index = PathIndex::build(arena, &delta);
+        let root = index.dir_ord(arena.prefix_range("root").start).unwrap();
+        let mut mask = vec![0u16; index.directory_count()];
+        let mut touched = vec![root];
+        mask[root as usize] = 1;
+
+        index.closure_sparse(&mut mask, &mut touched);
+        assert_eq!(mask, vec![1, 1, 1]);
+        assert_eq!(touched.len(), 3);
+
+        for directory in touched.drain(..) {
+            mask[directory as usize] = 0;
+        }
+        assert!(mask.iter().all(|&value| value == 0));
     }
 }
