@@ -349,6 +349,55 @@ impl ArchivedArena {
         )
     }
 
+    /// Evaluate an AND-of-OR required-literal proof directly over trigram rows.
+    pub(crate) fn candidate_blocks_for_clauses(
+        &self,
+        clauses: &[crate::literals::Clause],
+    ) -> Option<Vec<u32>> {
+        if clauses.is_empty() || self.trigram_index.is_empty() {
+            return None;
+        }
+        let blocks = num_blocks(self.parents.len());
+        let bytes = row_bytes(blocks);
+        let mut candidates = vec![u8::MAX; bytes];
+        let mut clause_bits = vec![0u8; bytes];
+        let mut literal_bits = vec![0u8; bytes];
+        let mut hashes = Vec::new();
+
+        for clause in clauses {
+            clause_bits.fill(0);
+            for literal in clause {
+                if literal.len() < 3 {
+                    return None;
+                }
+                literal_bits.fill(u8::MAX);
+                hashes.clear();
+                for_each_trigram(literal, |hash| hashes.push(hash as usize));
+                hashes.sort_unstable();
+                hashes.dedup();
+                for &hash in &hashes {
+                    let row = &self.trigram_index.as_slice()[hash * bytes..(hash + 1) * bytes];
+                    for (candidate, &value) in literal_bits.iter_mut().zip(row) {
+                        *candidate &= value;
+                    }
+                }
+                for (combined, &value) in clause_bits.iter_mut().zip(&literal_bits) {
+                    *combined |= value;
+                }
+            }
+            for (candidate, &value) in candidates.iter_mut().zip(&clause_bits) {
+                *candidate &= value;
+            }
+        }
+
+        Some(
+            (0..blocks)
+                .filter(|&block| candidates[block / 8] & (1 << (block % 8)) != 0)
+                .map(|block| block as u32)
+                .collect(),
+        )
+    }
+
     /// Walk the parent chain to reconstruct the full path. Path segments are
     /// decoded from the name blob and joined with `sep`.
     ///

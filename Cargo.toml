@@ -22,6 +22,7 @@ memmap2 = "0.9"
 thiserror = "1"
 anyhow = "1"
 regex-automata = "0.4"
+regex-syntax = "0.8"
 arc-swap = "1"
 memchr = "2"
 

@@ -40,8 +40,9 @@
 - **Substring search uses a trigram block filter** (16,384 rows × one bit per
   1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full
-  scan. Regex/wildcard queries are **not** filtered — that needs required-literal
-  extraction from the pattern and hasn't been done.
+  scan. Regex/wildcard queries use bounded must-contain HIR analysis and
+  evaluate AND-of-OR literal clauses directly over the same rows. Patterns
+  without a provable ASCII literal of at least 3 bytes still scan linearly.
 - **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
   saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
   it 0 because USN records do not carry size, so 0 means unknown rather than
