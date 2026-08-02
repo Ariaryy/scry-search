@@ -76,6 +76,48 @@ impl ChangeEvent {
 pub struct WindowsBackend;
 
 impl WindowsBackend {
+    /// Enumerates accessible fixed NTFS drive roots. Failed probes are omitted;
+    /// callers can continue indexing the remaining volumes.
+    pub fn fixed_ntfs_volumes() -> Vec<String> {
+        let drives = unsafe { ffi::GetLogicalDrives() };
+        let mut volumes = Vec::new();
+        for bit in 0..26 {
+            if drives & (1 << bit) == 0 {
+                continue;
+            }
+            let letter = char::from(b'A' + bit as u8);
+            let root = format!("{letter}:\\");
+            let wide = to_wide(&root);
+            if unsafe { ffi::GetDriveTypeW(wide.as_ptr()) } != ffi::DRIVE_FIXED {
+                continue;
+            }
+            let mut filesystem = [0u16; 32];
+            let ok = unsafe {
+                ffi::GetVolumeInformationW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    filesystem.as_mut_ptr(),
+                    filesystem.len() as u32,
+                )
+            };
+            if ok == 0 {
+                continue;
+            }
+            let length = filesystem
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(filesystem.len());
+            if String::from_utf16_lossy(&filesystem[..length]).eq_ignore_ascii_case("NTFS") {
+                volumes.push(format!("{letter}:"));
+            }
+        }
+        volumes
+    }
+
     /// Enables a named privilege (e.g. `SeManageVolumePrivilege`) on the
     /// current process token. See the free function of the same name for
     /// details.
@@ -755,6 +797,7 @@ mod ffi {
     pub const FILE_SHARE_WRITE: Dword = 0x0000_0002;
     pub const OPEN_EXISTING: Dword = 3;
     pub const ERROR_HANDLE_EOF: Dword = 38;
+    pub const DRIVE_FIXED: Dword = 3;
     pub const FILE_ATTRIBUTE_DIRECTORY: Dword = 0x10;
     /// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 44, METHOD_NEITHER, FILE_ANY_ACCESS)
     pub const FSCTL_ENUM_USN_DATA: Dword = 0x000900B3;
@@ -873,6 +916,18 @@ mod ffi {
 
     #[link(name = "kernel32")]
     extern "system" {
+        pub fn GetLogicalDrives() -> Dword;
+        pub fn GetDriveTypeW(root_path_name: *const u16) -> Dword;
+        pub fn GetVolumeInformationW(
+            root_path_name: *const u16,
+            volume_name_buffer: *mut u16,
+            volume_name_size: Dword,
+            volume_serial_number: *mut Dword,
+            maximum_component_length: *mut Dword,
+            file_system_flags: *mut Dword,
+            file_system_name_buffer: *mut u16,
+            file_system_name_size: Dword,
+        ) -> Bool;
         pub fn CreateFileW(
             lp_file_name: *const u16,
             dw_desired_access: Dword,

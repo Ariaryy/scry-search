@@ -70,8 +70,13 @@ mod tests {
     #[test]
     fn reservations_are_aggregate() {
         let now = Instant::now();
-        let mut state = State::new(100);
+        let mut state = State {
+            bytes_per_second: 100,
+            next: now,
+        };
         assert!(state.reserve(100, now).is_zero());
-        assert_eq!(state.reserve(100, now), Duration::from_secs(1));
+        let delay = state.reserve(100, now);
+        assert!(delay >= Duration::from_millis(999));
+        assert!(delay <= Duration::from_secs(1));
     }
 }

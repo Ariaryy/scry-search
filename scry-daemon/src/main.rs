@@ -34,7 +34,53 @@ use std::sync::Arc;
 /// swap happens underneath it.
 type SharedStore = Arc<arc_swap::ArcSwap<IndexView>>;
 
+struct VolumeIndex {
+    volume: String,
+    store: SharedStore,
+}
+
+type VolumeIndexes = Arc<Vec<VolumeIndex>>;
+
+struct StartupOptions {
+    volumes: Vec<String>,
+    index_mbps: Option<u64>,
+}
+
+fn startup_options() -> anyhow::Result<StartupOptions> {
+    let mut volumes = Vec::new();
+    let mut index_mbps = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--unbounded" => index_mbps = Some(0),
+            "--index-mbps" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--index-mbps requires a value"))?;
+                index_mbps =
+                    Some(value.parse().map_err(|_| {
+                        anyhow::anyhow!("--index-mbps expects a non-negative integer")
+                    })?);
+            }
+            _ if arg.starts_with("--index-mbps=") => {
+                let value = arg.trim_start_matches("--index-mbps=");
+                index_mbps =
+                    Some(value.parse().map_err(|_| {
+                        anyhow::anyhow!("--index-mbps expects a non-negative integer")
+                    })?);
+            }
+            _ if arg.starts_with('-') => return Err(anyhow::anyhow!("unknown option: {arg}")),
+            _ => volumes.push(arg),
+        }
+    }
+    Ok(StartupOptions {
+        volumes,
+        index_mbps,
+    })
+}
+
 fn main() -> anyhow::Result<()> {
+    let options = startup_options()?;
     // Return freed spans to the OS after 1s of idleness rather than mimalloc's
     // 10s default; this daemon is idle far more often than it is busy.
     if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
@@ -46,9 +92,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     configure_background_qos();
-    configure_index_read_cap();
+    configure_index_read_cap(options.index_mbps);
 
-    let volume = std::env::args().nth(1).unwrap_or_else(|| "C:".to_string());
+    let requested_volumes = options.volumes;
+    let volume_names = if requested_volumes.is_empty() {
+        scry_fsevents::WindowsBackend::fixed_ntfs_volumes()
+    } else {
+        requested_volumes
+    };
+    if volume_names.is_empty() {
+        return Err(anyhow::anyhow!("no fixed NTFS volumes available"));
+    }
 
     // Enables exact self-write identification via FSCTL_MARK_HANDLE. Requires
     // SeManageVolumePrivilege, which an elevated Administrators token holds
@@ -66,10 +120,35 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-    eprintln!("scryd: indexing {volume}...");
-    let initial = build_view(&volume, auxiliary_marking_enabled)?;
-    eprintln!("scryd: indexed {} entries", initial.len());
-    let store: SharedStore = Arc::new(initial.into());
+    let mut indexed = Vec::new();
+    for volume in volume_names {
+        eprintln!("scryd: indexing {volume}...");
+        let initial = match build_view(&volume, auxiliary_marking_enabled) {
+            Ok(view) => view,
+            Err(error) => {
+                eprintln!("scryd: skipping {volume}: {error}");
+                continue;
+            }
+        };
+        eprintln!("scryd: indexed {} entries on {volume}", initial.len());
+        indexed.push(VolumeIndex {
+            volume,
+            store: Arc::new(initial.into()),
+        });
+    }
+    if indexed.is_empty() {
+        return Err(anyhow::anyhow!("could not index any requested volume"));
+    }
+    let indexes: VolumeIndexes = Arc::new(indexed);
+    for index in indexes.iter().skip(1) {
+        spawn_volume_watcher(
+            index.volume.clone(),
+            index.store.clone(),
+            auxiliary_marking_enabled,
+        );
+    }
+    let store = indexes[0].store.clone();
+    let volume = indexes[0].volume.clone();
 
     {
         let store = store.clone();
@@ -90,9 +169,9 @@ fn main() -> anyhow::Result<()> {
     loop {
         match server.accept() {
             Ok(pipe) => {
-                let store = store.clone();
+                let indexes = indexes.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(pipe, &store) {
+                    if let Err(e) = handle_connection(pipe, &indexes) {
                         eprintln!("scryd: connection error: {e}");
                     }
                 });
@@ -115,18 +194,30 @@ fn main() -> anyhow::Result<()> {
 /// Both are best-effort. Failures are logged and ignored — an older Windows
 /// build simply doesn't support them, and that is not a reason to refuse to
 /// run.
-fn configure_index_read_cap() {
+fn spawn_volume_watcher(volume: String, store: SharedStore, auxiliary_marking_enabled: bool) {
+    let (tx, rx) = crossbeam::channel::bounded(16_384);
+    let watcher = scry_fsevents::WindowsBackend::spawn_watcher(&volume, tx);
+    // The daemon owns watchers for its whole process lifetime.
+    let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
+    std::thread::spawn(move || {
+        configure_background_thread_qos();
+        reindex_on_changes(volume, rx, store, auxiliary_marking_enabled, watcher)
+    });
+}
+
+fn configure_index_read_cap(cli_value: Option<u64>) {
     const MIB: u64 = 1024 * 1024;
-    let mebibytes_per_second = match std::env::var("SCRY_INDEX_MBPS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(value) => value,
-            Err(_) => {
-                eprintln!("scryd: ignoring invalid SCRY_INDEX_MBPS={value:?}; using 128");
-                128
-            }
-        },
-        Err(_) => 128,
-    };
+    let mebibytes_per_second =
+        cli_value.unwrap_or_else(|| match std::env::var("SCRY_INDEX_MBPS") {
+            Ok(value) => match value.parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("scryd: ignoring invalid SCRY_INDEX_MBPS={value:?}; using 128");
+                    128
+                }
+            },
+            Err(_) => 128,
+        });
     scry_fsevents::configure_index_read_cap(mebibytes_per_second.saturating_mul(MIB));
     eprintln!("scryd: index read cap {mebibytes_per_second} MiB/s");
 }
@@ -266,7 +357,7 @@ fn trim_working_set() {
 
 fn snapshot_path(volume: &str) -> std::path::PathBuf {
     let safe: String = volume.chars().filter(|c| c.is_alphanumeric()).collect();
-    std::env::temp_dir().join(format!("scry-index-{safe}.rkyv"))
+    std::path::PathBuf::from(format!("{volume}\\")).join(format!(".scry-index-{safe}.rkyv"))
 }
 
 /// Holds the state `is_real_change` needs to recognize the daemon's own
@@ -474,7 +565,7 @@ fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
     }
 }
 
-fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Result<()> {
+fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::Result<()> {
     loop {
         let req_bytes = match pipe.read_frame() {
             Ok(b) => b,
@@ -486,7 +577,11 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
 
         // `load_full` clones the Arc, keeping this index alive for the whole
         // query even if the reindex thread swaps in a new one mid-search.
-        let snapshot = store.load_full();
+        if req.kind == QueryKind::ShareIndex && indexes.len() != 1 {
+            pipe.write_frame(&encode_results(&[]))?;
+            continue;
+        }
+        let snapshot = indexes[0].store.load_full();
         if req.kind == QueryKind::ShareIndex {
             if req.pattern.parse::<u64>().ok() == Some(snapshot.generation) {
                 pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
@@ -516,10 +611,55 @@ fn handle_connection(pipe: scry_ipc::Pipe, store: &SharedStore) -> std::io::Resu
             }
             QueryKind::ShareIndex => unreachable!(),
         };
-        let entries: Vec<ResultEntry> = snapshot.search(&query, req.limit as usize);
+        let entries = search_indexes(indexes, &query, req.limit as usize);
 
         pipe.write_frame(&encode_results(&entries))?;
     }
+}
+
+fn search_indexes(indexes: &VolumeIndexes, query: &Query, limit: usize) -> Vec<ResultEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut entries: Vec<_> = indexes
+        .iter()
+        .flat_map(|index| index.store.load_full().search(query, limit))
+        .collect();
+    entries.sort_by(|left, right| {
+        result_rank(query, left)
+            .cmp(&result_rank(query, right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries.truncate(limit);
+    entries
+}
+
+fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
+    let name = entry.path.rsplit('\\').next().unwrap_or(&entry.path);
+    let quality = match query {
+        Query::Prefix(pattern) | Query::Substring(pattern) => {
+            if name.eq_ignore_ascii_case(pattern) {
+                0
+            } else if name
+                .get(..pattern.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(pattern))
+            {
+                1
+            } else {
+                2
+            }
+        }
+        Query::PathTerms(terms) => {
+            let matches_leaf = terms.iter().all(|term| {
+                name.as_bytes()
+                    .windows(term.len())
+                    .any(|part| part.eq_ignore_ascii_case(term.as_bytes()))
+            });
+            u8::from(!matches_leaf)
+        }
+        Query::Regex(_) => 2,
+    };
+    (quality, name.len())
 }
 
 fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
@@ -547,7 +687,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let view = build_store_with_n_records(200, &dir);
         let expected = view.search(&Query::Substring("file".into()), 50);
-        let store = Arc::new(arc_swap::ArcSwap::from(view));
+        let indexes = Arc::new(vec![VolumeIndex {
+            volume: "C:".to_string(),
+            store: Arc::new(arc_swap::ArcSwap::from(view)),
+        }]);
         let pipe_name = format!(
             r"\\.\pipe\scry-test-{}-{}",
             std::process::id(),
@@ -557,10 +700,10 @@ mod tests {
                 .as_nanos()
         );
         let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
-        let server_store = store.clone();
+        let server_indexes = indexes.clone();
         let thread = std::thread::spawn(move || {
             let pipe = server.accept().unwrap();
-            handle_connection(pipe, &server_store).unwrap();
+            handle_connection(pipe, &server_indexes).unwrap();
         });
         let mut client = (0..100)
             .find_map(|_| {

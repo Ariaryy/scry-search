@@ -440,6 +440,7 @@ impl ArchivedArena {
         let sep_str = sep.to_string();
         parts
             .iter()
+            .filter(|part| part.as_slice() != b".")
             .map(|b| String::from_utf8_lossy(b))
             .collect::<Vec<_>>()
             .join(&sep_str)
@@ -911,6 +912,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn full_path_starts_with_the_volume_root() {
+        let mut builder = ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        let marker = builder.push(".", 0, true);
+        let file = builder.push("report.pdf", 0, false);
+        builder.set_parent(marker, root);
+        builder.set_parent(file, marker);
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root-path.rkyv");
+        save(&arena, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+        let file = archived.prefix_range("report.pdf").start;
+        assert_eq!(archived.full_path(file, '\\'), "C:\\report.pdf");
     }
 
     /// Ignored release benchmark for `full_path` cache-locality.
