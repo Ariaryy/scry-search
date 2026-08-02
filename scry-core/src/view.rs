@@ -29,6 +29,21 @@ mod tests {
     use super::*;
     use crate::delta::{DeltaRecord, ParentRef};
 
+    #[test]
+    fn view_keeps_the_snapshot_cursor() {
+        let mut builder = crate::ArenaBuilder::default();
+        builder.set_snapshot_cursor(7, 11, 13);
+        builder.push("C:", 0, true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.rkyv");
+        crate::store::save(&builder.build().0, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+        assert_eq!(
+            (view.journal_id, view.next_usn, view.volume_serial),
+            (7, 11, 13)
+        );
+    }
+
     fn base_view(count: usize) -> (tempfile::TempDir, IndexView) {
         let mut builder = crate::ArenaBuilder::default();
         let root = builder.push("C:", 0, true);
