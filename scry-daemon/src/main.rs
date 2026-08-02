@@ -46,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     configure_background_qos();
+    configure_index_read_cap();
 
     let volume = std::env::args().nth(1).unwrap_or_else(|| "C:".to_string());
 
@@ -114,6 +115,22 @@ fn main() -> anyhow::Result<()> {
 /// Both are best-effort. Failures are logged and ignored — an older Windows
 /// build simply doesn't support them, and that is not a reason to refuse to
 /// run.
+fn configure_index_read_cap() {
+    const MIB: u64 = 1024 * 1024;
+    let mebibytes_per_second = match std::env::var("SCRY_INDEX_MBPS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("scryd: ignoring invalid SCRY_INDEX_MBPS={value:?}; using 128");
+                128
+            }
+        },
+        Err(_) => 128,
+    };
+    scry_fsevents::configure_index_read_cap(mebibytes_per_second.saturating_mul(MIB));
+    eprintln!("scryd: index read cap {mebibytes_per_second} MiB/s");
+}
+
 fn configure_background_qos() {
     use std::mem::size_of;
 

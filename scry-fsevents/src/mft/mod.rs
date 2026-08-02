@@ -118,6 +118,7 @@ pub fn enumerate_mft_raw_with_names(
                 break;
             }
             file.seek(std::io::SeekFrom::Start(disk_offset + run_position))?;
+            crate::throttle::acquire(aligned);
             let read_started = std::time::Instant::now();
             std::io::Read::read_exact(&mut file, &mut buffer.as_mut_slice()[..aligned])?;
             read_elapsed += read_started.elapsed();

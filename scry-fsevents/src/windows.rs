@@ -348,6 +348,7 @@ pub fn enumerate_mft_usn(
             };
             let mut bytes_returned: u32 = 0;
 
+            crate::throttle::acquire(out_buf.len());
             let ok = unsafe {
                 ffi::DeviceIoControl(
                     handle,
