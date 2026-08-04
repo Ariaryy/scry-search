@@ -804,6 +804,22 @@ fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
 /// cache entry is left empty instead, and the next keystroke rescans it.
 const REFINEMENT_CACHE_CAP: usize = 20_000;
 
+/// Worker count for `scry_core::view::search_base_parallel`'s bucket-sharded
+/// scan, computed once and reused for the daemon's lifetime rather than
+/// re-queried per keystroke. Capped at 8: beyond that, per-shard bucket
+/// ranges get small enough that thread coordination overhead starts eating
+/// into the win, and it keeps one query from claiming every core on a
+/// larger machine while a reindex is also running.
+fn query_thread_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+    })
+}
+
 /// The result of the last refinable query on this connection, per volume, so
 /// the next keystroke can filter instead of rescan when it's provably a
 /// narrower version of the same query. Lives for the lifetime of one
@@ -926,7 +942,12 @@ fn search_indexes_with_cache(
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            view.search_cancellable(query, REFINEMENT_CACHE_CAP, Some(cancel))
+            view.search_cancellable_pooled(
+                query,
+                REFINEMENT_CACHE_CAP,
+                Some(cancel),
+                query_thread_count(),
+            )
         };
         if cancel.is_cancelled() {
             return Vec::new();
@@ -1072,12 +1093,12 @@ fn search_indexes_cancellable(
         if cancel.is_cancelled() {
             return Vec::new();
         }
-        entries.extend(
-            index
-                .store
-                .load_full()
-                .search_cancellable(query, limit, Some(cancel)),
-        );
+        entries.extend(index.store.load_full().search_cancellable_pooled(
+            query,
+            limit,
+            Some(cancel),
+            query_thread_count(),
+        ));
     }
     if cancel.is_cancelled() {
         return Vec::new();

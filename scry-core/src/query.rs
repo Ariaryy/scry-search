@@ -43,17 +43,102 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
     search_base_impl(arena, query, limit, None)
 }
 
-/// As `search_base`, but abandons the scan (returning an empty result) once
-/// `cancel` reports a newer request superseded this one. Used only by the
-/// daemon's interactive query path — a one-shot caller has nothing that could
-/// supersede it, so it always uses the plain `search_base` above.
-pub(crate) fn search_base_cancellable(
+/// As `search_base` with `limit = usize::MAX`, but for `Substring`
+/// and `Regex` queries that would otherwise fall back to an unfiltered scan
+/// (needle under 3 bytes, or no literal the trigram index can use), splits
+/// that scan across up to `threads` scoped threads instead of running it on
+/// the connection thread alone. Buckets are the shard unit: a front-coded
+/// bucket decodes from nothing outside itself, so splitting on bucket
+/// boundaries needs no synchronization between shards. Every other query
+/// shape (an already-filtered scan, `Prefix`'s binary search, `PathTerms`)
+/// gets no benefit from more threads and runs exactly as it does today.
+pub fn search_base_parallel(
     arena: &ArchivedArena,
     query: &Query,
-    limit: usize,
-    cancel: Cancellation,
+    threads: usize,
+    cancel: Option<Cancellation>,
 ) -> Vec<u32> {
-    search_base_impl(arena, query, limit, Some(cancel))
+    if threads <= 1 {
+        return search_base_impl(arena, query, usize::MAX, cancel);
+    }
+    match query {
+        Query::Substring(needle) => {
+            let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            if arena.candidate_blocks(&needle_lower).is_some() {
+                return search_base_impl(arena, query, usize::MAX, cancel);
+            }
+            scan_full_parallel(arena, threads, cancel, move |name| {
+                let mut lower = Vec::with_capacity(name.len());
+                lower.extend(name.iter().map(u8::to_ascii_lowercase));
+                memchr::memmem::find(&lower, &needle_lower).is_some()
+            })
+        }
+        Query::Regex(pattern) => {
+            let re = match Regex::builder()
+                .syntax(syntax::Config::new().case_insensitive(true))
+                .build(pattern)
+            {
+                Ok(re) => re,
+                Err(_) => return Vec::new(),
+            };
+            let filtered = required_literals(pattern)
+                .and_then(|clauses| arena.candidate_blocks_for_clauses(&clauses))
+                .is_some();
+            if filtered {
+                return search_base_impl(arena, query, usize::MAX, cancel);
+            }
+            scan_full_parallel(arena, threads, cancel, move |name| re.is_match(name))
+        }
+        _ => search_base_impl(arena, query, usize::MAX, cancel),
+    }
+}
+
+/// Runs `matches` over every name in `arena`, sharded across `threads`
+/// bucket-aligned ranges. On cancellation the merged result is discarded
+/// entirely (returns empty), matching the single-threaded scan's contract
+/// that a superseded query yields no results rather than a partial set.
+fn scan_full_parallel(
+    arena: &ArchivedArena,
+    threads: usize,
+    cancel: Option<Cancellation>,
+    matches: impl Fn(&[u8]) -> bool + Sync,
+) -> Vec<u32> {
+    let n = arena.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let num_buckets = n.div_ceil(crate::record::BUCKET_SIZE);
+    let shard_buckets = num_buckets.div_ceil(threads).max(1);
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        let mut start_bucket = 0;
+        while start_bucket < num_buckets {
+            let end_bucket = (start_bucket + shard_buckets).min(num_buckets);
+            let start = (start_bucket * crate::record::BUCKET_SIZE) as u32;
+            let end = (end_bucket * crate::record::BUCKET_SIZE).min(n) as u32;
+            let matches = &matches;
+            let results = &results;
+            scope.spawn(move || {
+                let mut local = Vec::new();
+                let mut checked: u32 = 0;
+                arena.for_each_name_in(start..end, |idx, name| {
+                    if is_cancelled_periodically(cancel, &mut checked) {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    if matches(name) {
+                        local.push(idx);
+                    }
+                    std::ops::ControlFlow::Continue(())
+                });
+                results.lock().unwrap().extend(local);
+            });
+            start_bucket = end_bucket;
+        }
+    });
+    if cancel.is_some_and(|c| c.is_cancelled()) {
+        return Vec::new();
+    }
+    results.into_inner().unwrap()
 }
 
 fn search_base_impl(
@@ -271,6 +356,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Sharding the unfiltered scan across threads must never change which
+    /// records are found — only how the work to find them is split up. A
+    /// mismatch here would mean a query result depends on how many CPUs the
+    /// machine happens to have.
+    #[test]
+    fn parallel_scan_matches_sequential_scan() {
+        let (_dir, store) = generated_store(5_000);
+        let arena = store.archived();
+        let substrings = ["a", "e", "0", "report", "xyz-not-present"];
+        let regexes = [r".*", r"^a.*", r"^does-not-exist$"];
+        for threads in [1, 2, 3, 8] {
+            for pattern in substrings {
+                let query = Query::Substring(pattern.to_string());
+                let sequential = search_base(arena, &query, usize::MAX);
+                let parallel = super::search_base_parallel(arena, &query, threads, None);
+                let mut sequential_sorted = sequential.clone();
+                let mut parallel_sorted = parallel.clone();
+                sequential_sorted.sort_unstable();
+                parallel_sorted.sort_unstable();
+                assert_eq!(
+                    sequential_sorted, parallel_sorted,
+                    "substring {pattern:?}, threads={threads}"
+                );
+            }
+            for pattern in regexes {
+                let query = Query::Regex(pattern.to_string());
+                let sequential = search_base(arena, &query, usize::MAX);
+                let parallel = super::search_base_parallel(arena, &query, threads, None);
+                let mut sequential_sorted = sequential.clone();
+                let mut parallel_sorted = parallel.clone();
+                sequential_sorted.sort_unstable();
+                parallel_sorted.sort_unstable();
+                assert_eq!(
+                    sequential_sorted, parallel_sorted,
+                    "regex {pattern:?}, threads={threads}"
+                );
+            }
+        }
+    }
+
+    /// A cancelled parallel scan must discard everything it found, not just
+    /// whichever shard happened to notice — a superseded query still has to
+    /// come back empty, the same contract the sequential scan honors.
+    #[test]
+    fn parallel_scan_honors_cancellation() {
+        let (_dir, store) = generated_store(200_000);
+        let arena = store.archived();
+        let generation = std::sync::atomic::AtomicU64::new(1);
+        let cancel = crate::cancel::Cancellation::new(&generation, 0); // already stale
+        let result =
+            super::search_base_parallel(arena, &Query::Substring("a".to_string()), 4, Some(cancel));
+        assert!(result.is_empty());
     }
 
     #[test]

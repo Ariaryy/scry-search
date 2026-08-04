@@ -10,7 +10,7 @@ use crate::delta::{Delta, ParentRef};
 use crate::pathindex::{PathClosureScratch, PathIndex};
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
-use crate::query::{search_base, Query};
+use crate::query::Query;
 use crate::store::ArenaStore;
 use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
 
@@ -66,10 +66,11 @@ mod tests {
         let (_dir, view) = base_view(5_000);
         for i in 0..100 {
             let query = Query::Substring(format!("{:02}", i));
-            let expected: Vec<String> = search_base(view.base.archived(), &query, usize::MAX)
-                .into_iter()
-                .map(|index| view.base.archived().full_path(index, '\\'))
-                .collect();
+            let expected: Vec<String> =
+                crate::query::search_base(view.base.archived(), &query, usize::MAX)
+                    .into_iter()
+                    .map(|index| view.base.archived().full_path(index, '\\'))
+                    .collect();
             let actual: Vec<String> = view
                 .search(&query, usize::MAX)
                 .into_iter()
@@ -546,6 +547,21 @@ impl IndexView {
         limit: usize,
         cancel: Option<Cancellation>,
     ) -> Vec<ResultEntry> {
+        self.search_cancellable_pooled(query, limit, cancel, 1)
+    }
+
+    /// As `search_cancellable`, but for a `Substring`/`Regex` query that
+    /// would fall back to an unfiltered scan, spreads that scan across up to
+    /// `threads` threads (see `query::search_base_parallel`). `threads = 1`
+    /// is exactly `search_cancellable`'s behavior. Used only by the daemon,
+    /// which owns sizing the thread count to the machine.
+    pub fn search_cancellable_pooled(
+        &self,
+        query: &Query,
+        limit: usize,
+        cancel: Option<Cancellation>,
+        threads: usize,
+    ) -> Vec<ResultEntry> {
         if let Query::PathTerms(terms) = query {
             return search_path_terms_cancellable(
                 self.base.archived(),
@@ -556,7 +572,14 @@ impl IndexView {
                 cancel,
             );
         }
-        search_ranked_cancellable(self.base.archived(), &self.delta, query, limit, cancel)
+        search_ranked_cancellable(
+            self.base.archived(),
+            &self.delta,
+            query,
+            limit,
+            cancel,
+            threads,
+        )
     }
 
     pub fn delta_path(&self, mut index: u32) -> String {
@@ -852,7 +875,7 @@ fn search_ranked(
     query: &Query,
     limit: usize,
 ) -> Vec<ResultEntry> {
-    search_ranked_cancellable(arena, delta, query, limit, None)
+    search_ranked_cancellable(arena, delta, query, limit, None, 1)
 }
 
 fn search_ranked_cancellable(
@@ -861,6 +884,7 @@ fn search_ranked_cancellable(
     query: &Query,
     limit: usize,
     cancel: Option<Cancellation>,
+    threads: usize,
 ) -> Vec<ResultEntry> {
     if limit == 0 {
         return Vec::new();
@@ -868,10 +892,7 @@ fn search_ranked_cancellable(
     if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return Vec::new();
     }
-    let base_hits = match cancel {
-        Some(cancel) => crate::query::search_base_cancellable(arena, query, usize::MAX, cancel),
-        None => search_base(arena, query, usize::MAX),
-    };
+    let base_hits = crate::query::search_base_parallel(arena, query, threads, cancel);
     let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut name = Vec::new();
     for index in base_hits {
