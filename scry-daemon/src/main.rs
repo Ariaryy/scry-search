@@ -161,10 +161,18 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+    // Every indexed volume's snapshot lives under the same profile directory
+    // (see `snapshot_path`), so a daemon indexing several volumes can end up
+    // writing all of them onto one physical drive. Each volume's write filter
+    // needs the full list to recognize a sibling volume's snapshot file as
+    // its own, not just the file it writes itself.
+    let all_volumes: std::sync::Arc<Vec<String>> = std::sync::Arc::new(volume_names.clone());
+
     let mut indexed = Vec::new();
     for volume in volume_names {
         eprintln!("scryd: indexing {volume}...");
-        let initial = match build_or_resume_view(&volume, auxiliary_marking_enabled) {
+        let initial = match build_or_resume_view(&volume, &all_volumes, auxiliary_marking_enabled)
+        {
             Ok(view) => view,
             Err(error) => {
                 eprintln!("scryd: skipping {volume}: {error}");
@@ -197,6 +205,7 @@ fn main() -> anyhow::Result<()> {
     for index in indexes.iter().skip(1) {
         spawn_volume_watcher(
             index.volume.clone(),
+            all_volumes.clone(),
             index.store.clone(),
             index.cursor,
             auxiliary_marking_enabled,
@@ -209,6 +218,7 @@ fn main() -> anyhow::Result<()> {
     {
         let store = store.clone();
         let volume = volume.clone();
+        let all_volumes = all_volumes.clone();
         let (tx, rx) = crossbeam::channel::bounded(16_384);
         let watcher = scry_fsevents::WindowsBackend::spawn_watcher_from(&volume, cursor, tx);
         // Leaked intentionally: the watcher runs for the daemon's whole
@@ -216,7 +226,14 @@ fn main() -> anyhow::Result<()> {
         let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
         std::thread::spawn(move || {
             configure_background_thread_qos();
-            reindex_on_changes(volume, rx, store, auxiliary_marking_enabled, watcher)
+            reindex_on_changes(
+                volume,
+                &all_volumes,
+                rx,
+                store,
+                auxiliary_marking_enabled,
+                watcher,
+            )
         });
     }
 
@@ -252,6 +269,7 @@ fn main() -> anyhow::Result<()> {
 /// run.
 fn spawn_volume_watcher(
     volume: String,
+    all_volumes: std::sync::Arc<Vec<String>>,
     store: SharedStore,
     cursor: Option<scry_fsevents::JournalCursor>,
     auxiliary_marking_enabled: bool,
@@ -262,7 +280,14 @@ fn spawn_volume_watcher(
     let watcher: &'static scry_fsevents::JournalHandle = Box::leak(Box::new(watcher));
     std::thread::spawn(move || {
         configure_background_thread_qos();
-        reindex_on_changes(volume, rx, store, auxiliary_marking_enabled, watcher)
+        reindex_on_changes(
+            volume,
+            &all_volumes,
+            rx,
+            store,
+            auxiliary_marking_enabled,
+            watcher,
+        )
     });
 }
 
@@ -371,9 +396,10 @@ fn build_path_index(
 
 fn build_or_resume_view(
     volume: &str,
+    all_volumes: &[String],
     auxiliary_marking_enabled: bool,
 ) -> anyhow::Result<StartupView> {
-    match resume_view(volume, auxiliary_marking_enabled) {
+    match resume_view(volume, all_volumes, auxiliary_marking_enabled) {
         Ok(Some(view)) => {
             eprintln!(
                 "scryd: resumed {volume} from journal at {}",
@@ -400,6 +426,7 @@ fn replay_exceeds_compaction_threshold(event_count: usize, base_len: usize) -> b
 
 fn resume_view(
     volume: &str,
+    all_volumes: &[String],
     auxiliary_marking_enabled: bool,
 ) -> anyhow::Result<Option<StartupView>> {
     let path = snapshot_path(volume);
@@ -423,7 +450,7 @@ fn resume_view(
         return Err(anyhow::anyhow!("replay exceeds the compaction threshold"));
     }
 
-    let mut filter = SelfWriteFilter::new(volume, auxiliary_marking_enabled);
+    let mut filter = SelfWriteFilter::new(volume, all_volumes, auxiliary_marking_enabled);
     let mut delta = scry_core::delta::Delta::new(archived.len());
     for change in &events {
         if !is_real_change(change, &mut filter) {
@@ -568,48 +595,71 @@ fn hosting_volume(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// The four file names (final and `.tmp`, for both the snapshot and its FRN
+/// sidecar) that persisting `volume`'s index can produce, regardless of which
+/// physical drive they land on.
+fn snapshot_file_names(volume: &str) -> [String; 4] {
+    let path = snapshot_path(volume);
+    let tmp_path = path.with_extension("tmp");
+    let sidecar_path = path.with_extension("frn");
+    let sidecar_tmp_path = path.with_extension("frn.tmp");
+    [
+        path.file_name().unwrap().to_string_lossy().into_owned(),
+        tmp_path.file_name().unwrap().to_string_lossy().into_owned(),
+        sidecar_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        sidecar_tmp_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+/// Every snapshot filename that could land on `watched_volume`'s journal:
+/// not just `watched_volume`'s own snapshot, but any other indexed volume's
+/// snapshot too, since they all live under the same `%LOCALAPPDATA%` and so
+/// may physically share a hosting drive. Without this, a daemon watching C:
+/// while also indexing D: sees D:'s snapshot write (physically on C:) as an
+/// unrecognized file and reindexes C: for no real change.
+fn owned_snapshot_names(
+    watched_volume: &str,
+    all_volumes: &[String],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for volume in all_volumes {
+        let path = snapshot_path(volume);
+        if hosting_volume(&path).as_deref() == Some(watched_volume) {
+            names.extend(snapshot_file_names(volume));
+        }
+    }
+    names
+}
+
 /// Holds the state `is_real_change` needs to recognize the daemon's own
 /// snapshot writes: the name-based fallback set, and whether
 /// `FSCTL_MARK_HANDLE` auxiliary marking is active (in which case
 /// `is_auxiliary` is trusted over the heuristic).
 struct SelfWriteFilter {
-    snapshot_name: String,
-    snapshot_tmp_name: String,
-    sidecar_name: String,
-    sidecar_tmp_name: String,
+    own_names: std::collections::HashSet<String>,
     self_frns: std::collections::HashSet<u64>,
     use_auxiliary: bool,
 }
 
 impl SelfWriteFilter {
-    fn new(volume: &str, use_auxiliary: bool) -> Self {
-        let path = snapshot_path(volume);
-        let tmp_path = path.with_extension("tmp");
-        let sidecar_path = path.with_extension("frn");
-        let sidecar_tmp_path = path.with_extension("frn.tmp");
+    fn new(watched_volume: &str, all_volumes: &[String], use_auxiliary: bool) -> Self {
         SelfWriteFilter {
-            snapshot_name: path.file_name().unwrap().to_string_lossy().into_owned(),
-            snapshot_tmp_name: tmp_path.file_name().unwrap().to_string_lossy().into_owned(),
-            sidecar_name: sidecar_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            sidecar_tmp_name: sidecar_tmp_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            own_names: owned_snapshot_names(watched_volume, all_volumes),
             self_frns: std::collections::HashSet::new(),
             use_auxiliary,
         }
     }
 
     fn is_own_name(&self, name: &str) -> bool {
-        name == self.snapshot_name
-            || name == self.snapshot_tmp_name
-            || name == self.sidecar_name
-            || name == self.sidecar_tmp_name
+        self.own_names.contains(name)
     }
 }
 
@@ -664,12 +714,13 @@ fn collect_change(
 
 fn reindex_on_changes(
     volume: String,
+    all_volumes: &[String],
     rx: crossbeam::channel::Receiver<scry_fsevents::ChangeEvent>,
     store: SharedStore,
     auxiliary_marking_enabled: bool,
     watcher: &scry_fsevents::JournalHandle,
 ) {
-    let mut filter = SelfWriteFilter::new(&volume, auxiliary_marking_enabled);
+    let mut filter = SelfWriteFilter::new(&volume, all_volumes, auxiliary_marking_enabled);
 
     loop {
         // Block until something changes...
@@ -1700,7 +1751,7 @@ eport.txt"
 
     #[test]
     fn modified_events_never_trigger_reindex() {
-        let mut filter = SelfWriteFilter::new("C:", false);
+        let mut filter = SelfWriteFilter::new("C:", &["C:".to_string()], false);
 
         let modified = ChangeEvent::Modified {
             frn: 1,
@@ -1715,7 +1766,7 @@ eport.txt"
             is_dir: false,
             is_auxiliary: true,
         };
-        let mut aux_filter = SelfWriteFilter::new("C:", true);
+        let mut aux_filter = SelfWriteFilter::new("C:", &["C:".to_string()], true);
         assert!(!is_real_change(&auxiliary_created, &mut aux_filter));
 
         let real_created = ChangeEvent::Created {
@@ -1730,7 +1781,7 @@ eport.txt"
 
     #[test]
     fn journal_advance_is_retained_without_creating_a_delta_event() {
-        let mut filter = SelfWriteFilter::new("C:", false);
+        let mut filter = SelfWriteFilter::new("C:", &["C:".to_string()], false);
         let mut batch = Vec::new();
         let mut next_usn = None;
         collect_change(
@@ -1748,6 +1799,41 @@ eport.txt"
         let path = snapshot_path("C:");
         assert_eq!(path.file_name().unwrap(), "index-C.rkyv");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "scry");
+    }
+
+    #[test]
+    fn a_sibling_volumes_snapshot_write_never_triggers_this_volumes_reindex() {
+        // Every volume's snapshot lands under the same %LOCALAPPDATA%, so two
+        // indexed volumes' snapshots always share one hosting drive — the
+        // drive backing the user profile, whatever it is on this machine.
+        // The daemon watching that hosting volume must recognize the other
+        // volume's snapshot filenames as its own writes, not just its own.
+        let host = hosting_volume(&snapshot_path("D:")).expect("snapshot path has a drive letter");
+        let all_volumes = vec![host.clone(), "D:".to_string()];
+        let mut filter = SelfWriteFilter::new(&host, &all_volumes, false);
+
+        for name in snapshot_file_names("D:") {
+            let created = ChangeEvent::Created {
+                frn: 10,
+                parent_frn: 0,
+                name: name.clone(),
+                is_dir: false,
+                is_auxiliary: false,
+            };
+            assert!(
+                !is_real_change(&created, &mut filter),
+                "{name} is D:'s own snapshot file, physically hosted on {host}; \
+                 {host}'s watcher must not treat writing it as a real change"
+            );
+
+            let renamed = ChangeEvent::Renamed {
+                frn: 10,
+                parent_frn: 0,
+                name,
+                is_auxiliary: false,
+            };
+            assert!(!is_real_change(&renamed, &mut filter));
+        }
     }
 
     #[test]

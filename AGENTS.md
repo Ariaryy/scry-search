@@ -31,9 +31,15 @@
   unchecked arithmetic, and an explicit termination guard on every loop driven
   by an on-disk length. Extend `parser_never_panics_on_mutated_records` whenever
   the parser learns a new structure.
-- The daemon's snapshot file (`%TEMP%\scry-index-<vol>.rkyv`) lives on the volume being watched.
-  Any code that writes to disk from within the daemon must be accounted for in the USN-event filter
-  in `reindex_on_changes` (`scry-daemon/src/main.rs`) or it'll retrigger its own reindex.
+- The daemon's snapshot file (`%LOCALAPPDATA%\scry\index-<vol>.rkyv`) lives under the user profile,
+  not on the volume it describes — so with more than one volume indexed, every volume's snapshot can
+  physically share one hosting drive (whichever drive the profile is on). `SelfWriteFilter` in
+  `scry-daemon/src/main.rs` accounts for this two ways: `FSCTL_MARK_HANDLE` marking is applied
+  against the snapshot's *hosting* volume (`hosting_volume`), and the name-based fallback for a given
+  watched volume recognizes every indexed volume's snapshot filenames that are hosted there
+  (`owned_snapshot_names`), not just the filenames it writes for itself. Any new on-disk write from
+  within the daemon must be accounted for the same way or it'll retrigger a reindex of whichever
+  volume actually hosts the write.
 
 ## Known limitations (not oversights — documented tradeoffs)
 
