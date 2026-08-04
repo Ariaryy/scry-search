@@ -30,8 +30,10 @@ pub enum Order {
     Relevance = 0,
     /// Most recently modified first.
     Recent = 1,
-    /// Largest first. Paired with directory sizes this is what a
-    /// disk-usage view wants.
+    /// Largest first. A directory's key uses its *recursive* size — the sum
+    /// of everything beneath it, via `ArchivedArena::recursive_size_kib` — so
+    /// this is what a disk-usage view wants without a separate aggregation
+    /// pass; a file's key is unaffected, since its own "subtree" is itself.
     Largest = 2,
 }
 

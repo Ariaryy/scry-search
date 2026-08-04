@@ -1001,14 +1001,17 @@ fn record_mtime(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32
 }
 
 /// Size of a record in KiB — the width the index stores and the width
-/// [`rank::largest_key`] wants.
+/// [`rank::largest_key`] wants. For a base-arena directory this is its
+/// *recursive* size (everything beneath it, O(1) via the DFS prefix-sum
+/// column); for a file, or for any delta-added record, it is the record's
+/// own size — a delta addition has no subtree computed for it, and a file's
+/// subtree is itself anyway.
 #[inline]
 fn record_size_kib(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32 {
-    let bytes = match record.checked_sub(arena.len() as u32) {
-        None => arena.size_bytes(record),
-        Some(index) => delta.added[index as usize].size_bytes,
-    };
-    crate::record::bytes_to_size_kib(bytes)
+    match record.checked_sub(arena.len() as u32) {
+        None => arena.recursive_size_kib(record),
+        Some(index) => crate::record::bytes_to_size_kib(delta.added[index as usize].size_bytes),
+    }
 }
 
 /// The sort key for one candidate under `order`.

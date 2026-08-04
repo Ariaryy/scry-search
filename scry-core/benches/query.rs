@@ -260,6 +260,22 @@ fn fixed_costs(c: &mut Criterion) {
                 .len()
         })
     });
+    // Paid alongside `dfs_build` at the same points (reindex, compaction) —
+    // it is what lets `Order::Largest` rank a directory by recursive size
+    // without an aggregation pass at query time. Measured over the already
+    // -built tree order so this isolates the prefix-sum pass itself.
+    group.bench_function("dfs_size_prefix_build", |b| {
+        let parents: Vec<u32> = view.base.archived().parents.iter().copied().collect();
+        let sizes: Vec<u32> = view.base.archived().sizes.iter().copied().collect();
+        let dfs = scry_core::dfs::build(&parents);
+        b.iter(|| {
+            black_box(scry_core::dfs::prefix_sums_u64(
+                black_box(&dfs.records),
+                black_box(&sizes),
+            ))
+            .len()
+        })
+    });
     group.bench_function("closure_all_dirs", |b| {
         let mut mask = vec![0u16; view.path_index.directory_count()];
         b.iter(|| {

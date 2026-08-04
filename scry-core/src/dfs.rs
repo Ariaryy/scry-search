@@ -37,6 +37,30 @@ pub struct DfsLayout {
     pub subtree_ends: Vec<u32>,
 }
 
+/// Prefix sums of a per-record `u32` column, laid out in depth-first order.
+///
+/// `prefix[k]` is the sum of `values[records[0..k]]`, so `prefix.len() ==
+/// records.len() + 1` and a subtree total over `positions[r]..subtree_ends[r]`
+/// is one subtraction: `prefix[subtree_ends[r]] - prefix[positions[r]]`. A
+/// leaf's own interval has width one, so the same formula gives back its own
+/// value — callers do not need an `is_dir` branch.
+///
+/// Sums accumulate in `u64` even though each per-record value is a saturating
+/// `u32` (KiB): a directory's recursive total can exceed `u32::MAX` KiB (~4
+/// TiB) on a large volume even though no single file can, and the running sum
+/// must not wrap partway through the corpus.
+#[inline]
+pub fn prefix_sums_u64(records: &[u32], values: &[u32]) -> Vec<u64> {
+    let mut prefix = Vec::with_capacity(records.len() + 1);
+    prefix.push(0u64);
+    let mut running = 0u64;
+    for &record in records {
+        running += values[record as usize] as u64;
+        prefix.push(running);
+    }
+    prefix
+}
+
 /// Children of each record, as a compressed sparse row over record indices.
 ///
 /// Built and dropped inside [`build`] rather than stored: it is only needed to
@@ -336,6 +360,66 @@ mod tests {
         assert_is_permutation(&layout, parents.len());
         assert_eq!(layout.subtree_ends[0] - layout.positions[0], DEPTH);
         assert_eq!(layout.subtree_ends[(DEPTH - 1) as usize], DEPTH);
+    }
+
+    /// Recursive size over nested directories: a subtree total must equal
+    /// the sum of every record beneath it, itself included.
+    #[test]
+    fn prefix_sums_give_correct_subtree_totals_for_nested_dirs() {
+        // 0 root, 1 and 2 children of 0, 3 and 4 children of 1.
+        let parents = forest(&[
+            (PARENT_NONE, true),
+            (0, true),
+            (0, false),
+            (1, false),
+            (1, false),
+        ]);
+        let sizes = [0u32, 0, 5, 3, 7]; // dirs carry no own size in this model
+        let layout = build(&parents);
+        let prefix = prefix_sums_u64(&layout.records, &sizes);
+        assert_eq!(prefix.len(), parents.len() + 1);
+
+        let subtree_total = |record: usize| {
+            prefix[layout.subtree_ends[record] as usize] - prefix[layout.positions[record] as usize]
+        };
+        assert_eq!(subtree_total(0), 15, "root covers every record");
+        assert_eq!(subtree_total(1), 10, "record 1 plus its two children");
+        assert_eq!(subtree_total(2), 5, "a leaf's subtree is itself");
+        assert_eq!(subtree_total(3), 3);
+        assert_eq!(subtree_total(4), 7);
+    }
+
+    /// A parent cycle still yields a total permutation, so the prefix-sum
+    /// invariant (subtree total is a valid, in-bounds subtraction) must keep
+    /// holding even when cycle members are pseudo-roots.
+    #[test]
+    fn prefix_sums_stay_valid_across_a_parent_cycle() {
+        // 0 -> 1 -> 2 -> 0, plus an unrelated root with a child.
+        let parents = forest(&[
+            (1, true),
+            (2, true),
+            (0, true),
+            (PARENT_NONE, true),
+            (3, false),
+        ]);
+        let sizes = [1u32, 2, 3, 4, 5];
+        let layout = build(&parents);
+        assert_is_permutation(&layout, parents.len());
+        let prefix = prefix_sums_u64(&layout.records, &sizes);
+        assert_eq!(prefix.len(), parents.len() + 1);
+        // Total across the whole tree order must equal the sum of every value,
+        // regardless of how cycle members were rooted.
+        assert_eq!(
+            *prefix.last().unwrap(),
+            sizes.iter().map(|&s| s as u64).sum::<u64>()
+        );
+        for record in 0..parents.len() {
+            let total = prefix[layout.subtree_ends[record] as usize]
+                - prefix[layout.positions[record] as usize];
+            // Every record's own value is included in its own subtree total,
+            // cycle member or not.
+            assert!(total >= sizes[record] as u64);
+        }
     }
 
     /// Randomised forests, checked against the independent ancestor walk.

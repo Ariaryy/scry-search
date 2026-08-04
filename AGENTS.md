@@ -10,13 +10,14 @@
   `parent()`, `mtime()`) needs an impl on each — the accessors on `ArchivedArena` read
   directly from the archived column vectors. `FileRecord` no longer exists; the dual-impl
   pattern now applies to functions on `ArchivedArena` vs the free functions in `record.rs`.
-- `Arena` uses a format v8 index (parallel 4-byte columns: `parents` hot,
-  `mtimes`/`sizes`/`dfs_positions`/`dfs_records`/`dfs_ends` cold; plus name-sorted
-  front-coded names) rather than plain `String` fields or a single interleaved struct.
-  The hot/cold split is load-bearing: `parents` alone in its column gives 16 parent hops
-  per cache line; keeping the rest separate lets them stay paged out between compaction
-  bursts. A future change that folds any cold field back into the hot column must update
-  both this note and the doc comments in `arena.rs`.
+- `Arena` uses a format v9 index (parallel 4-byte columns: `parents` hot,
+  `mtimes`/`sizes`/`dfs_positions`/`dfs_records`/`dfs_ends` cold, plus the 8-byte
+  `dfs_size_prefix` cold column; plus name-sorted front-coded names) rather than plain
+  `String` fields or a single interleaved struct. The hot/cold split is load-bearing:
+  `parents` alone in its column gives 16 parent hops per cache line; keeping the rest
+  separate lets them stay paged out between compaction bursts. A future change that
+  folds any cold field back into the hot column must update both this note and the doc
+  comments in `arena.rs`.
 - Records are stored **name-sorted** — `prefix_range`'s binary search and front-coding
   both depend on it — so the `dfs_*` columns (`scry-core/src/dfs.rs`) carry tree order
   separately: `dfs_positions[r]..dfs_ends[r]` is the half-open span of `dfs_records`
@@ -26,6 +27,19 @@
   (cycle members become pseudo-roots), so `dfs_positions` is always a total permutation.
   The traversal is iterative on purpose — a recursive DFS overflows the stack on a
   deep or corrupt parent chain.
+- **Recursive directory sizes are a prefix sum over `sizes`, laid out in the same
+  depth-first order as the `dfs_*` columns** (`dfs_size_prefix` in `arena.rs`,
+  built by `dfs::prefix_sums_u64`): a directory's recursive size is one subtraction,
+  `dfs_size_prefix[dfs_ends[r]] - dfs_size_prefix[dfs_positions[r]]`
+  (`ArchivedArena::recursive_size_kib`), not an aggregation pass. The column is `u64`
+  even though each per-record value is a saturating `u32` KiB count, because a
+  directory's recursive total can exceed `u32::MAX` KiB (~4 TiB) on a large volume
+  well before any single file could; the ranking key still saturates the *result* to
+  `u32` to fit `rank::largest_key`. A record with unknown size (see the `size` note
+  below) contributes zero to every ancestor's sum, so a directory total is a lower
+  bound, not an exact figure, whenever any descendant's size is unknown. Cold column,
+  same eviction rationale as `mtimes`/`sizes`: 8 bytes/record, ~8 MB per million
+  records in the snapshot.
 - The `$MFT` parser (`scry-fsevents/src/mft/`) reads a live on-disk structure
   and must treat every length and offset as hostile: checked slicing only, no
   unchecked arithmetic, and an explicit termination guard on every loop driven

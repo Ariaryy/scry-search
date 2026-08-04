@@ -68,6 +68,18 @@ pub struct Arena {
     /// Indexed by name-sorted record, so `dfs_positions[r]..dfs_ends[r]` is
     /// the span of `dfs_records` covering everything beneath `r`.
     pub dfs_ends: Vec<u32>,
+    /// Prefix sums of `sizes`, laid out in depth-first order (see
+    /// `crate::dfs::prefix_sums_u64`). `dfs_size_prefix.len() ==
+    /// dfs_records.len() + 1`. A record's recursive size is one subtraction:
+    /// `dfs_size_prefix[dfs_ends[r]] - dfs_size_prefix[dfs_positions[r]]` —
+    /// see `ArchivedArena::recursive_size_kib`. `u64` so the running sum
+    /// cannot wrap on a multi-terabyte volume even though each per-record
+    /// value is a saturating `u32` KiB count; a directory's aggregate
+    /// legitimately exceeds `u32::MAX` KiB (~4 TiB) well before the volume
+    /// itself does. Cold: same eviction rationale as `mtimes`/`sizes` — only
+    /// `Order::Largest` reads it. Costs 8 bytes/record, i.e. ~8 MB per
+    /// million records in the snapshot.
+    pub dfs_size_prefix: Vec<u64>,
 }
 
 impl Arena {
@@ -247,6 +259,33 @@ impl ArchivedArena {
     pub fn is_descendant_of(&self, descendant: u32, ancestor: u32) -> bool {
         self.subtree(ancestor)
             .contains(&self.dfs_positions[descendant as usize])
+    }
+
+    /// Recursive size of `idx`'s subtree, itself included, in KiB. O(1): a
+    /// subtraction of two entries of `dfs_size_prefix`, not a walk. A leaf's
+    /// subtree is itself, so this also works — and agrees with `sizes[idx]`
+    /// — for a plain file; callers do not need an `is_dir` branch.
+    ///
+    /// Unknown per-record sizes (the USN fallback path, see the `size` note
+    /// in AGENTS.md) contribute zero, so a directory's total is a lower
+    /// bound, not an exact figure, whenever any descendant's size is
+    /// unknown. Saturates at `u32::MAX` KiB (~4 TiB) — the width `rank`'s
+    /// sort key packs a size into — even though the underlying `u64` sum can
+    /// exceed that on a very large subtree.
+    ///
+    /// A snapshot written before this column existed has an empty
+    /// `dfs_size_prefix`; that can only happen if `dfs_positions` is also
+    /// empty (both are populated together at build time), so the `subtree`
+    /// empty-column fallback already guards this.
+    #[inline]
+    pub fn recursive_size_kib(&self, idx: u32) -> u32 {
+        if self.dfs_size_prefix.is_empty() {
+            return self.sizes[idx as usize];
+        }
+        let span = self.subtree(idx);
+        let total =
+            self.dfs_size_prefix[span.end as usize] - self.dfs_size_prefix[span.start as usize];
+        total.min(u32::MAX as u64) as u32
     }
 
     /// Decode the name of record `idx` into `out`, clearing it first.
@@ -857,6 +896,9 @@ impl ArenaBuilder {
         // 5. Tree order, over the *remapped* parents — `dfs` indexes records
         // the same way every other column does.
         let dfs = crate::dfs::build(&out_parents);
+        // 6. Recursive-size prefix sums, over the same tree order and the
+        // just-built size column — see the `dfs_size_prefix` doc comment.
+        let dfs_size_prefix = crate::dfs::prefix_sums_u64(&dfs.records, &out_sizes);
 
         (
             Arena {
@@ -873,6 +915,7 @@ impl ArenaBuilder {
                 dfs_positions: dfs.positions,
                 dfs_records: dfs.records,
                 dfs_ends: dfs.subtree_ends,
+                dfs_size_prefix,
             },
             frn_entries,
         )
@@ -914,6 +957,7 @@ mod tests {
         assert_eq!(archived.parents.len(), archived.dfs_positions.len());
         assert_eq!(archived.parents.len(), archived.dfs_records.len());
         assert_eq!(archived.parents.len(), archived.dfs_ends.len());
+        assert_eq!(archived.parents.len() + 1, archived.dfs_size_prefix.len());
     }
 
     /// `dfs` is built over the *remapped* parents, so the intervals have to
@@ -961,6 +1005,80 @@ mod tests {
         );
         assert!(!archived.is_descendant_of(sibling, mid));
         assert!(!archived.is_descendant_of(root, mid));
+    }
+
+    /// A directory's recursive size is the sum of every file beneath it; a
+    /// nested directory's total nests inside its parent's; a leaf's total is
+    /// its own size — no `is_dir` branch needed by the caller.
+    #[test]
+    fn recursive_size_kib_sums_nested_directories() {
+        let mut b = ArenaBuilder::default();
+        let root = b.push_bytes_with_metadata(b"root", 0, true, None, 0);
+        let mid = b.push_bytes_with_metadata(b"mid", 0, true, None, 0);
+        let leaf_a = b.push_bytes_with_metadata(b"leaf_a.txt", 0, false, None, 3 * 1024);
+        let leaf_b = b.push_bytes_with_metadata(b"leaf_b.txt", 0, false, None, 5 * 1024);
+        let sibling = b.push_bytes_with_metadata(b"sibling.txt", 0, false, None, 2 * 1024);
+        b.set_parent(mid, root);
+        b.set_parent(leaf_a, mid);
+        b.set_parent(leaf_b, mid);
+        b.set_parent(sibling, root);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recursive_size.rkyv");
+        save(&b.build().0, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+        let find = |wanted: &str| {
+            (0..archived.len() as u32)
+                .find(|&i| archived.name(i) == wanted)
+                .expect("record present")
+        };
+        let (root, mid, leaf_a, sibling) = (
+            find("root"),
+            find("mid"),
+            find("leaf_a.txt"),
+            find("sibling.txt"),
+        );
+
+        assert_eq!(archived.recursive_size_kib(mid), 8, "mid's two leaves");
+        assert_eq!(
+            archived.recursive_size_kib(root),
+            10,
+            "everything beneath root"
+        );
+        assert_eq!(
+            archived.recursive_size_kib(leaf_a),
+            3,
+            "a leaf's total is its own size"
+        );
+        assert_eq!(archived.recursive_size_kib(sibling), 2);
+    }
+
+    /// A directory with an unknown-size descendant (0 KiB, the USN-path
+    /// sentinel) must not treat that as a hole in the sum — it contributes
+    /// zero, so the total is a lower bound rather than an error.
+    #[test]
+    fn recursive_size_kib_treats_unknown_sizes_as_zero() {
+        let mut b = ArenaBuilder::default();
+        let root = b.push_bytes_with_metadata(b"root", 0, true, None, 0);
+        let known = b.push_bytes_with_metadata(b"known.txt", 0, false, None, 4 * 1024);
+        let unknown = b.push_bytes_with_metadata(b"unknown.txt", 0, false, None, 0);
+        b.set_parent(known, root);
+        b.set_parent(unknown, root);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown_size.rkyv");
+        save(&b.build().0, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+        let root = (0..archived.len() as u32)
+            .find(|&i| archived.name(i) == "root")
+            .unwrap();
+        assert_eq!(
+            archived.recursive_size_kib(root),
+            4,
+            "unknown-size descendant contributes zero, not an error"
+        );
     }
 
     /// This plan is a rearrangement: the total archived bytes per entry must
@@ -1275,6 +1393,8 @@ mod tests {
             pack_parent(0, false), // record 1, parent = 0 — CYCLE
         ];
         let dfs = crate::dfs::build(&parents);
+        let sizes = vec![0u32, 0];
+        let dfs_size_prefix = crate::dfs::prefix_sums_u64(&dfs.records, &sizes);
         let arena = Arena {
             format_version: crate::record::FORMAT_VERSION,
             journal_id: 0,
@@ -1284,11 +1404,12 @@ mod tests {
             bucket_offsets,
             parents,
             mtimes: vec![0, 0],
-            sizes: vec![0, 0],
+            sizes,
             trigram_index: Vec::new(),
             dfs_positions: dfs.positions,
             dfs_records: dfs.records,
             dfs_ends: dfs.subtree_ends,
+            dfs_size_prefix,
         };
 
         let dir = tempfile::tempdir().unwrap();
