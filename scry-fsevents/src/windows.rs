@@ -169,13 +169,30 @@ impl WindowsBackend {
     pub fn bulk_index_volume(
         volume: &str,
     ) -> Result<(scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>), WindowsBackendError> {
+        // Which reader served which volume, and why, is worth a line each:
+        // the two differ in whether `size` carries any information at all, and
+        // a volume silently demoting to USN is otherwise indistinguishable
+        // from a volume where every file happens to be empty.
         match build_raw_index(volume) {
             Ok((arena, frns, report)) => {
-                eprintln!("scry: raw MFT reader: {report:?}");
+                let unknown = report.files_with_zero_size;
+                eprintln!(
+                    "scry: {volume} indexed by the raw $MFT reader: {} entries, \
+                     {unknown} of them files with unknown size ({:.2}%), \
+                     {} unresolved attribute lists",
+                    report.emitted,
+                    100.0 * unknown as f64 / report.emitted.max(1) as f64,
+                    report.attribute_list_unresolved,
+                );
+                eprintln!("scry: {volume} raw reader detail: {report:?}");
                 Ok((arena, frns))
             }
             Err(error) => {
-                eprintln!("scry: raw MFT reader unavailable ({error}); using USN enumeration");
+                eprintln!(
+                    "scry: {volume} demoted to USN enumeration ({error}); \
+                     size is unavailable from USN records, so every entry on \
+                     this volume will report 0"
+                );
                 build_usn_index(volume)
             }
         }

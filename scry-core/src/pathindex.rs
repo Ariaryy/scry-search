@@ -257,8 +257,10 @@ mod tests {
     use crate::Arena;
 
     fn archived(arena: &Arena) -> &'static ArchivedArena {
-        let bytes = rkyv::to_bytes::<_, 1024>(arena).unwrap();
-        crate::store::archived_bytes(Box::leak(bytes.into_boxed_slice())).unwrap()
+        // Leak the `AlignedVec` itself rather than a re-boxed slice: the
+        // archive's alignment comes from that allocation.
+        let bytes: &'static _ = Box::leak(Box::new(crate::store::to_bytes(arena).unwrap()));
+        crate::store::archived_bytes(bytes).unwrap()
     }
 
     #[test]

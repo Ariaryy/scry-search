@@ -15,6 +15,58 @@ pub enum StoreError {
     Validation(String),
     #[error("format version mismatch: found {found}, expected {expected}")]
     VersionMismatch { found: u32, expected: u32 },
+    #[error("not a scry snapshot")]
+    BadMagic,
+}
+
+/// Leading bytes of every snapshot, ahead of the rkyv archive.
+///
+/// The version also lives inside the archive, but it cannot be *read* from one
+/// written by a different version: rkyv resolves fields by offsets derived from
+/// the current struct definition, so a layout change makes every field of an
+/// older archive garbage — including the version field that was supposed to
+/// detect the change. Validating such an archive fails deep inside bytecheck
+/// with a pointer-out-of-bounds message that describes the symptom rather than
+/// the cause, and `VersionMismatch` never fires. This header is outside the
+/// archive and fixed forever, so a stale snapshot is diagnosed before rkyv sees
+/// a byte of it.
+const MAGIC: [u8; 8] = *b"SCRYIDX\0";
+
+/// Magic, version, and four reserved bytes. Sixteen rather than twelve so the
+/// archive stays 8-aligned behind it — the archive contains `u64` fields, and
+/// rkyv's validator rejects a misaligned buffer.
+const HEADER_LEN: usize = 16;
+
+/// The complete snapshot image — header followed by the rkyv archive.
+///
+/// Returned as an `AlignedVec` because the archive behind the 16-byte header
+/// must stay 8-aligned; a plain `Vec<u8>` gives no such guarantee and rkyv's
+/// validator would reject the result on a bad allocation day.
+pub fn to_bytes(arena: &Arena) -> Result<rkyv::AlignedVec, StoreError> {
+    let archive =
+        rkyv::to_bytes::<_, 1024>(arena).map_err(|e| StoreError::Validation(e.to_string()))?;
+    let mut out = rkyv::AlignedVec::with_capacity(HEADER_LEN + archive.len());
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&archive);
+    Ok(out)
+}
+
+/// Validates the header and returns the archive bytes behind it.
+fn split_header(bytes: &[u8]) -> Result<&[u8], StoreError> {
+    let header = bytes.get(..HEADER_LEN).ok_or(StoreError::BadMagic)?;
+    if header[..8] != MAGIC {
+        return Err(StoreError::BadMagic);
+    }
+    let found = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+    if found != FORMAT_VERSION {
+        return Err(StoreError::VersionMismatch {
+            found,
+            expected: FORMAT_VERSION,
+        });
+    }
+    Ok(&bytes[HEADER_LEN..])
 }
 
 /// Serialize an Arena to disk via rkyv. This is the only place allocation-heavy
@@ -31,8 +83,7 @@ pub fn save_with<F>(arena: &Arena, path: &Path, on_create: F) -> Result<(), Stor
 where
     F: FnOnce(&File),
 {
-    let bytes =
-        rkyv::to_bytes::<_, 1024>(arena).map_err(|e| StoreError::Validation(e.to_string()))?;
+    let bytes = to_bytes(arena)?;
     let tmp_path = path.with_extension("tmp");
     {
         let mut f = File::create(&tmp_path)?;
@@ -80,16 +131,12 @@ impl ArenaStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        // Validate once at open time (bytecheck), not on every query.
-        let archived = rkyv::check_archived_root::<Arena>(&mmap[..])
+        // Header first, so a stale snapshot is reported as a version mismatch
+        // rather than as a bytecheck failure over a layout that no longer
+        // applies. Then validate once at open time (bytecheck), not per query.
+        let archive = split_header(&mmap[..])?;
+        rkyv::check_archived_root::<Arena>(archive)
             .map_err(|e| StoreError::Validation(e.to_string()))?;
-        let found = archived.format_version;
-        if found != FORMAT_VERSION {
-            return Err(StoreError::VersionMismatch {
-                found,
-                expected: FORMAT_VERSION,
-            });
-        }
         let sidecar = path.with_extension("frn");
         let frn_map = match FrnMap::open(&sidecar) {
             Ok(map) => Some(map),
@@ -111,10 +158,12 @@ impl ArenaStore {
 
     #[inline]
     pub fn archived(&self) -> &ArchivedArena {
-        // Safety: validated in `open` via check_archived_root.
-        unsafe { rkyv::archived_root::<Arena>(&self.mmap[..]) }
+        // Safety: validated in `open` via split_header + check_archived_root.
+        unsafe { rkyv::archived_root::<Arena>(&self.mmap[HEADER_LEN..]) }
     }
 
+    /// The whole snapshot image, header included, as shared with clients.
+    /// Consumers parse it with [`archived_bytes`], which expects the header.
     pub fn archive_bytes(&self) -> &[u8] {
         &self.mmap
     }
@@ -125,15 +174,10 @@ impl ArenaStore {
 }
 
 pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
-    let archived = rkyv::check_archived_root::<Arena>(bytes)
+    let archive = split_header(bytes)?;
+    rkyv::check_archived_root::<Arena>(archive)
         .map_err(|e| StoreError::Validation(e.to_string()))?;
-    if archived.format_version != FORMAT_VERSION {
-        return Err(StoreError::VersionMismatch {
-            found: archived.format_version,
-            expected: FORMAT_VERSION,
-        });
-    }
-    Ok(unsafe { rkyv::archived_root::<Arena>(bytes) })
+    Ok(unsafe { rkyv::archived_root::<Arena>(archive) })
 }
 
 /// Return the archived root after the caller has validated this exact,
@@ -144,7 +188,7 @@ pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
 /// `bytes` must be the same bytes previously accepted by [`archived_bytes`]
 /// and must not have changed since validation.
 pub unsafe fn archived_bytes_validated(bytes: &[u8]) -> &ArchivedArena {
-    unsafe { rkyv::archived_root::<Arena>(bytes) }
+    unsafe { rkyv::archived_root::<Arena>(&bytes[HEADER_LEN..]) }
 }
 
 #[cfg(test)]
@@ -152,8 +196,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_rejects_a_snapshot_with_a_different_format_version() {
-        // Save a valid arena, then corrupt its format_version bytes.
+    fn open_diagnoses_a_stale_or_alien_snapshot_from_the_header() {
+        // Save a valid arena, then patch the version in its header.
         let dir = tempfile::tempdir().unwrap();
         let mut b = crate::arena::ArenaBuilder::default();
         b.push("test", 0, false);
@@ -161,11 +205,36 @@ mod tests {
         let path = dir.path().join("versioned.rkyv");
         save(&arena, &path).unwrap();
 
-        // Read the bytes, find format_version (first u32 in the rkyv archive
-        // at a known offset relative to the end — rkyv stores the root at the
-        // end). Instead of brittle byte-patching, we just confirm that a file
-        // of random-ish bytes is rejected, which covers the version-check path.
-        // (The valid save above also exercises the happy path in open().)
+        // The version lives in the header at a fixed offset, so patching it is
+        // exact rather than brittle — which is the whole point of the header.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&(FORMAT_VERSION - 1).to_le_bytes());
+        let stale_path = dir.path().join("stale.rkyv");
+        std::fs::write(&stale_path, &bytes).unwrap();
+        match ArenaStore::open(&stale_path) {
+            Err(StoreError::VersionMismatch { found, expected }) => {
+                assert_eq!(found, FORMAT_VERSION - 1);
+                assert_eq!(expected, FORMAT_VERSION);
+            }
+            other => panic!(
+                "a stale snapshot must report a version mismatch, not a \
+                 bytecheck failure over a layout that no longer applies; got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+
+        // A file that isn't a snapshot at all is rejected on the magic.
+        let alien_path = dir.path().join("alien.rkyv");
+        std::fs::write(
+            &alien_path,
+            b"PK\x03\x04 definitely a zip file, not an index",
+        )
+        .unwrap();
+        assert!(matches!(
+            ArenaStore::open(&alien_path),
+            Err(StoreError::BadMagic)
+        ));
+
         let random_path = dir.path().join("random.rkyv");
         std::fs::write(
             &random_path,

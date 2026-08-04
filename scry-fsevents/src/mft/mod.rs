@@ -39,6 +39,25 @@ pub struct MftEnumReport {
     pub nonresident_attribute_lists: usize,
     pub targeted_extension_reads: usize,
     pub extra_hard_links_ignored: usize,
+    /// Non-directory records emitted with a size of zero.
+    ///
+    /// A genuinely empty file is rare, so this should stay near zero on a real
+    /// volume. A large count means `$DATA` is not being found — the usual
+    /// causes being a base record whose unnamed `$DATA` lives in an extension
+    /// reached through an `$ATTRIBUTE_LIST` we could not resolve, or a stream
+    /// that is entirely named. `size` reaching the index as 0 is documented to
+    /// mean *unknown*, so without this counter the gap is indistinguishable
+    /// from a volume full of empty files.
+    pub files_with_zero_size: usize,
+}
+
+/// Records one emitted entry. Both emit sites go through here so the size
+/// coverage counter can't drift away from `emitted`.
+fn note_emitted(report: &mut MftEnumReport, is_dir: bool, size: u64) {
+    report.emitted += 1;
+    if !is_dir && size == 0 {
+        report.files_with_zero_size += 1;
+    }
 }
 
 struct DeferredRecord {
@@ -382,7 +401,7 @@ fn parse_and_emit(
         mtime,
         size,
     );
-    state.report.emitted += 1;
+    note_emitted(&mut state.report, record.is_dir(), size);
     Ok(())
 }
 
@@ -493,15 +512,16 @@ fn resolve_deferred(
             .or_else(|| names.iter().find(|name| name.namespace == 0));
         if let Some(name) = selected {
             state.report.extra_hard_links_ignored += names.len().saturating_sub(1);
+            let size = resolved_sizes[base_index].unwrap_or(base.size);
             sink(
                 base.frn,
                 name.parent_frn,
                 name.name.as_bytes(),
                 base.is_dir,
                 resolved_mtimes[base_index].unwrap_or(base.mtime),
-                resolved_sizes[base_index].unwrap_or(base.size),
+                size,
             );
-            state.report.emitted += 1;
+            note_emitted(&mut state.report, base.is_dir, size);
         }
         if resolved_children[base_index] {
             state.report.attribute_list_resolved += 1;
