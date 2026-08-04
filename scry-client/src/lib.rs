@@ -71,6 +71,20 @@ impl Client {
         pattern: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<ResultEntry>> {
+        self.send_interactive(kind, pattern, limit)?;
+        self.recv_interactive()
+    }
+
+    /// Writes an as-you-type request without blocking for its response —
+    /// see `search_interactive`. Split out so a caller can echo the typed
+    /// pattern immediately and only block on `recv_interactive` once it has
+    /// nothing left to send, instead of round-tripping per keystroke.
+    pub fn send_interactive(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+    ) -> anyhow::Result<()> {
         let req = Request {
             kind,
             pattern: pattern.to_string(),
@@ -78,12 +92,24 @@ impl Client {
         };
         self.pipe.write_frame(&encode_request(&req))?;
         self.pending_interactive += 1;
+        Ok(())
+    }
+
+    /// Blocks until the response to the most recent `send_interactive` call
+    /// arrives, discarding any older buffered responses along the way.
+    /// Panics if called with no outstanding `send_interactive` request —
+    /// that's a caller bug, not a runtime condition to recover from.
+    pub fn recv_interactive(&mut self) -> anyhow::Result<Vec<ResultEntry>> {
+        assert!(
+            self.pending_interactive > 0,
+            "recv_interactive called with no outstanding send_interactive request"
+        );
         let mut latest = None;
         while self.pending_interactive > 0 {
             latest = Some(self.pipe.read_frame()?);
             self.pending_interactive -= 1;
         }
-        let resp = latest.expect("at least one request was sent above");
+        let resp = latest.expect("pending_interactive was > 0 above");
         decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
     }
 

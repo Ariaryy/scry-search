@@ -67,9 +67,15 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Redraws the query line and its current results each keystroke, using the
-/// daemon's pipelined `search_interactive` endpoint so a fast typist always
-/// sees the answer to their latest keystroke rather than a queued stale one.
+/// Redraws the query line and its current results as the user types, using
+/// the daemon's pipelined `search_interactive` endpoint so a fast typist
+/// always sees the answer to their latest keystroke rather than a queued
+/// stale one. Each round of the outer loop blocks for one keystroke, then
+/// drains any more that have already landed in the console's input buffer
+/// (typed while the previous search was still in flight) into the same
+/// pattern edit before searching again and echoes the pattern immediately,
+/// before the round trip — a slow search must never stall the on-screen
+/// text, only how soon the result list underneath it catches up.
 fn run_interactive(
     client: &mut Client,
     explicit_kind: Option<QueryKind>,
@@ -82,23 +88,44 @@ fn run_interactive(
     let mut results = fetch(client, explicit_kind, &pattern)?;
     render(&pattern, &results);
 
-    while let Some(unit) = raw.read_char() {
-        match unit {
-            0x03 | 0x1B => break, // Ctrl+C / Escape: quit without printing
-            0x0D | 0x0A => break, // Enter: stop editing, print current results below
-            0x08 | 0x7F => {
-                pattern.pop();
-            }
-            _ => {
-                if let Some(Ok(ch)) = char::decode_utf16([unit]).next() {
-                    if !ch.is_control() {
-                        pattern.push(ch);
+    'outer: loop {
+        let mut edited = false;
+        let mut submit = false;
+        loop {
+            let Some(unit) = raw.read_char() else {
+                break 'outer;
+            };
+            match unit {
+                0x03 | 0x1B => break 'outer, // Ctrl+C / Escape: quit without printing
+                0x0D | 0x0A => {
+                    submit = true; // Enter: stop editing, print current results below
+                    break;
+                }
+                0x08 | 0x7F => {
+                    pattern.pop();
+                    edited = true;
+                }
+                _ => {
+                    if let Some(Ok(ch)) = char::decode_utf16([unit]).next() {
+                        if !ch.is_control() {
+                            pattern.push(ch);
+                            edited = true;
+                        }
                     }
                 }
             }
+            if !raw.has_pending_input() {
+                break;
+            }
         }
-        results = fetch(client, explicit_kind, &pattern)?;
-        render(&pattern, &results);
+        if edited {
+            render(&pattern, &results);
+            results = fetch(client, explicit_kind, &pattern)?;
+            render(&pattern, &results);
+        }
+        if submit {
+            break;
+        }
     }
     drop(raw);
 
