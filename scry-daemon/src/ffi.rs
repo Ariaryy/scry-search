@@ -27,6 +27,19 @@ pub const MEMORY_PRIORITY_LOW: Dword = 2;
 pub const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
 pub const THREAD_MODE_BACKGROUND_END: i32 = 0x0002_0000;
 
+/// Console control signals delivered to a `HandlerRoutine` registered via
+/// `SetConsoleCtrlHandler`. `CLOSE`/`LOGOFF`/`SHUTDOWN` are the ones that
+/// matter for persistence: the process is going away regardless of what the
+/// handler returns, so the handler's job is to finish writing before that
+/// happens, not to veto it.
+pub const CTRL_C_EVENT: Dword = 0;
+pub const CTRL_BREAK_EVENT: Dword = 1;
+pub const CTRL_CLOSE_EVENT: Dword = 2;
+pub const CTRL_LOGOFF_EVENT: Dword = 5;
+pub const CTRL_SHUTDOWN_EVENT: Dword = 6;
+
+pub type HandlerRoutine = extern "system" fn(Dword) -> Bool;
+
 #[repr(C)]
 pub struct ProcessPowerThrottlingState {
     pub version: Dword,
@@ -73,6 +86,7 @@ extern "system" {
         maximum_working_set_size: usize,
         flags: Dword,
     ) -> Bool;
+    pub fn SetConsoleCtrlHandler(handler: HandlerRoutine, add: Bool) -> Bool;
 }
 
 extern "C" {

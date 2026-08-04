@@ -63,7 +63,11 @@
   reference C: measurement reported 4,220 such lists, 1,540 unresolved base
   records, and a stable 1,555–1,564 USN-only residual versus 18–25 raw-only
   entries. This is a systematic coverage gap, not live-volume churn.
-- **Single volume per daemon instance**, chosen via argv. No multi-volume aggregation yet.
+- **One daemon indexes every accessible fixed NTFS volume**, or the volumes named on argv.
+  Each volume gets its own `IndexView`, watcher, and snapshot; queries fan out and merge
+  through the same bounded top-k heap used within a single volume. Initial indexing is
+  serialized across volumes to bound peak RSS and disk load; steady-state watching is
+  concurrent. Peak-RSS and idle-reindex measurements across volumes are still outstanding.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust
   consumers would need a `cdylib` shim over `scry-ipc`'s framing.
 - **`daemon-release` Cargo profile exists but isn't wired to any build script** — `scryd` currently

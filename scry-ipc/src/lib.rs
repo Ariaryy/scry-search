@@ -19,9 +19,43 @@ pub const PIPE_NAME: &str = r"\\.\pipe\scry";
 pub struct Pipe(ffi::Handle);
 
 // Safety: Win32 HANDLEs are safe to transfer between threads (there's no
-// thread-affinity for file/pipe handles), and Pipe never allows concurrent
-// access from multiple threads at once — each connection is single-owner.
+// thread-affinity for file/pipe handles). `Pipe` is also `Sync`, but only
+// `pending_bytes` is safe to call concurrently with another thread's
+// `read_frame`/`write_frame`: on a synchronous (non-overlapped) handle, the
+// kernel serializes a thread's blocking `ReadFile` against another thread's
+// `WriteFile` on the same handle through the file object's synchronous-I/O
+// event, and if the read is blocked waiting for bytes the write itself needs
+// to unblock (the read/respond cycle this crate implements), the two calls
+// deadlock. `PeekNamedPipe` is a non-blocking query, not a positional I/O
+// op, so it never joins that queue — that's what lets one thread do the
+// blocking read+write cycle while another polls `pending_bytes` for a
+// signal that a new request already arrived.
 unsafe impl Send for Pipe {}
+unsafe impl Sync for Pipe {}
+
+impl Pipe {
+    /// Non-blocking check for unread bytes already sitting in the pipe's
+    /// receive buffer — see the `Sync` safety note above for why this, and
+    /// not a second `read_frame`, is the only concurrency-safe way to detect
+    /// a newer request without blocking the response for the current one.
+    pub fn pending_bytes(&self) -> io::Result<u32> {
+        let mut avail: u32 = 0;
+        let ok = unsafe {
+            ffi::PeekNamedPipe(
+                self.0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(avail)
+    }
+}
 
 impl Pipe {
     pub fn client_process_id(&self) -> io::Result<u32> {

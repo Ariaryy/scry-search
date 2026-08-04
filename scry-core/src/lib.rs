@@ -1,6 +1,7 @@
 pub mod arena;
 pub mod ascii;
 pub mod bitvec;
+pub mod cancel;
 pub mod delta;
 pub mod frnmap;
 mod literals;
@@ -17,6 +18,7 @@ pub mod view;
 mod tests;
 
 pub use arena::{ArchivedArena, Arena, ArenaBuilder};
+pub use cancel::Cancellation;
 pub use frnmap::FrnEntry;
 pub use protocol::{QueryKind, Request, ResultEntry};
 pub use query::Query;

@@ -71,6 +71,15 @@ extern "system" {
 
     pub fn CloseHandle(h_object: Handle) -> Bool;
 
+    pub fn PeekNamedPipe(
+        h_named_pipe: Handle,
+        lp_buffer: *mut c_void,
+        n_buffer_size: Dword,
+        lp_bytes_read: *mut Dword,
+        lp_total_bytes_avail: *mut Dword,
+        lp_bytes_left_this_message: *mut Dword,
+    ) -> Bool;
+
     pub fn WaitNamedPipeW(lp_named_pipe_name: *const u16, n_time_out: Dword) -> Bool;
     pub fn CreateFileMappingW(
         h_file: Handle,

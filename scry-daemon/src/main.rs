@@ -47,6 +47,40 @@ struct StartupView {
 
 type VolumeIndexes = Arc<Vec<VolumeIndex>>;
 
+/// Read by `handle_console_ctrl`, which — being a plain Win32 callback — has
+/// no way to receive the indexes as an argument. Set once at startup, never
+/// mutated after.
+static SHUTDOWN_STATE: std::sync::OnceLock<(VolumeIndexes, bool)> = std::sync::OnceLock::new();
+
+/// Persists every volume's index before the process goes away. Registered
+/// via `SetConsoleCtrlHandler` so a console close, logoff, shutdown, or
+/// Ctrl+C loses at most the work since the last idle/compaction write instead
+/// of everything since the last snapshot. `CLOSE`/`LOGOFF`/`SHUTDOWN` kill the
+/// process regardless of the return value, so this exits explicitly rather
+/// than returning and hoping the default handler waits for us.
+extern "system" fn handle_console_ctrl(ctrl_type: ffi::Dword) -> ffi::Bool {
+    if !is_shutdown_signal(ctrl_type) {
+        return 0;
+    }
+    if let Some((indexes, auxiliary_marking_enabled)) = SHUTDOWN_STATE.get() {
+        for index in indexes.iter() {
+            persist_idle_view(&index.store, &index.volume, *auxiliary_marking_enabled);
+        }
+    }
+    std::process::exit(0);
+}
+
+fn is_shutdown_signal(ctrl_type: ffi::Dword) -> bool {
+    matches!(
+        ctrl_type,
+        ffi::CTRL_C_EVENT
+            | ffi::CTRL_BREAK_EVENT
+            | ffi::CTRL_CLOSE_EVENT
+            | ffi::CTRL_LOGOFF_EVENT
+            | ffi::CTRL_SHUTDOWN_EVENT
+    )
+}
+
 struct StartupOptions {
     volumes: Vec<String>,
     index_mbps: Option<u64>,
@@ -147,6 +181,18 @@ fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("could not index any requested volume"));
     }
     let indexes: VolumeIndexes = Arc::new(indexed);
+    let _ = SHUTDOWN_STATE.set((indexes.clone(), auxiliary_marking_enabled));
+    // SAFETY: `handle_console_ctrl` matches `HandlerRoutine`'s signature and
+    // reads only `SHUTDOWN_STATE`, which is set above and never mutated again.
+    unsafe {
+        if ffi::SetConsoleCtrlHandler(handle_console_ctrl, 1) == 0 {
+            eprintln!(
+                "scryd: could not register console control handler (win32 error {}); \
+                 clean-shutdown persistence disabled",
+                ffi::GetLastError()
+            );
+        }
+    }
     for index in indexes.iter().skip(1) {
         spawn_volume_watcher(
             index.volume.clone(),
@@ -324,6 +370,15 @@ fn build_or_resume_view(
     }
 }
 
+/// Shared by warm-launch replay and by the live reindex loop: once accrued
+/// change events exceed 5% of the base, a streaming compaction is cheaper
+/// than the delta staying live indefinitely. At startup, exceeding it also
+/// means the gap since the snapshot was written is wide enough that a fresh
+/// enumeration is more trustworthy than a long replay.
+fn replay_exceeds_compaction_threshold(event_count: usize, base_len: usize) -> bool {
+    event_count.saturating_mul(20) > base_len
+}
+
 fn resume_view(
     volume: &str,
     auxiliary_marking_enabled: bool,
@@ -345,7 +400,7 @@ fn resume_view(
     };
     let (cursor, events) = scry_fsevents::WindowsBackend::replay_journal(volume, stored)
         .map_err(|error| anyhow::anyhow!("cannot replay snapshot: {error}"))?;
-    if events.len().saturating_mul(20) > archived.len() {
+    if replay_exceeds_compaction_threshold(events.len(), archived.len()) {
         return Err(anyhow::anyhow!("replay exceeds the compaction threshold"));
     }
 
@@ -630,7 +685,7 @@ fn reindex_on_changes(
                 volume_serial: view.volume_serial,
             });
             let changes = next.delta.tombstones.count_ones() as usize + next.delta.added.len();
-            if changes.saturating_mul(20) > next.base.archived().len() {
+            if replay_exceeds_compaction_threshold(changes, next.base.archived().len()) {
                 match compact_view(&next, &volume, auxiliary_marking_enabled) {
                     Ok(compacted) => {
                         let len = compacted.len();
@@ -714,66 +769,131 @@ fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
     }
 }
 
+/// A connection does its read/search/write cycle on one thread — the pipe's
+/// synchronous handle deadlocks if a blocking read on one thread and a
+/// blocking write on another are both in flight at once (see the `Sync`
+/// safety note on `scry_ipc::Pipe`) — while a second, poll-only thread bumps
+/// `generation` whenever it sees unread bytes already sitting in the pipe.
+/// That's the cancellation signal an in-flight search checks periodically
+/// (via `Cancellation`) to abandon a stale scan once a newer request has
+/// already arrived, while this thread still writes exactly one response
+/// frame per request, so framing stays 1:1 even for a superseded (empty)
+/// result.
 fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::Result<()> {
-    loop {
-        let req_bytes = match pipe.read_frame() {
-            Ok(b) => b,
-            Err(_) => return Ok(()), // client disconnected
-        };
-        let Some(req) = decode_request(&req_bytes) else {
-            continue;
-        };
+    let pipe = Arc::new(pipe);
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // `load_full` clones the Arc, keeping this index alive for the whole
-        // query even if the reindex thread swaps in a new one mid-search.
-        if req.kind == QueryKind::ShareIndex && indexes.len() != 1 {
-            pipe.write_frame(&encode_results(&[]))?;
-            continue;
+    let peek_pipe = Arc::clone(&pipe);
+    let peek_generation = Arc::clone(&generation);
+    let peek_stop = Arc::clone(&stop);
+    let peeker = std::thread::spawn(move || {
+        while !peek_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match peek_pipe.pending_bytes() {
+                Ok(0) => {}
+                Ok(_) => {
+                    peek_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => return, // client disconnected
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let snapshot = indexes[0].store.load_full();
-        if req.kind == QueryKind::ShareIndex {
-            if req.pattern.parse::<u64>().ok() == Some(snapshot.generation) {
-                pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
-                    handle: 0,
-                    len: 0,
-                    generation: snapshot.generation,
-                    overlay: Vec::new(),
-                }))?;
+    });
+
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            let req_bytes = match pipe.read_frame() {
+                Ok(b) => b,
+                Err(_) => return Ok(()), // client disconnected
+            };
+            let Some(req) = decode_request(&req_bytes) else {
                 continue;
-            }
-            let section = shared_section(&snapshot)?;
-            let handle = section.duplicate_for(pipe.client_process_id()?)?;
-            pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
-                handle,
-                len: section.len() as u64,
-                generation: snapshot.generation,
-                overlay: snapshot.delta.encode_query_overlay(),
-            }))?;
-            continue;
+            };
+            let gen = generation.load(std::sync::atomic::Ordering::Relaxed);
+            let cancel = scry_core::Cancellation::new(&generation, gen);
+            let response = handle_request(&req, indexes, &pipe, cancel)?;
+            pipe.write_frame(&response)?;
         }
-        let query = match req.kind {
-            QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
-            QueryKind::Substring => Query::Substring(req.pattern.clone()),
-            QueryKind::Wildcard => Query::wildcard(&req.pattern),
-            QueryKind::PathTerms => {
-                Query::PathTerms(scry_core::terms::parse_terms(&req.pattern).unwrap_or_default())
-            }
-            QueryKind::ShareIndex => unreachable!(),
-        };
-        let entries = search_indexes(indexes, &query, req.limit as usize);
-
-        pipe.write_frame(&encode_results(&entries))?;
-    }
+    })();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = peeker.join();
+    result
 }
 
-fn search_indexes(indexes: &VolumeIndexes, query: &Query, limit: usize) -> Vec<ResultEntry> {
-    if limit == 0 {
+/// Builds the response frame for one request. Returns an empty results frame
+/// for a search request that `cancel` reports as superseded before or during
+/// the scan; `ShareIndex` requests are never cancellable (they're answered
+/// from an already-published snapshot, not a scan).
+fn handle_request(
+    req: &scry_core::protocol::Request,
+    indexes: &VolumeIndexes,
+    pipe: &scry_ipc::Pipe,
+    cancel: scry_core::Cancellation,
+) -> std::io::Result<Vec<u8>> {
+    // `load_full` clones the Arc, keeping this index alive for the whole
+    // query even if the reindex thread swaps in a new one mid-search.
+    if req.kind == QueryKind::ShareIndex && indexes.len() != 1 {
+        return Ok(encode_results(&[]));
+    }
+    if req.kind == QueryKind::ShareIndex {
+        let snapshot = indexes[0].store.load_full();
+        if req.pattern.parse::<u64>().ok() == Some(snapshot.generation) {
+            return Ok(encode_shared_index(&SharedIndexResponse {
+                handle: 0,
+                len: 0,
+                generation: snapshot.generation,
+                overlay: Vec::new(),
+            }));
+        }
+        let section = shared_section(&snapshot)?;
+        let handle = section.duplicate_for(pipe.client_process_id()?)?;
+        return Ok(encode_shared_index(&SharedIndexResponse {
+            handle,
+            len: section.len() as u64,
+            generation: snapshot.generation,
+            overlay: snapshot.delta.encode_query_overlay(),
+        }));
+    }
+    let query = match req.kind {
+        QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
+        QueryKind::Substring => Query::Substring(req.pattern.clone()),
+        QueryKind::Wildcard => Query::wildcard(&req.pattern),
+        QueryKind::PathTerms => {
+            Query::PathTerms(scry_core::terms::parse_terms(&req.pattern).unwrap_or_default())
+        }
+        QueryKind::ShareIndex => unreachable!(),
+    };
+    let entries = search_indexes_cancellable(indexes, &query, req.limit as usize, cancel);
+    Ok(encode_results(&entries))
+}
+
+/// Fans a query out across every volume's index and merges by rank, in one
+/// bounded top-k pass per volume. Abandons the fan-out (returning an empty
+/// result) once `cancel` reports this request was superseded.
+fn search_indexes_cancellable(
+    indexes: &VolumeIndexes,
+    query: &Query,
+    limit: usize,
+    cancel: scry_core::Cancellation,
+) -> Vec<ResultEntry> {
+    if limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
-    let mut entries: Vec<_> = indexes
-        .iter()
-        .flat_map(|index| index.store.load_full().search(query, limit))
-        .collect();
+    let mut entries = Vec::new();
+    for index in indexes.iter() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        entries.extend(
+            index
+                .store
+                .load_full()
+                .search_cancellable(query, limit, Some(cancel)),
+        );
+    }
+    if cancel.is_cancelled() {
+        return Vec::new();
+    }
     entries.sort_by(|left, right| {
         result_rank(query, left)
             .cmp(&result_rank(query, right))
@@ -876,6 +996,82 @@ mod tests {
         drop(client);
         thread.join().unwrap();
     }
+    #[test]
+    fn cancelled_request_returns_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_store_with_n_records(200, &dir);
+        let indexes = Arc::new(vec![VolumeIndex {
+            volume: "C:".to_string(),
+            store: Arc::new(arc_swap::ArcSwap::from(view)),
+            cursor: None,
+        }]);
+        let generation = std::sync::atomic::AtomicU64::new(1);
+        let cancel = scry_core::Cancellation::new(&generation, 0); // stale: expects 0, generation is 1
+        let entries =
+            search_indexes_cancellable(&indexes, &Query::Substring("file".into()), 50, cancel);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn two_pipelined_requests_produce_exactly_two_response_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_store_with_n_records(200, &dir);
+        let expected = view.search(&Query::Substring("file".into()), 50);
+        let indexes = Arc::new(vec![VolumeIndex {
+            volume: "C:".to_string(),
+            store: Arc::new(arc_swap::ArcSwap::from(view)),
+            cursor: None,
+        }]);
+        let pipe_name = format!(
+            r"\\.\pipe\scry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let server_indexes = indexes.clone();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            handle_connection(pipe, &server_indexes).unwrap();
+        });
+        let client = (0..100)
+            .find_map(|_| {
+                scry_ipc::connect_client(&pipe_name).ok().or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    None
+                })
+            })
+            .expect("test pipe did not become ready");
+
+        let request = scry_core::protocol::Request {
+            kind: QueryKind::Substring,
+            pattern: "file".to_string(),
+            limit: 50,
+        };
+        // Both requests are written before either response is read, so the
+        // daemon's peek thread should see the second one arrive while (or
+        // before) the first is still being handled — but whether it actually
+        // supersedes the first is a timing race, not something this test can
+        // assert on. What must always hold is the framing invariant: exactly
+        // one response frame per request, in request order.
+        client
+            .write_frame(&scry_core::protocol::encode_request(&request))
+            .unwrap();
+        client
+            .write_frame(&scry_core::protocol::encode_request(&request))
+            .unwrap();
+
+        let first = scry_core::protocol::decode_results(&client.read_frame().unwrap()).unwrap();
+        let second = scry_core::protocol::decode_results(&client.read_frame().unwrap()).unwrap();
+        assert!(first.is_empty() || first == expected);
+        assert_eq!(second, expected);
+
+        drop(client);
+        thread.join().unwrap();
+    }
+
     use scry_core::{store::save, Arena};
     use scry_fsevents::ChangeEvent;
 
@@ -942,6 +1138,27 @@ mod tests {
         let path = snapshot_path("C:");
         assert_eq!(path.file_name().unwrap(), "index-C.rkyv");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "scry");
+    }
+
+    #[test]
+    fn replay_threshold_matches_the_compaction_threshold() {
+        assert!(!replay_exceeds_compaction_threshold(5, 100));
+        assert!(replay_exceeds_compaction_threshold(6, 100));
+    }
+
+    /// The console handler exits the process, so only the classification is
+    /// tested directly. `CTRL_C`/`BREAK`/`CLOSE`/`LOGOFF`/`SHUTDOWN` are the
+    /// signals that mean the process is going away; anything else (Windows
+    /// reserves the range for future use) must not trigger a shutdown write.
+    #[test]
+    fn only_termination_signals_are_treated_as_shutdown() {
+        assert!(is_shutdown_signal(ffi::CTRL_C_EVENT));
+        assert!(is_shutdown_signal(ffi::CTRL_BREAK_EVENT));
+        assert!(is_shutdown_signal(ffi::CTRL_CLOSE_EVENT));
+        assert!(is_shutdown_signal(ffi::CTRL_LOGOFF_EVENT));
+        assert!(is_shutdown_signal(ffi::CTRL_SHUTDOWN_EVENT));
+        assert!(!is_shutdown_signal(3));
+        assert!(!is_shutdown_signal(4));
     }
 
     /// Struct sizes must match their Win32 counterparts exactly — a mismatch

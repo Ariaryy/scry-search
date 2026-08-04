@@ -5,9 +5,11 @@ use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
 use crate::ascii;
+use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
 use crate::pathindex::{PathClosureScratch, PathIndex};
 use crate::protocol::ResultEntry;
+use crate::query::is_cancelled_periodically;
 use crate::query::{search_base, Query};
 use crate::store::ArenaStore;
 use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
@@ -355,6 +357,7 @@ mod tests {
             usize::MAX,
             &mut PathSearchScratch::default(),
             true,
+            None,
         );
         let full = search_path_terms_with_scratch(
             view.base.archived(),
@@ -364,6 +367,7 @@ mod tests {
             usize::MAX,
             &mut PathSearchScratch::default(),
             false,
+            None,
         );
 
         assert_eq!(filtered, full);
@@ -387,6 +391,7 @@ mod tests {
             10,
             &mut scratch,
             true,
+            None,
         );
         assert_eq!(absent.len(), 10);
 
@@ -398,6 +403,7 @@ mod tests {
             10,
             &mut scratch,
             true,
+            None,
         );
         assert!(results.is_empty());
         assert!(scratch
@@ -466,6 +472,7 @@ mod tests {
                 50,
                 scratch,
                 filtered,
+                None,
             );
             (start.elapsed(), results)
         };
@@ -526,16 +533,30 @@ impl IndexView {
     /// creation order. The combined result is intentionally not globally
     /// sorted while the overlay remains uncompacted.
     pub fn search(&self, query: &Query, limit: usize) -> Vec<ResultEntry> {
+        self.search_cancellable(query, limit, None)
+    }
+
+    /// As `search`, but abandons the scan (returning an empty result) once
+    /// `cancel` reports a newer request superseded this one on the same
+    /// connection. `cancel` is `None` for a one-shot caller, which reduces to
+    /// plain `search`.
+    pub fn search_cancellable(
+        &self,
+        query: &Query,
+        limit: usize,
+        cancel: Option<Cancellation>,
+    ) -> Vec<ResultEntry> {
         if let Query::PathTerms(terms) = query {
-            return search_path_terms(
+            return search_path_terms_cancellable(
                 self.base.archived(),
                 &self.delta,
                 &self.path_index,
                 terms,
                 limit,
+                cancel,
             );
         }
-        search_ranked(self.base.archived(), &self.delta, query, limit)
+        search_ranked_cancellable(self.base.archived(), &self.delta, query, limit, cancel)
     }
 
     pub fn delta_path(&self, mut index: u32) -> String {
@@ -831,12 +852,29 @@ fn search_ranked(
     query: &Query,
     limit: usize,
 ) -> Vec<ResultEntry> {
+    search_ranked_cancellable(arena, delta, query, limit, None)
+}
+
+fn search_ranked_cancellable(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    query: &Query,
+    limit: usize,
+    cancel: Option<Cancellation>,
+) -> Vec<ResultEntry> {
     if limit == 0 {
         return Vec::new();
     }
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return Vec::new();
+    }
+    let base_hits = match cancel {
+        Some(cancel) => crate::query::search_base_cancellable(arena, query, usize::MAX, cancel),
+        None => search_base(arena, query, usize::MAX),
+    };
     let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut name = Vec::new();
-    for index in search_base(arena, query, usize::MAX) {
+    for index in base_hits {
         if delta.tombstones.get(index) {
             continue;
         }
@@ -921,6 +959,17 @@ pub fn search_path_terms(
     terms: &[String],
     limit: usize,
 ) -> Vec<ResultEntry> {
+    search_path_terms_cancellable(arena, delta, path_index, terms, limit, None)
+}
+
+fn search_path_terms_cancellable(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    path_index: &PathIndex,
+    terms: &[String],
+    limit: usize,
+    cancel: Option<Cancellation>,
+) -> Vec<ResultEntry> {
     PATH_SEARCH_SCRATCH.with(|scratch| {
         search_path_terms_with_scratch(
             arena,
@@ -930,10 +979,12 @@ pub fn search_path_terms(
             limit,
             &mut scratch.borrow_mut(),
             true,
+            cancel,
         )
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_path_terms_with_scratch(
     arena: &crate::ArchivedArena,
     delta: &Delta,
@@ -942,8 +993,12 @@ fn search_path_terms_with_scratch(
     limit: usize,
     scratch: &mut PathSearchScratch,
     use_filter: bool,
+    cancel: Option<Cancellation>,
 ) -> Vec<ResultEntry> {
     if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS || limit == 0 {
+        return Vec::new();
+    }
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return Vec::new();
     }
     scratch.reset(path_index.directory_count(), limit);
@@ -980,14 +1035,19 @@ fn search_path_terms_with_scratch(
                 .extend_from_slice(&scratch.term_blocks);
         }
     }
+    let mut checked: u32 = 0;
+    let mut cancelled = false;
     if filtered {
         scratch.candidate_blocks.sort_unstable();
         scratch.candidate_blocks.dedup();
-        for block_index in 0..scratch.candidate_blocks.len() {
+        'blocks: for block_index in 0..scratch.candidate_blocks.len() {
             let block = scratch.candidate_blocks[block_index];
             let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
             let end = start.saturating_add(crate::trigram::TRIGRAM_BLOCK as u32);
             arena.for_each_name_in(start..end, |record, name| {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    return std::ops::ControlFlow::Break(());
+                }
                 if !delta.tombstones.get(record) {
                     let mask = mask_for(name);
                     if mask != 0 {
@@ -999,9 +1059,16 @@ fn search_path_terms_with_scratch(
                 }
                 std::ops::ControlFlow::Continue(())
             });
+            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                cancelled = true;
+                break 'blocks;
+            }
         }
     } else {
         arena.for_each_name(|record, name| {
+            if is_cancelled_periodically(cancel, &mut checked) {
+                return std::ops::ControlFlow::Break(());
+            }
             if !delta.tombstones.get(record) {
                 let mask = mask_for(name);
                 if mask != 0 {
@@ -1013,6 +1080,10 @@ fn search_path_terms_with_scratch(
             }
             std::ops::ControlFlow::Continue(())
         });
+        cancelled = cancel.is_some_and(|cancel| cancel.is_cancelled());
+    }
+    if cancelled {
+        return Vec::new();
     }
     for (index, record) in delta.added.iter().enumerate() {
         if !record.live {
@@ -1048,7 +1119,11 @@ fn search_path_terms_with_scratch(
         (1u16 << terms.len()) - 1
     };
     let mut hit_position = 0usize;
+    let mut checked: u32 = 0;
     for record in 0..path_index.records() as u32 {
+        if is_cancelled_periodically(cancel, &mut checked) {
+            return Vec::new();
+        }
         let live = if record < arena.len() as u32 {
             !delta.tombstones.get(record)
         } else {

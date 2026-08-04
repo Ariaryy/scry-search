@@ -1,4 +1,5 @@
 use crate::arena::ArchivedArena;
+use crate::cancel::{Cancellation, CHECK_INTERVAL};
 use crate::literals::required_literals;
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -39,6 +40,28 @@ impl Query {
 /// lazily via `ArchivedArena::full_path`, and only for the slice they actually
 /// send over IPC (streaming, not materializing the whole result set).
 pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
+    search_base_impl(arena, query, limit, None)
+}
+
+/// As `search_base`, but abandons the scan (returning an empty result) once
+/// `cancel` reports a newer request superseded this one. Used only by the
+/// daemon's interactive query path — a one-shot caller has nothing that could
+/// supersede it, so it always uses the plain `search_base` above.
+pub(crate) fn search_base_cancellable(
+    arena: &ArchivedArena,
+    query: &Query,
+    limit: usize,
+    cancel: Cancellation,
+) -> Vec<u32> {
+    search_base_impl(arena, query, limit, Some(cancel))
+}
+
+fn search_base_impl(
+    arena: &ArchivedArena,
+    query: &Query,
+    limit: usize,
+    cancel: Option<Cancellation>,
+) -> Vec<u32> {
     match query {
         Query::Prefix(prefix) => {
             let range = arena.prefix_range(prefix);
@@ -48,9 +71,16 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
             let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
             let finder = memchr::memmem::Finder::new(&needle_lower);
             let mut results = Vec::new();
-            let mut scratch = Vec::new();
             let stopped = std::cell::Cell::new(false);
+            let cancelled = std::cell::Cell::new(false);
+            let mut scratch = Vec::new();
+            let mut checked: u32 = 0;
             let mut visit = |idx, name: &[u8]| {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    cancelled.set(true);
+                    stopped.set(true);
+                    return std::ops::ControlFlow::Break(());
+                }
                 scratch.clear();
                 scratch.extend(name.iter().map(|b| b.to_ascii_lowercase()));
                 if finder.find(&scratch).is_some() {
@@ -76,6 +106,9 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
                     }
                 }
             }
+            if cancelled.get() {
+                return Vec::new();
+            }
             results
         }
         Query::Regex(pattern) => {
@@ -88,7 +121,14 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
             };
             let mut results = Vec::new();
             let stopped = std::cell::Cell::new(false);
+            let cancelled = std::cell::Cell::new(false);
+            let mut checked: u32 = 0;
             let mut visit = |idx, name: &[u8]| {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    cancelled.set(true);
+                    stopped.set(true);
+                    return std::ops::ControlFlow::Break(());
+                }
                 if re.is_match(name) {
                     results.push(idx);
                     if results.len() >= limit {
@@ -114,10 +154,25 @@ pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u3
                     }
                 }
             }
+            if cancelled.get() {
+                return Vec::new();
+            }
             results
         }
         Query::PathTerms(_) => Vec::new(),
     }
+}
+
+/// Advances `checked` and, once every `CHECK_INTERVAL` calls, reports whether
+/// `cancel` has been superseded. Cheap in the common (non-cancellable) case:
+/// `cancel` is `None` for every one-shot caller, so this is a single branch.
+#[inline]
+pub(crate) fn is_cancelled_periodically(cancel: Option<Cancellation>, checked: &mut u32) -> bool {
+    let Some(cancel) = cancel else {
+        return false;
+    };
+    *checked = checked.wrapping_add(1);
+    (*checked).is_multiple_of(CHECK_INTERVAL) && cancel.is_cancelled()
 }
 
 #[cfg(test)]
