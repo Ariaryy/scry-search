@@ -956,6 +956,20 @@ fn search_indexes_with_cache(
         cache.per_volume.resize_with(indexes.len(), || None);
     }
 
+    // Overscanning to `REFINEMENT_CACHE_CAP` only pays for itself if a later
+    // keystroke actually filters the result, and every hit it collects beyond
+    // `limit` costs a `full_path` reconstruction (~3 µs) plus a `String`. A
+    // one-shot `scry <query>` opens a connection, asks once and exits, so it
+    // would pay that for nothing. Widen only once this connection has already
+    // served a refinable query — that is what an as-you-type session looks
+    // like, and it is the only case where the cache can be read back.
+    let seen_refinable_query = cache.kind.is_some();
+    let scan_limit = if seen_refinable_query {
+        REFINEMENT_CACHE_CAP
+    } else {
+        limit
+    };
+
     let mut merged = Vec::new();
     let mut next_per_volume = Vec::with_capacity(indexes.len());
     for (i, index) in indexes.iter().enumerate() {
@@ -975,36 +989,28 @@ fn search_indexes_with_cache(
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            view.search_cancellable_pooled(
-                query,
-                REFINEMENT_CACHE_CAP,
-                Some(cancel),
-                query_thread_count(),
-            )
+            view.search_cancellable_pooled(query, scan_limit, Some(cancel), query_thread_count())
         };
         if cancel.is_cancelled() {
             return Vec::new();
         }
         merged.extend(candidates.iter().cloned());
-        next_per_volume.push(if candidates.len() < REFINEMENT_CACHE_CAP {
-            Some(VolumeCandidates {
-                generation: view.generation,
-                candidates,
-            })
-        } else {
-            None
-        });
+        // Only a set scanned at the full cap is known to be a superset of what
+        // a refined query could match. A set truncated at `limit` is not, and
+        // caching it would let a later keystroke miss real hits.
+        next_per_volume.push(
+            (scan_limit == REFINEMENT_CACHE_CAP && candidates.len() < REFINEMENT_CACHE_CAP)
+                .then(|| VolumeCandidates {
+                    generation: view.generation,
+                    candidates,
+                }),
+        );
     }
     cache.kind = Some(kind);
     cache.terms = new_terms;
     cache.per_volume = next_per_volume;
 
-    merged.sort_by(|left, right| {
-        result_rank(query, left)
-            .cmp(&result_rank(query, right))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    merged.truncate(limit);
+    rank_sort_truncate(query, &mut merged, limit);
     merged
 }
 
@@ -1136,13 +1142,42 @@ fn search_indexes_cancellable(
     if cancel.is_cancelled() {
         return Vec::new();
     }
-    entries.sort_by(|left, right| {
-        result_rank(query, left)
-            .cmp(&result_rank(query, right))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    entries.truncate(limit);
+    rank_sort_truncate(query, &mut entries, limit);
     entries
+}
+
+/// Orders merged cross-volume results by rank and keeps the best `limit`.
+///
+/// `result_rank` is not free — for `PathTerms` it is a naive substring scan
+/// per term over the leaf name — so it is computed exactly once per entry
+/// here, into a permutation that is sorted instead of the entries themselves.
+/// Passing it to `sort_by` directly, as this used to, re-derived both operands
+/// on every one of the O(n log n) comparisons.
+fn rank_sort_truncate(query: &Query, entries: &mut Vec<ResultEntry>, limit: usize) {
+    if entries.len() <= 1 {
+        entries.truncate(limit);
+        return;
+    }
+    let mut order: Vec<((u8, usize), u32)> = entries
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (result_rank(query, entry), position as u32))
+        .collect();
+    // Path is the tiebreak rather than the scan order the entries arrived in,
+    // so that a result set is stable across a reindex that renumbers records.
+    order.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| entries[left.1 as usize].path.cmp(&entries[right.1 as usize].path))
+    });
+    order.truncate(limit);
+
+    let mut taken: Vec<Option<ResultEntry>> = entries.drain(..).map(Some).collect();
+    entries.extend(order.into_iter().map(|(_, position)| {
+        taken[position as usize]
+            .take()
+            .expect("each position appears exactly once in the permutation")
+    }));
 }
 
 fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
@@ -1440,6 +1475,85 @@ mod tests {
         );
         assert_eq!(actual, expected);
         assert_eq!(cache.kind, Some(QueryKind::Substring));
+    }
+
+    /// A one-shot `scry <query>` asks its connection exactly one question and
+    /// exits, so overscanning to `REFINEMENT_CACHE_CAP` on that first query
+    /// buys nothing and costs a `full_path` reconstruction per surplus hit.
+    /// The wide scan must therefore start only once a connection has shown it
+    /// is an as-you-type session by asking a second refinable question.
+    #[test]
+    fn first_query_on_a_connection_does_not_overscan_for_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_refinement_store(&dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let mut cache = RefinementCache::default();
+
+        search_indexes_with_cache(
+            &indexes,
+            QueryKind::Substring,
+            &Query::Substring("re".to_string()),
+            5,
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+        );
+        assert!(
+            cache.per_volume.iter().all(Option::is_none),
+            "a set truncated at the caller's limit is not a superset of what a \
+             refined query could match, so it must not be cached"
+        );
+
+        search_indexes_with_cache(
+            &indexes,
+            QueryKind::Substring,
+            &Query::Substring("res".to_string()),
+            5,
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+        );
+        assert!(
+            cache.per_volume.iter().all(Option::is_some),
+            "the second refinable query on a connection should scan wide and cache"
+        );
+    }
+
+    /// `rank_sort_truncate` replaced a `sort_by` that re-derived `result_rank`
+    /// on every comparison. Ordering must be byte-for-byte what that
+    /// comparator produced, including the path tiebreak between equal ranks.
+    #[test]
+    fn rank_sort_truncate_matches_the_naive_comparator() {
+        let query = Query::Substring("report".to_string());
+        let entries: Vec<ResultEntry> = [
+            r"C:\b\report.txt",
+            r"C:\a\report.txt",
+            r"C:\a\reportage_long_name.txt",
+            r"C:\a\report",
+            r"C:\z\summary_report.txt",
+            r"C:\a\summary_report.txt",
+        ]
+        .iter()
+        .map(|path| ResultEntry {
+            path: (*path).to_string(),
+            size: 0,
+            is_dir: false,
+        })
+        .collect();
+
+        let mut expected = entries.clone();
+        expected.sort_by(|left, right| {
+            result_rank(&query, left)
+                .cmp(&result_rank(&query, right))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        for limit in 0..=entries.len() + 1 {
+            let mut actual = entries.clone();
+            rank_sort_truncate(&query, &mut actual, limit);
+            let mut want = expected.clone();
+            want.truncate(limit);
+            assert_eq!(actual, want, "limit {limit}");
+        }
     }
 
     use scry_core::{store::save, Arena};

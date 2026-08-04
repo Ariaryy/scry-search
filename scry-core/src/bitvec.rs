@@ -1,12 +1,19 @@
 //! Borrowed rank/select over an LSB-first bitmap.
 //!
-//! Rank samples store cumulative popcounts every 16 bits, bounding a rank
-//! query to one byte popcount. Select uses binary search over
-//! positions backed by rank. A larger select-sampling index could make select
+//! Rank samples store cumulative popcounts every 256 bits, bounding a rank
+//! query to four `u64` popcounts. Select uses binary search over positions
+//! backed by rank. A larger select-sampling index could make select
 //! constant-time, but would spend persistent space to save nanoseconds on
 //! operations that occur only while walking a tree path.
+//!
+//! The sampling rate is a space decision, not a speed one. A `u32` sample per
+//! 16 bits — the original rate — costs two bytes of index per two bytes of
+//! bitmap: 200% overhead, or ~680 KB of samples over the 340 KB `dir_bits` of
+//! a two-million-record volume. At 256 bits the same index is ~21 KB, and the
+//! extra scan work is four popcounts on one or two cache lines that rank was
+//! already going to touch.
 
-pub const SUPERBLOCK_BITS: usize = 16;
+pub const SUPERBLOCK_BITS: usize = 256;
 
 pub fn build_superblocks(bits: &[u8]) -> Vec<u32> {
     let mut samples = Vec::with_capacity(bits.len().div_ceil(64) + 1);
@@ -38,7 +45,15 @@ impl<'a> RankSelect<'a> {
         let start_byte = superblock * (SUPERBLOCK_BITS / 8);
         let full_bytes = end / 8;
         let bytes = &self.bits[start_byte.min(self.bits.len())..full_bytes.min(self.bits.len())];
-        count += bytes
+        // Whole `u64`s first: at a 256-bit sampling rate the span between a
+        // sample and the query position is up to 32 bytes, which is four
+        // popcounts this way versus thirty-two byte-wise.
+        let (words, tail) = bytes.split_at(bytes.len() & !7);
+        for word in words.chunks_exact(8) {
+            count += u64::from_le_bytes(word.try_into().expect("chunks_exact(8) yields 8 bytes"))
+                .count_ones() as usize;
+        }
+        count += tail
             .iter()
             .map(|byte| byte.count_ones() as usize)
             .sum::<usize>();
