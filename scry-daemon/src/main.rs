@@ -795,6 +795,165 @@ fn delta_event(event: &scry_fsevents::ChangeEvent) -> Option<DeltaEvent> {
     }
 }
 
+/// Above this many matches, the daemon stops trusting a query's candidate
+/// list as complete: the bounded top-k search inside `IndexView` only keeps
+/// every match when the true count is under its limit, so a result this long
+/// may have silently dropped matches that a *narrower* follow-up query would
+/// need. Caching it would risk a refined query missing a file that exists —
+/// the one failure mode this feature must never produce — so that volume's
+/// cache entry is left empty instead, and the next keystroke rescans it.
+const REFINEMENT_CACHE_CAP: usize = 20_000;
+
+/// The result of the last refinable query on this connection, per volume, so
+/// the next keystroke can filter instead of rescan when it's provably a
+/// narrower version of the same query. Lives for the lifetime of one
+/// connection: an as-you-type session is exactly the case this optimizes,
+/// and nothing about it is meaningful to persist across connections.
+#[derive(Default)]
+struct RefinementCache {
+    kind: Option<QueryKind>,
+    terms: Vec<String>,
+    per_volume: Vec<Option<VolumeCandidates>>,
+}
+
+struct VolumeCandidates {
+    generation: u64,
+    candidates: Vec<ResultEntry>,
+}
+
+/// The term list a query would need to have matched to be filterable from a
+/// cached result later — `None` for kinds that are never cacheable
+/// (`Regex`/`Wildcard`: a longer pattern can *grow* the match set, so no
+/// subset relationship can be assumed) or `ShareIndex` (not a search at all).
+fn refinable_terms(kind: QueryKind, query: &Query) -> Option<Vec<String>> {
+    match (kind, query) {
+        (QueryKind::Prefix, Query::Prefix(pattern))
+        | (QueryKind::Substring, Query::Substring(pattern)) => Some(vec![pattern.clone()]),
+        (QueryKind::PathTerms, Query::PathTerms(terms)) => Some(terms.clone()),
+        _ => None,
+    }
+}
+
+/// True when `new_terms` can only match a subset of what `old_terms` matched:
+/// every old term, in order, is a case-insensitive prefix of the
+/// correspondingly-positioned new term, and no old term is missing from the
+/// new list. Extra new terms beyond `old_terms.len()` are fine — an
+/// additional AND-ed term only shrinks the match set further.
+fn is_refinement(old_terms: &[String], new_terms: &[String]) -> bool {
+    !old_terms.is_empty()
+        && new_terms.len() >= old_terms.len()
+        && old_terms.iter().zip(new_terms.iter()).all(|(old, new)| {
+            new.len() >= old.len()
+                && new.as_bytes()[..old.len()].eq_ignore_ascii_case(old.as_bytes())
+        })
+}
+
+fn leaf_name(path: &str) -> &str {
+    path.rsplit('\\').next().unwrap_or(path)
+}
+
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Re-checks a cached hit against a refined query without touching the
+/// index, mirroring the matching rules `search_base`/`search_path_terms` use
+/// so a filtered cache and a full rescan never disagree.
+fn matches_refined(entry: &ResultEntry, kind: QueryKind, terms: &[String]) -> bool {
+    match kind {
+        QueryKind::Prefix => {
+            let name = leaf_name(&entry.path);
+            name.len() >= terms[0].len()
+                && name.as_bytes()[..terms[0].len()].eq_ignore_ascii_case(terms[0].as_bytes())
+        }
+        QueryKind::Substring => contains_ci(leaf_name(&entry.path), &terms[0]),
+        QueryKind::PathTerms => terms.iter().all(|term| {
+            entry
+                .path
+                .split('\\')
+                .any(|segment| contains_ci(segment, term))
+        }),
+        QueryKind::Wildcard | QueryKind::ShareIndex => false,
+    }
+}
+
+/// As `search_indexes_cancellable`, but for a refinable query kind, checks
+/// whether this connection's cache holds the previous, broader query's
+/// complete match set per volume and filters it in memory instead of
+/// rescanning that volume. A volume whose index generation moved, or whose
+/// cached set hit `REFINEMENT_CACHE_CAP` last time, is rescanned on its own —
+/// one volume reindexing must not force a rescan of the others.
+fn search_indexes_with_cache(
+    indexes: &VolumeIndexes,
+    kind: QueryKind,
+    query: &Query,
+    limit: usize,
+    cancel: scry_core::Cancellation,
+    cache: &mut RefinementCache,
+) -> Vec<ResultEntry> {
+    if limit == 0 || cancel.is_cancelled() {
+        return Vec::new();
+    }
+    let Some(new_terms) = refinable_terms(kind, query) else {
+        return search_indexes_cancellable(indexes, query, limit, cancel);
+    };
+    let refine = cache.kind == Some(kind) && is_refinement(&cache.terms, &new_terms);
+    if !refine || cache.per_volume.len() != indexes.len() {
+        cache.per_volume.clear();
+        cache.per_volume.resize_with(indexes.len(), || None);
+    }
+
+    let mut merged = Vec::new();
+    let mut next_per_volume = Vec::with_capacity(indexes.len());
+    for (i, index) in indexes.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let view = index.store.load_full();
+        let reused = refine
+            .then(|| cache.per_volume[i].as_ref())
+            .flatten()
+            .filter(|cached| cached.generation == view.generation);
+        let candidates = if let Some(cached) = reused {
+            cached
+                .candidates
+                .iter()
+                .filter(|entry| matches_refined(entry, kind, &new_terms))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            view.search_cancellable(query, REFINEMENT_CACHE_CAP, Some(cancel))
+        };
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        merged.extend(candidates.iter().cloned());
+        next_per_volume.push(if candidates.len() < REFINEMENT_CACHE_CAP {
+            Some(VolumeCandidates {
+                generation: view.generation,
+                candidates,
+            })
+        } else {
+            None
+        });
+    }
+    cache.kind = Some(kind);
+    cache.terms = new_terms;
+    cache.per_volume = next_per_volume;
+
+    merged.sort_by(|left, right| {
+        result_rank(query, left)
+            .cmp(&result_rank(query, right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    merged.truncate(limit);
+    merged
+}
+
 /// A connection does its read/search/write cycle on one thread — the pipe's
 /// synchronous handle deadlocks if a blocking read on one thread and a
 /// blocking write on another are both in flight at once (see the `Sync`
@@ -826,6 +985,7 @@ fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::
         }
     });
 
+    let mut cache = RefinementCache::default();
     let result = (|| -> std::io::Result<()> {
         loop {
             let req_bytes = match pipe.read_frame() {
@@ -837,7 +997,7 @@ fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::
             };
             let gen = generation.load(std::sync::atomic::Ordering::Relaxed);
             let cancel = scry_core::Cancellation::new(&generation, gen);
-            let response = handle_request(&req, indexes, &pipe, cancel)?;
+            let response = handle_request(&req, indexes, &pipe, cancel, &mut cache)?;
             pipe.write_frame(&response)?;
         }
     })();
@@ -855,6 +1015,7 @@ fn handle_request(
     indexes: &VolumeIndexes,
     pipe: &scry_ipc::Pipe,
     cancel: scry_core::Cancellation,
+    cache: &mut RefinementCache,
 ) -> std::io::Result<Vec<u8>> {
     // `load_full` clones the Arc, keeping this index alive for the whole
     // query even if the reindex thread swaps in a new one mid-search.
@@ -889,7 +1050,8 @@ fn handle_request(
         }
         QueryKind::ShareIndex => unreachable!(),
     };
-    let entries = search_indexes_cancellable(indexes, &query, req.limit as usize, cancel);
+    let entries =
+        search_indexes_with_cache(indexes, req.kind, &query, req.limit as usize, cancel, cache);
     Ok(encode_results(&entries))
 }
 
@@ -1096,6 +1258,134 @@ mod tests {
 
         drop(client);
         thread.join().unwrap();
+    }
+
+    fn build_refinement_store(dir: &tempfile::TempDir) -> Arc<IndexView> {
+        let mut b = Arena::builder();
+        let root = b.push("C:", 0, true);
+        let dirs = ["Documents", "Photos", "Projects"];
+        let vocab = [
+            "resume", "report", "invoice", "photo", "backup", "notes", "draft", "project",
+        ];
+        let exts = ["txt", "pdf", "png", "docx"];
+        let mut i: u32 = 0;
+        for &d in &dirs {
+            let dnode = b.push(d, 0, true);
+            b.set_parent(dnode, root);
+            for &w in &vocab {
+                for &ext in &exts {
+                    let name = format!("{w}_{i}.{ext}");
+                    let f = b.push(&name, 0, false);
+                    b.set_parent(f, dnode);
+                    i += 1;
+                }
+            }
+        }
+        let arena = b.build().0;
+        let path = dir.path().join("refine.rkyv");
+        save(&arena, &path).unwrap();
+        Arc::new(IndexView::new(Arc::new(ArenaStore::open(&path).unwrap())))
+    }
+
+    fn single_volume(view: Arc<IndexView>) -> VolumeIndexes {
+        Arc::new(vec![VolumeIndex {
+            volume: "C:".to_string(),
+            store: Arc::new(arc_swap::ArcSwap::from(view)),
+            cursor: None,
+        }])
+    }
+
+    /// Filtering a cached candidate set must always agree with rescanning the
+    /// index from scratch, at every keystroke of a randomised typing
+    /// sequence. A disagreement here would mean a refined query could hide a
+    /// file that a full scan would have found.
+    #[test]
+    fn refinement_matches_a_full_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_refinement_store(&dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let vocab = [
+            "resume", "report", "invoice", "photo", "backup", "notes", "draft", "project",
+        ];
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next_rand = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        for _ in 0..1000 {
+            let mut cache = RefinementCache::default();
+            let word = vocab[(next_rand() as usize) % vocab.len()];
+            let len = 1 + (next_rand() as usize) % word.len();
+            for step in 1..=len {
+                let pattern = word[..step].to_string();
+                let cached = search_indexes_with_cache(
+                    &indexes,
+                    QueryKind::Substring,
+                    &Query::Substring(pattern.clone()),
+                    50,
+                    scry_core::Cancellation::new(&generation, 0),
+                    &mut cache,
+                );
+                // A fresh cache never reuses a prior candidate list, so this
+                // always takes the full-rescan branch — the baseline the
+                // possibly-refined `cached` result above must match exactly.
+                let mut uncached = RefinementCache::default();
+                let fresh = search_indexes_with_cache(
+                    &indexes,
+                    QueryKind::Substring,
+                    &Query::Substring(pattern.clone()),
+                    50,
+                    scry_core::Cancellation::new(&generation, 0),
+                    &mut uncached,
+                );
+                assert_eq!(cached, fresh, "diverged at pattern {pattern:?}");
+            }
+        }
+    }
+
+    /// A `Wildcard` query can only grow the match set as characters are
+    /// added, so it must never be answered by filtering a narrower cached
+    /// `Substring`/`Prefix`/`PathTerms` set — and must not overwrite that
+    /// cache either, since it isn't itself refinable.
+    #[test]
+    fn refinement_is_bypassed_for_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_refinement_store(&dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let mut cache = RefinementCache::default();
+
+        search_indexes_with_cache(
+            &indexes,
+            QueryKind::Substring,
+            &Query::Substring("resu".to_string()),
+            50,
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+        );
+        assert_eq!(cache.kind, Some(QueryKind::Substring));
+
+        let wildcard_query = Query::wildcard("*.pdf");
+        let actual = search_indexes_with_cache(
+            &indexes,
+            QueryKind::Wildcard,
+            &wildcard_query,
+            50,
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+        );
+        let expected = search_indexes_cancellable(
+            &indexes,
+            &wildcard_query,
+            50,
+            scry_core::Cancellation::new(&generation, 0),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(cache.kind, Some(QueryKind::Substring));
     }
 
     use scry_core::{store::save, Arena};
