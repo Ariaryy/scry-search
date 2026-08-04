@@ -13,4 +13,9 @@ memchr = { workspace = true }
 aho-corasick = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
+
+[[bench]]
+name = "query"
+harness = false
