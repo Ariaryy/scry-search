@@ -10,13 +10,22 @@
   `parent()`, `mtime()`) needs an impl on each — the accessors on `ArchivedArena` read
   directly from the archived column vectors. `FileRecord` no longer exists; the dual-impl
   pattern now applies to functions on `ArchivedArena` vs the free functions in `record.rs`.
-- `Arena` uses a format v6 index (three parallel 4-byte columns: `parents` hot,
-  `mtimes` and `sizes` cold; plus name-sorted front-coded names) rather than plain
-  `String` fields or a single interleaved struct. The hot/cold split is load-bearing:
-  `parents` alone in its column gives 16 parent hops per cache line; keeping `mtimes`
-  and `sizes` separate lets them stay paged out between compaction bursts. A future
-  change that folds any cold field back into the hot column must update both this note
-  and the doc comments in `arena.rs`.
+- `Arena` uses a format v8 index (parallel 4-byte columns: `parents` hot,
+  `mtimes`/`sizes`/`dfs_positions`/`dfs_records`/`dfs_ends` cold; plus name-sorted
+  front-coded names) rather than plain `String` fields or a single interleaved struct.
+  The hot/cold split is load-bearing: `parents` alone in its column gives 16 parent hops
+  per cache line; keeping the rest separate lets them stay paged out between compaction
+  bursts. A future change that folds any cold field back into the hot column must update
+  both this note and the doc comments in `arena.rs`.
+- Records are stored **name-sorted** — `prefix_range`'s binary search and front-coding
+  both depend on it — so the `dfs_*` columns (`scry-core/src/dfs.rs`) carry tree order
+  separately: `dfs_positions[r]..dfs_ends[r]` is the half-open span of `dfs_records`
+  holding everything beneath `r`. That makes descendant tests and descendant counts
+  O(1). The parent column comes off a live volume and may contain cycles, self-parents
+  and dangling indices; `dfs::build` still assigns every record exactly one position
+  (cycle members become pseudo-roots), so `dfs_positions` is always a total permutation.
+  The traversal is iterative on purpose — a recursive DFS overflows the stack on a
+  deep or corrupt parent chain.
 - The `$MFT` parser (`scry-fsevents/src/mft/`) reads a live on-disk structure
   and must treat every length and offset as hostile: checked slicing only, no
   unchecked arithmetic, and an explicit termination guard on every loop driven

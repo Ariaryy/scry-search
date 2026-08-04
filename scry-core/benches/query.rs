@@ -249,6 +249,17 @@ fn fixed_costs(c: &mut Criterion) {
     group.bench_function("path_index_build", |b| {
         b.iter(|| black_box(PathIndex::build(view.base.archived(), &view.delta)))
     });
+    // Paid once per snapshot rather than once per query, but it sits on the
+    // critical path of every reindex and compaction, so a regression here
+    // shows up as indexing latency rather than query latency.
+    group.bench_function("dfs_build", |b| {
+        let parents: Vec<u32> = view.base.archived().parents.iter().copied().collect();
+        b.iter(|| {
+            black_box(scry_core::dfs::build(black_box(&parents)))
+                .records
+                .len()
+        })
+    });
     group.bench_function("closure_all_dirs", |b| {
         let mut mask = vec![0u16; view.path_index.directory_count()];
         b.iter(|| {

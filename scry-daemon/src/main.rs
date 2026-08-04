@@ -999,11 +999,12 @@ fn search_indexes_with_cache(
         // a refined query could match. A set truncated at `limit` is not, and
         // caching it would let a later keystroke miss real hits.
         next_per_volume.push(
-            (scan_limit == REFINEMENT_CACHE_CAP && candidates.len() < REFINEMENT_CACHE_CAP)
-                .then(|| VolumeCandidates {
+            (scan_limit == REFINEMENT_CACHE_CAP && candidates.len() < REFINEMENT_CACHE_CAP).then(
+                || VolumeCandidates {
                     generation: view.generation,
                     candidates,
-                }),
+                },
+            ),
         );
     }
     cache.kind = Some(kind);
@@ -1166,9 +1167,11 @@ fn rank_sort_truncate(query: &Query, entries: &mut Vec<ResultEntry>, limit: usiz
     // Path is the tiebreak rather than the scan order the entries arrived in,
     // so that a result set is stable across a reindex that renumbers records.
     order.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| entries[left.1 as usize].path.cmp(&entries[right.1 as usize].path))
+        left.0.cmp(&right.0).then_with(|| {
+            entries[left.1 as usize]
+                .path
+                .cmp(&entries[right.1 as usize].path)
+        })
     });
     order.truncate(limit);
 

@@ -9,7 +9,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// The full index: entries in name-sorted order, names front-coded in a
 /// separate blob, version-stamped for safe mmap reuse across daemon upgrades.
 ///
-/// Five arrays, all plain PODs — no String, no relative pointer — so rkyv's
+/// Parallel arrays, all plain PODs — no String, no relative pointer — so rkyv's
 /// bytecheck performs a handful of bounds checks rather than chasing a pointer
 /// and UTF-8-validating a name for every one of a million records.
 ///
@@ -21,9 +21,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   compaction, never on the query path. Kept in their own arrays so the OS
 ///   can evict those pages between compaction bursts.
 ///
-/// These arrays are index-parallel: `parents[i]`, `mtimes[i]`, and `sizes[i]`
-/// all describe the same entry. A future change that pushes to one without
-/// the others silently corrupts the index.
+/// These arrays are index-parallel: `parents[i]`, `mtimes[i]`, `sizes[i]`,
+/// `dfs_positions[i]` and `dfs_ends[i]` all describe the same entry. A future
+/// change that pushes to one without the others silently corrupts the index.
+/// `dfs_records` is the one exception — it is indexed by depth-first position,
+/// not by record.
 #[derive(Archive, Serialize, Deserialize, Debug)]
 #[archive(check_bytes)]
 pub struct Arena {
@@ -56,6 +58,16 @@ pub struct Arena {
     pub sizes: Vec<u32>,
     /// Trigram row matrix; each row has one LSB-first bit per 1024 records.
     pub trigram_index: Vec<u8>,
+    /// Depth-first position of each record, indexed by name-sorted record.
+    /// Cold: only a scope-restricted or aggregating query reads it.
+    /// See `crate::dfs` for what the three tree-order columns buy.
+    pub dfs_positions: Vec<u32>,
+    /// Inverse of `dfs_positions`: record index at each depth-first position.
+    pub dfs_records: Vec<u32>,
+    /// Exclusive end, in depth-first positions, of each record's subtree.
+    /// Indexed by name-sorted record, so `dfs_positions[r]..dfs_ends[r]` is
+    /// the span of `dfs_records` covering everything beneath `r`.
+    pub dfs_ends: Vec<u32>,
 }
 
 impl Arena {
@@ -194,6 +206,47 @@ impl ArchivedArena {
     #[inline]
     pub fn size_bytes(&self, idx: u32) -> u64 {
         self.sizes[idx as usize] as u64 * 1024
+    }
+
+    /// Depth-first position of record `idx` in tree order.
+    #[inline]
+    pub fn dfs_position(&self, idx: u32) -> u32 {
+        self.dfs_positions[idx as usize]
+    }
+
+    /// Record index sitting at depth-first `position`.
+    #[inline]
+    pub fn dfs_record(&self, position: u32) -> u32 {
+        self.dfs_records[position as usize]
+    }
+
+    /// Half-open span of depth-first positions covering `idx` and everything
+    /// beneath it. Feed each position to [`Self::dfs_record`] to enumerate.
+    ///
+    /// A snapshot written before tree order existed has empty columns; the
+    /// span is then empty rather than wrong, so callers must treat it as
+    /// "no information" and fall back to an ancestor walk.
+    #[inline]
+    pub fn subtree(&self, idx: u32) -> std::ops::Range<u32> {
+        if self.dfs_positions.is_empty() {
+            return 0..0;
+        }
+        self.dfs_positions[idx as usize]..self.dfs_ends[idx as usize]
+    }
+
+    /// Number of records in `idx`'s subtree, itself included. O(1): it is the
+    /// width of the interval, so nothing is visited.
+    #[inline]
+    pub fn subtree_len(&self, idx: u32) -> u32 {
+        self.subtree(idx).len() as u32
+    }
+
+    /// Whether `descendant` lies beneath `ancestor` (or is it). O(1), versus
+    /// the parent-chain walk it replaces.
+    #[inline]
+    pub fn is_descendant_of(&self, descendant: u32, ancestor: u32) -> bool {
+        self.subtree(ancestor)
+            .contains(&self.dfs_positions[descendant as usize])
     }
 
     /// Decode the name of record `idx` into `out`, clearing it first.
@@ -801,6 +854,10 @@ impl ArenaBuilder {
         drop(std::mem::take(&mut self.staging_names));
         drop(std::mem::take(&mut self.name_ends));
 
+        // 5. Tree order, over the *remapped* parents — `dfs` indexes records
+        // the same way every other column does.
+        let dfs = crate::dfs::build(&out_parents);
+
         (
             Arena {
                 format_version: crate::record::FORMAT_VERSION,
@@ -813,6 +870,9 @@ impl ArenaBuilder {
                 mtimes: out_mtimes,
                 sizes: out_sizes,
                 trigram_index,
+                dfs_positions: dfs.positions,
+                dfs_records: dfs.records,
+                dfs_ends: dfs.subtree_ends,
             },
             frn_entries,
         )
@@ -851,6 +911,56 @@ mod tests {
         assert_eq!(archived.parents.len(), archived.mtimes.len());
         assert_eq!(archived.parents.len(), archived.sizes.len());
         assert_eq!(archived.len(), archived.parents.len());
+        assert_eq!(archived.parents.len(), archived.dfs_positions.len());
+        assert_eq!(archived.parents.len(), archived.dfs_records.len());
+        assert_eq!(archived.parents.len(), archived.dfs_ends.len());
+    }
+
+    /// `dfs` is built over the *remapped* parents, so the intervals have to
+    /// survive the name sort that reorders every record. Checked end-to-end
+    /// through the archive rather than on the builder output, because the
+    /// archived accessors are a separate code path.
+    #[test]
+    fn subtree_intervals_survive_the_name_sort() {
+        // Names chosen so insertion order and sorted order disagree.
+        let mut b = ArenaBuilder::default();
+        let root = b.push("zulu_root", 0, true);
+        let mid = b.push("alpha_mid", 0, true);
+        let leaf = b.push("mike_leaf", 0, false);
+        let sibling = b.push("bravo_sibling", 0, false);
+        b.set_parent(mid, root);
+        b.set_parent(leaf, mid);
+        b.set_parent(sibling, root);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subtree.rkyv");
+        save(&b.build().0, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+
+        let find = |wanted: &str| {
+            (0..archived.len() as u32)
+                .find(|&i| archived.name(i) == wanted)
+                .expect("record present")
+        };
+        let (root, mid, leaf, sibling) = (
+            find("zulu_root"),
+            find("alpha_mid"),
+            find("mike_leaf"),
+            find("bravo_sibling"),
+        );
+
+        assert_eq!(archived.subtree_len(root), 4, "root covers everything");
+        assert_eq!(archived.subtree_len(mid), 2, "mid plus its leaf");
+        assert_eq!(archived.subtree_len(leaf), 1);
+        assert!(archived.is_descendant_of(leaf, root));
+        assert!(archived.is_descendant_of(leaf, mid));
+        assert!(
+            archived.is_descendant_of(root, root),
+            "a record contains itself"
+        );
+        assert!(!archived.is_descendant_of(sibling, mid));
+        assert!(!archived.is_descendant_of(root, mid));
     }
 
     /// This plan is a rearrangement: the total archived bytes per entry must
@@ -1160,6 +1270,11 @@ mod tests {
             front_code(&names_in, &mut blob, &mut offsets, &mut [], 0);
             (blob, offsets)
         };
+        let parents = vec![
+            pack_parent(1, false), // record 0, parent = 1
+            pack_parent(0, false), // record 1, parent = 0 — CYCLE
+        ];
+        let dfs = crate::dfs::build(&parents);
         let arena = Arena {
             format_version: crate::record::FORMAT_VERSION,
             journal_id: 0,
@@ -1167,13 +1282,13 @@ mod tests {
             volume_serial: 0,
             names,
             bucket_offsets,
-            parents: vec![
-                pack_parent(1, false), // record 0, parent = 1
-                pack_parent(0, false), // record 1, parent = 0 — CYCLE
-            ],
+            parents,
             mtimes: vec![0, 0],
             sizes: vec![0, 0],
             trigram_index: Vec::new(),
+            dfs_positions: dfs.positions,
+            dfs_records: dfs.records,
+            dfs_ends: dfs.subtree_ends,
         };
 
         let dir = tempfile::tempdir().unwrap();

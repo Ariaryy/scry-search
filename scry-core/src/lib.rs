@@ -3,6 +3,7 @@ pub mod ascii;
 pub mod bitvec;
 pub mod cancel;
 pub mod delta;
+pub mod dfs;
 pub mod frnmap;
 mod literals;
 pub mod pathindex;
