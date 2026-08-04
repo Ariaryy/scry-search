@@ -350,6 +350,24 @@ fn configure_background_thread_qos() {
     }
 }
 
+/// Builds a `PathIndex` and logs its size and build time — both feed
+/// directly into the reindex-transient peak-RSS measurement, so they need to
+/// be visible without attaching a profiler.
+fn build_path_index(
+    archived: &scry_core::ArchivedArena,
+    delta: &scry_core::delta::Delta,
+) -> Arc<scry_core::pathindex::PathIndex> {
+    let start = std::time::Instant::now();
+    let path_index = scry_core::pathindex::PathIndex::build(archived, delta);
+    eprintln!(
+        "scryd: path index built in {:?} ({} bytes, {} directories)",
+        start.elapsed(),
+        path_index.heap_bytes(),
+        path_index.directory_count()
+    );
+    Arc::new(path_index)
+}
+
 fn build_or_resume_view(
     volume: &str,
     auxiliary_marking_enabled: bool,
@@ -420,7 +438,7 @@ fn resume_view(
     Ok(Some(StartupView {
         view: Arc::new(IndexView {
             base: base.clone(),
-            path_index: Arc::new(scry_core::pathindex::PathIndex::build(archived, &delta)),
+            path_index: build_path_index(archived, &delta),
             delta: Arc::new(delta),
             generation: scry_core::view::fresh_generation(),
             journal_id: cursor.journal_id,
@@ -700,10 +718,7 @@ fn reindex_on_changes(
         if !needs_full_reindex {
             let next = Arc::new(IndexView {
                 base: view.base.clone(),
-                path_index: Arc::new(scry_core::pathindex::PathIndex::build(
-                    view.base.archived(),
-                    &delta,
-                )),
+                path_index: build_path_index(view.base.archived(), &delta),
                 delta: Arc::new(delta),
                 generation: scry_core::view::fresh_generation(),
                 journal_id: view.journal_id,
@@ -813,11 +828,28 @@ const REFINEMENT_CACHE_CAP: usize = 20_000;
 fn query_thread_count() -> usize {
     static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *COUNT.get_or_init(|| {
+        // Measurement-only override: lets the daemon be launched at a fixed
+        // worker count (e.g. 1, for an apples-to-apples single-threaded
+        // comparison) without a separate build.
+        if let Some(threads) = std::env::var("SCRY_QUERY_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            return threads.max(1);
+        }
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .min(8)
     })
+}
+
+/// Measurement-only override: `SCRY_NO_REFINEMENT_CACHE=1` makes every query
+/// rescan from scratch, for an as-you-type latency comparison against the
+/// cached path without a separate build.
+fn refinement_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SCRY_NO_REFINEMENT_CACHE").is_none())
 }
 
 /// The result of the last refinable query on this connection, per volume, so
@@ -914,7 +946,8 @@ fn search_indexes_with_cache(
     if limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
-    let Some(new_terms) = refinable_terms(kind, query) else {
+    let Some(new_terms) = refinable_terms(kind, query).filter(|_| refinement_cache_enabled())
+    else {
         return search_indexes_cancellable(indexes, query, limit, cancel);
     };
     let refine = cache.kind == Some(kind) && is_refinement(&cache.terms, &new_terms);
