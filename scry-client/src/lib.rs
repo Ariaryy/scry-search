@@ -17,6 +17,12 @@ pub struct Client {
     pipe: scry_ipc::Pipe,
     pipe_name: String,
     local: Option<LocalIndex>,
+    /// Requests written by `search_interactive` that haven't had their
+    /// response frame read yet. Framing guarantees exactly one response per
+    /// request, in send order, so draining this many frames always lands on
+    /// the response to the request just sent — anything read before that is
+    /// a stale answer to an earlier, since-superseded keystroke.
+    pending_interactive: u64,
 }
 
 impl Client {
@@ -31,6 +37,7 @@ impl Client {
             pipe,
             pipe_name: pipe_name.to_owned(),
             local: None,
+            pending_interactive: 0,
         })
     }
 
@@ -47,6 +54,36 @@ impl Client {
         };
         self.pipe.write_frame(&encode_request(&req))?;
         let resp = self.pipe.read_frame()?;
+        decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
+    }
+
+    /// As-you-type querying over a single pipelined connection: writes the
+    /// request immediately (even if an earlier call's response hasn't been
+    /// read yet), then reads and discards every response older than this
+    /// one before returning it. A caller that fires a request per keystroke
+    /// without waiting for each response therefore always sees the answer to
+    /// its latest keystroke, never a stale one — at the cost of a stale
+    /// (possibly empty) result briefly reaching the caller for the discarded
+    /// requests, since each still yields exactly one response frame.
+    pub fn search_interactive(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<ResultEntry>> {
+        let req = Request {
+            kind,
+            pattern: pattern.to_string(),
+            limit,
+        };
+        self.pipe.write_frame(&encode_request(&req))?;
+        self.pending_interactive += 1;
+        let mut latest = None;
+        while self.pending_interactive > 0 {
+            latest = Some(self.pipe.read_frame()?);
+            self.pending_interactive -= 1;
+        }
+        let resp = latest.expect("at least one request was sent above");
         decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
     }
 
@@ -156,5 +193,84 @@ impl Client {
 
     pub fn path_terms(&self, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {
         self.query(QueryKind::PathTerms, pattern, limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scry_core::protocol::encode_results;
+
+    fn unique_pipe_name() -> String {
+        format!(
+            r"\\.\pipe\scry-client-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn connect(pipe_name: &str) -> Client {
+        (0..100)
+            .find_map(|_| {
+                Client::connect_to(pipe_name).ok().or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    None
+                })
+            })
+            .expect("test pipe did not become ready")
+    }
+
+    fn entry(name: &str) -> ResultEntry {
+        ResultEntry {
+            path: name.to_string(),
+            size: 0,
+            is_dir: false,
+        }
+    }
+
+    /// A response already sitting in the pipe when `search_interactive` is
+    /// called — the answer to a keystroke the caller has since moved past —
+    /// must be discarded in favor of the response to the request this call
+    /// itself just wrote, never returned to the caller.
+    #[test]
+    fn search_interactive_discards_a_stale_buffered_response() {
+        let pipe_name = unique_pipe_name();
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            // Respond to both requests only after both have arrived, so the
+            // client's write of the second request races ahead of it reading
+            // the first response — exactly the scenario this method exists for.
+            let _first = pipe.read_frame().unwrap();
+            let _second = pipe.read_frame().unwrap();
+            pipe.write_frame(&encode_results(&[entry("stale")]))
+                .unwrap();
+            pipe.write_frame(&encode_results(&[entry("fresh")]))
+                .unwrap();
+        });
+
+        let mut client = connect(&pipe_name);
+        // Simulate an earlier `search_interactive` call whose request was
+        // written but whose response hasn't been read yet.
+        client
+            .pipe
+            .write_frame(&encode_request(&Request {
+                kind: QueryKind::Substring,
+                pattern: "stale-query".to_string(),
+                limit: 50,
+            }))
+            .unwrap();
+        client.pending_interactive = 1;
+
+        let result = client
+            .search_interactive(QueryKind::Substring, "fresh-query", 50)
+            .unwrap();
+        assert_eq!(result, vec![entry("fresh")]);
+
+        drop(client);
+        thread.join().unwrap();
     }
 }
