@@ -444,10 +444,14 @@ fn build_view(volume: &str, auxiliary_marking_enabled: bool) -> anyhow::Result<S
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let volume = volume.to_string();
+    let host = hosting_volume(&path);
     let mark = |f: &std::fs::File| {
         if auxiliary_marking_enabled {
-            if let Err(e) = scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(f, &volume) {
+            let Some(host) = &host else {
+                eprintln!("scryd: could not determine snapshot's hosting volume for {path:?}");
+                return;
+            };
+            if let Err(e) = scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(f, host) {
                 eprintln!("scryd: could not mark index handle as auxiliary ({e})");
             }
         }
@@ -474,11 +478,14 @@ fn compact_view(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let volume = volume.to_string();
+    let host = hosting_volume(&path);
     let mark = |file: &std::fs::File| {
         if auxiliary_marking_enabled {
-            if let Err(error) =
-                scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(file, &volume)
+            let Some(host) = &host else {
+                eprintln!("scryd: could not determine snapshot's hosting volume for {path:?}");
+                return;
+            };
+            if let Err(error) = scry_fsevents::WindowsBackend::mark_handle_as_auxiliary(file, host)
             {
                 eprintln!("scryd: could not mark compacted index as auxiliary ({error})");
             }
@@ -521,6 +528,25 @@ fn snapshot_path(volume: &str) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     app_data.join("scry").join(format!("index-{safe}.rkyv"))
+}
+
+/// The volume a snapshot file physically lives on, which is not necessarily
+/// the volume it describes: snapshots are written under `%LOCALAPPDATA%`, so
+/// a daemon indexing `D:` still writes that snapshot onto whatever drive the
+/// user profile is on. `FSCTL_MARK_HANDLE` must be applied against the
+/// hosting volume's journal, or the write is invisible to the auxiliary
+/// filter and retriggers that volume's own watcher.
+fn hosting_volume(path: &std::path::Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    match path.components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                Some(format!("{}:", letter as char))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Holds the state `is_real_change` needs to recognize the daemon's own
