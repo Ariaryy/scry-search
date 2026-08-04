@@ -3,3 +3,6 @@ Cargo.lock
 *.idx
 /plans/
 /.tokensave/
+
+.claude/
+.serena/

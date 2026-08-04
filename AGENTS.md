@@ -63,6 +63,23 @@
   scan. Regex/wildcard queries use bounded must-contain HIR analysis and
   evaluate AND-of-OR literal clauses directly over the same rows. Patterns
   without a provable ASCII literal of at least 3 bytes still scan linearly.
+- **Ranking is one `u64` sort key per candidate** (`scry-core/src/rank.rs`), not a
+  comparator or a trait object: the bounded top-k heap compares plain integers, and every
+  key carries the record in its low 32 bits so the order is total and the record reads back
+  out. Descending orderings store the field's bitwise complement. Adding an `Order` variant
+  means adding a `*_key` constructor and a wire discriminant — the search loops don't change.
+  `Order::needs_metadata` is what lets `Relevance` skip the cold `mtimes`/`sizes` reads and
+  the other orderings skip the name decode.
+- **Matching, ranking and path reconstruction are three separate steps.** `search_hits`
+  returns `Hit`s (record, size, mtime, is_dir); `full_path` costs a parent-chain walk and a
+  `String` (~3.5 µs) and happens only in `materialize_hits`. A consumer that counts,
+  aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
+  (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
+  record indices from different volumes are not comparable.
+- **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
+  set is only a superset of a refined query's matches under the *same* ordering; the scan
+  keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
+  different records.
 - **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
   saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
   it 0 because USN records do not carry size, so 0 means unknown rather than

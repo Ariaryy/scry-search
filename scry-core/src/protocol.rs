@@ -5,6 +5,8 @@
 //! (The *index* uses rkyv because that payload is huge and zero-copy matters
 //! there; the protocol payload doesn't have that problem.)
 
+pub use crate::rank::Order;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Prefix = 0,
@@ -74,19 +76,27 @@ pub struct Request {
     pub kind: QueryKind,
     pub pattern: String,
     pub limit: u32,
+    /// How to order results. Encoded as one byte after `limit`; an unknown
+    /// value is rejected rather than silently treated as relevance, so a newer
+    /// client asking an older daemon for an ordering it can't honor gets an
+    /// error instead of a wrong answer.
+    pub order: Order,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultEntry {
     pub path: String,
     pub size: u64,
+    /// Modification time, seconds since the Unix epoch.
+    pub mtime: u32,
     pub is_dir: bool,
 }
 
 pub fn encode_request(req: &Request) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(9 + req.pattern.len());
+    let mut buf = Vec::with_capacity(10 + req.pattern.len());
     buf.push(req.kind as u8);
     buf.extend_from_slice(&req.limit.to_le_bytes());
+    buf.push(req.order as u8);
     write_string(&mut buf, &req.pattern);
     buf
 }
@@ -95,11 +105,13 @@ pub fn decode_request(buf: &[u8]) -> Option<Request> {
     let mut c = Cursor::new(buf);
     let kind = QueryKind::from_u8(c.read_u8()?)?;
     let limit = c.read_u32()?;
+    let order = Order::from_u8(c.read_u8()?)?;
     let pattern = c.read_string()?;
     Some(Request {
         kind,
         pattern,
         limit,
+        order,
     })
 }
 
@@ -109,6 +121,7 @@ pub fn encode_results(entries: &[ResultEntry]) -> Vec<u8> {
     for e in entries {
         write_string(&mut buf, &e.path);
         buf.extend_from_slice(&e.size.to_le_bytes());
+        buf.extend_from_slice(&e.mtime.to_le_bytes());
         buf.push(e.is_dir as u8);
     }
     buf
@@ -121,8 +134,14 @@ pub fn decode_results(buf: &[u8]) -> Option<Vec<ResultEntry>> {
     for _ in 0..count {
         let path = c.read_string()?;
         let size = c.read_u64()?;
+        let mtime = c.read_u32()?;
         let is_dir = c.read_u8()? != 0;
-        out.push(ResultEntry { path, size, is_dir });
+        out.push(ResultEntry {
+            path,
+            size,
+            mtime,
+            is_dir,
+        });
     }
     Some(out)
 }
@@ -178,12 +197,28 @@ mod tests {
             kind: QueryKind::Wildcard,
             pattern: "*.docx".into(),
             limit: 50,
+            order: Order::Recent,
         };
         let bytes = encode_request(&req);
         let decoded = decode_request(&bytes).unwrap();
         assert_eq!(decoded.kind, QueryKind::Wildcard);
         assert_eq!(decoded.pattern, "*.docx");
         assert_eq!(decoded.limit, 50);
+        assert_eq!(decoded.order, Order::Recent);
+    }
+
+    /// An ordering this build doesn't know about must fail the decode rather
+    /// than fall back to relevance and return a confidently wrong list.
+    #[test]
+    fn an_unknown_order_is_rejected() {
+        let mut bytes = encode_request(&Request {
+            kind: QueryKind::Prefix,
+            pattern: "a".into(),
+            limit: 1,
+            order: Order::Relevance,
+        });
+        bytes[5] = 99;
+        assert!(decode_request(&bytes).is_none());
     }
 
     #[test]
@@ -192,11 +227,13 @@ mod tests {
             ResultEntry {
                 path: "C:\\a.txt".into(),
                 size: 10,
+                mtime: 1_700_000_000,
                 is_dir: false,
             },
             ResultEntry {
                 path: "C:\\dir".into(),
                 size: 0,
+                mtime: 0,
                 is_dir: true,
             },
         ];

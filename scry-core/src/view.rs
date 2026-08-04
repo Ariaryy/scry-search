@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{cell::RefCell, cmp::Ordering, collections::BinaryHeap};
+use std::{cell::RefCell, collections::BinaryHeap};
 
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -11,8 +11,45 @@ use crate::pathindex::{PathClosureScratch, PathIndex};
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
 use crate::query::Query;
+use crate::rank::{self, Order};
 use crate::store::ArenaStore;
 use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
+
+/// What to return and in what order.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub limit: usize,
+    pub order: Order,
+}
+
+impl SearchOptions {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            order: Order::default(),
+        }
+    }
+
+    pub fn ordered(limit: usize, order: Order) -> Self {
+        Self { limit, order }
+    }
+}
+
+/// A match, before its path has been reconstructed.
+///
+/// Every field here is either already in the key or a single indexed read from
+/// a column; the path is not — it costs a parent-chain walk and a `String` per
+/// result, which measured at ~3.5 µs each. A caller that counts matches,
+/// aggregates sizes, or renders paths lazily as the user scrolls should take
+/// `Hit`s and call [`IndexView::path_of`] only for what it displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    /// Index into the combined base-then-delta record space.
+    pub record: u32,
+    pub size: u64,
+    pub mtime: u32,
+    pub is_dir: bool,
+}
 
 /// Immutable base-and-overlay pair published through one atomic pointer.
 pub struct IndexView {
@@ -78,6 +115,65 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected);
         }
+    }
+
+    /// Ordering is the only thing that changes between these searches: the
+    /// same query, the same limit, the same records. If `Order` were being
+    /// dropped anywhere between `SearchOptions` and the heap key, every list
+    /// here would come back in relevance order and be identical.
+    #[test]
+    fn each_order_sorts_by_its_own_column() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        // Name length is deliberately anti-correlated with both mtime and
+        // size, so a relevance key leaking through would be visible.
+        // Sizes are KiB multiples because the column stores KiB, so anything
+        // else comes back rounded up and the assertion would be about the
+        // rounding rather than the ordering.
+        for (index, (mtime, size)) in [(300u32, 1_024u64), (100, 9_216), (200, 5_120)]
+            .into_iter()
+            .enumerate()
+        {
+            let child = builder.push_bytes_with_metadata(
+                format!("match_{}", "x".repeat(index + 1)).as_bytes(),
+                mtime,
+                false,
+                None,
+                size,
+            );
+            builder.set_parent(child, root);
+        }
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordered.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+
+        let query = Query::Prefix("match".into());
+        let mtimes = |order| -> Vec<u32> {
+            view.search_hits(&query, SearchOptions::ordered(10, order))
+                .iter()
+                .map(|hit| hit.mtime)
+                .collect()
+        };
+        assert_eq!(mtimes(Order::Recent), [300, 200, 100]);
+        assert_eq!(
+            view.search_hits(&query, SearchOptions::ordered(10, Order::Largest))
+                .iter()
+                .map(|hit| hit.size)
+                .collect::<Vec<_>>(),
+            [9_216, 5_120, 1_024]
+        );
+        assert_eq!(mtimes(Order::Relevance), [300, 100, 200], "shortest first");
+
+        // The bounded heap must keep the *best* two, not the first two seen.
+        assert_eq!(
+            view.search_hits(&query, SearchOptions::ordered(2, Order::Recent))
+                .iter()
+                .map(|hit| hit.mtime)
+                .collect::<Vec<_>>(),
+            [300, 200]
+        );
     }
 
     #[test]
@@ -221,7 +317,12 @@ mod tests {
             Query::wildcard("*.txt"),
         ] {
             assert_eq!(
-                search_archived_with_delta(view.base.archived(), &decoded, &query, 100),
+                search_archived_with_delta(
+                    view.base.archived(),
+                    &decoded,
+                    &query,
+                    SearchOptions::new(100),
+                ),
                 view.search(&query, 100)
             );
         }
@@ -355,7 +456,7 @@ mod tests {
             &view.delta,
             &view.path_index,
             &terms,
-            usize::MAX,
+            SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
             true,
             None,
@@ -365,7 +466,7 @@ mod tests {
             &view.delta,
             &view.path_index,
             &terms,
-            usize::MAX,
+            SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
             false,
             None,
@@ -373,8 +474,8 @@ mod tests {
 
         assert_eq!(filtered, full);
         assert_eq!(filtered.len(), 1);
-        assert!(filtered[0]
-            .path
+        assert!(view
+            .path_of(filtered[0].record)
             .ends_with("aaa_ancestorqzxv\\zzz_leafwkyp.dll"));
     }
 
@@ -389,7 +490,7 @@ mod tests {
             &large.delta,
             &large.path_index,
             &["match".to_owned()],
-            10,
+            SearchOptions::new(10),
             &mut scratch,
             true,
             None,
@@ -401,7 +502,7 @@ mod tests {
             &small.delta,
             &small.path_index,
             &["definitely_absent_qzxv".to_owned()],
-            10,
+            SearchOptions::new(10),
             &mut scratch,
             true,
             None,
@@ -470,7 +571,7 @@ mod tests {
                 &view.delta,
                 &view.path_index,
                 &terms,
-                50,
+                SearchOptions::new(50),
                 scratch,
                 filtered,
                 None,
@@ -537,6 +638,61 @@ impl IndexView {
         self.search_cancellable(query, limit, None)
     }
 
+    /// Match and rank without reconstructing any paths.
+    ///
+    /// This is the primitive the other `search*` methods are built on. A caller
+    /// that doesn't need every path — a counter, a size aggregator, a list that
+    /// renders lazily — should use this and call [`Self::path_of`] for the rows
+    /// it actually shows.
+    pub fn search_hits(&self, query: &Query, options: SearchOptions) -> Vec<Hit> {
+        self.search_hits_cancellable(query, options, None, 1)
+    }
+
+    /// As [`Self::search_hits`], with cancellation and an optional thread pool
+    /// for the unfiltered-scan fallback.
+    pub fn search_hits_cancellable(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+        cancel: Option<Cancellation>,
+        threads: usize,
+    ) -> Vec<Hit> {
+        if let Query::PathTerms(terms) = query {
+            return search_path_terms_cancellable(
+                self.base.archived(),
+                &self.delta,
+                &self.path_index,
+                terms,
+                options,
+                cancel,
+            );
+        }
+        search_ranked_cancellable(
+            self.base.archived(),
+            &self.delta,
+            query,
+            options,
+            cancel,
+            threads,
+        )
+    }
+
+    /// As [`Self::search_hits`], but reconstructs every path.
+    pub fn search_with(&self, query: &Query, options: SearchOptions) -> Vec<ResultEntry> {
+        self.materialize(&self.search_hits(query, options))
+    }
+
+    /// The full path of one hit's record.
+    pub fn path_of(&self, record: u32) -> String {
+        path_of(self.base.archived(), &self.delta, record)
+    }
+
+    /// Reconstruct the path of every hit. See [`Hit`] for why this is a
+    /// separate step.
+    pub fn materialize(&self, hits: &[Hit]) -> Vec<ResultEntry> {
+        materialize_hits(self.base.archived(), &self.delta, hits)
+    }
+
     /// As `search`, but abandons the scan (returning an empty result) once
     /// `cancel` reports a newer request superseded this one on the same
     /// connection. `cancel` is `None` for a one-shot caller, which reduces to
@@ -562,24 +718,8 @@ impl IndexView {
         cancel: Option<Cancellation>,
         threads: usize,
     ) -> Vec<ResultEntry> {
-        if let Query::PathTerms(terms) = query {
-            return search_path_terms_cancellable(
-                self.base.archived(),
-                &self.delta,
-                &self.path_index,
-                terms,
-                limit,
-                cancel,
-            );
-        }
-        search_ranked_cancellable(
-            self.base.archived(),
-            &self.delta,
-            query,
-            limit,
-            cancel,
-            threads,
-        )
+        let options = SearchOptions::new(limit);
+        self.materialize(&self.search_hits_cancellable(query, options, cancel, threads))
     }
 
     pub fn delta_path(&self, mut index: u32) -> String {
@@ -708,20 +848,28 @@ pub fn search_archived_with_delta(
     arena: &crate::ArchivedArena,
     delta: &Delta,
     query: &Query,
-    limit: usize,
+    options: SearchOptions,
 ) -> Vec<ResultEntry> {
-    if let Query::PathTerms(terms) = query {
+    let hits = if let Query::PathTerms(terms) = query {
         let path_index = PathIndex::build(arena, delta);
-        return search_path_terms(arena, delta, &path_index, terms, limit);
-    }
-    search_ranked(arena, delta, query, limit)
+        search_path_terms(arena, delta, &path_index, terms, options)
+    } else {
+        search_ranked(arena, delta, query, options)
+    };
+    materialize_hits(arena, delta, &hits)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RankedHit {
-    quality: u8,
-    name_len: u32,
-    record: u32,
+/// Reconstruct the path of every hit. Split out of the search functions so a
+/// caller can rank first and pay for paths only where it needs them — see
+/// [`Hit`].
+pub fn materialize_hits(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    hits: &[Hit],
+) -> Vec<ResultEntry> {
+    hits.iter()
+        .map(|hit| materialize(arena, delta, hit))
+        .collect()
 }
 
 #[derive(Default)]
@@ -737,7 +885,7 @@ struct PathSearchScratch {
     term_blocks: Vec<u32>,
     candidate_bitmap: Vec<u8>,
     trigram_hashes: Vec<usize>,
-    heap: BinaryHeap<RankedHit>,
+    heap: BinaryHeap<u64>,
     name: Vec<u8>,
 }
 
@@ -826,31 +974,92 @@ thread_local! {
         RefCell::new(PathSearchScratch::default());
 }
 
-impl Ord for RankedHit {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.quality, self.name_len, self.record).cmp(&(
-            other.quality,
-            other.name_len,
-            other.record,
-        ))
-    }
-}
-
-impl PartialOrd for RankedHit {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-fn retain_hit(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) {
+/// Keep `key` if it belongs in the best `limit` seen so far.
+///
+/// The heap is a max-heap over keys that sort ascending-is-better, so its root
+/// is the worst retained candidate and eviction is a peek and a swap. See
+/// [`crate::rank`] for why a candidate is one integer and not a struct.
+fn retain_hit(heap: &mut BinaryHeap<u64>, key: u64, limit: usize) {
     if limit == 0 {
         return;
     }
     if heap.len() < limit {
-        heap.push(hit);
-    } else if heap.peek().is_some_and(|worst| hit < *worst) {
+        heap.push(key);
+    } else if heap.peek().is_some_and(|worst| key < *worst) {
         heap.pop();
-        heap.push(hit);
+        heap.push(key);
+    }
+}
+
+/// Modification time of a record in the combined base-then-delta space.
+#[inline]
+fn record_mtime(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32 {
+    match record.checked_sub(arena.len() as u32) {
+        None => arena.mtime(record),
+        Some(index) => delta.added[index as usize].mtime_secs,
+    }
+}
+
+/// Size of a record in KiB — the width the index stores and the width
+/// [`rank::largest_key`] wants.
+#[inline]
+fn record_size_kib(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32 {
+    let bytes = match record.checked_sub(arena.len() as u32) {
+        None => arena.size_bytes(record),
+        Some(index) => delta.added[index as usize].size_bytes,
+    };
+    crate::record::bytes_to_size_kib(bytes)
+}
+
+/// The sort key for one candidate under `order`.
+///
+/// `quality` and `name_len` are already in hand at every call site; the cold
+/// `mtimes`/`sizes` reads happen only for the orderings that need them, which
+/// is the point of [`Order::needs_metadata`].
+#[inline]
+fn sort_key(
+    order: Order,
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    record: u32,
+    quality: u8,
+    name_len: u32,
+) -> u64 {
+    match order {
+        Order::Relevance => rank::relevance_key(quality, name_len, record),
+        Order::Recent => rank::recent_key(record_mtime(arena, delta, record), record),
+        Order::Largest => rank::largest_key(record_size_kib(arena, delta, record), record),
+    }
+}
+
+/// Turn the heap's retained keys into hits, best first.
+fn drain_heap(arena: &crate::ArchivedArena, delta: &Delta, heap: &mut BinaryHeap<u64>) -> Vec<Hit> {
+    let mut hits = Vec::with_capacity(heap.len());
+    while let Some(key) = heap.pop() {
+        hits.push(hit_for(arena, delta, rank::key_record(key)));
+    }
+    // The heap yields worst-first; the caller wants best-first.
+    hits.reverse();
+    hits
+}
+
+fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> Hit {
+    match record.checked_sub(arena.len() as u32) {
+        None => Hit {
+            record,
+            size: arena.size_bytes(record),
+            mtime: arena.mtime(record),
+            is_dir: arena.is_dir(record),
+        },
+        Some(index) => {
+            let added = &delta.added[index as usize];
+            Hit {
+                record,
+                size: added.size_bytes,
+                mtime: added.mtime_secs,
+                is_dir: added.is_dir,
+            }
+        }
     }
 }
 
@@ -873,19 +1082,20 @@ fn search_ranked(
     arena: &crate::ArchivedArena,
     delta: &Delta,
     query: &Query,
-    limit: usize,
-) -> Vec<ResultEntry> {
-    search_ranked_cancellable(arena, delta, query, limit, None, 1)
+    options: SearchOptions,
+) -> Vec<Hit> {
+    search_ranked_cancellable(arena, delta, query, options, None, 1)
 }
 
 fn search_ranked_cancellable(
     arena: &crate::ArchivedArena,
     delta: &Delta,
     query: &Query,
-    limit: usize,
+    options: SearchOptions,
     cancel: Option<Cancellation>,
     threads: usize,
-) -> Vec<ResultEntry> {
+) -> Vec<Hit> {
+    let SearchOptions { limit, order } = options;
     if limit == 0 {
         return Vec::new();
     }
@@ -895,18 +1105,22 @@ fn search_ranked_cancellable(
     let base_hits = crate::query::search_base_parallel(arena, query, threads, cancel);
     let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut name = Vec::new();
+    // `match_quality` needs the decoded name, and so does the length; neither
+    // is needed by an ordering that ranks on a column, so skip the decode.
+    let needs_name = !order.needs_metadata();
     for index in base_hits {
         if delta.tombstones.get(index) {
             continue;
         }
-        arena.name_into(index, &mut name);
+        let (quality, name_len) = if needs_name {
+            arena.name_into(index, &mut name);
+            (match_quality(query, &name), name.len() as u32)
+        } else {
+            (0, 0)
+        };
         retain_hit(
             &mut heap,
-            RankedHit {
-                quality: match_quality(query, &name),
-                name_len: name.len() as u32,
-                record: index,
-            },
+            sort_key(order, arena, delta, index, quality, name_len),
             limit,
         );
     }
@@ -937,39 +1151,40 @@ fn search_ranked_cancellable(
             Query::PathTerms(_) => unreachable!(),
         };
         if matched {
+            let combined = arena.len() as u32 + index;
             retain_hit(
                 &mut heap,
-                RankedHit {
-                    quality: match_quality(query, record.name.as_bytes()),
-                    name_len: record.name.len() as u32,
-                    record: arena.len() as u32 + index,
-                },
+                sort_key(
+                    order,
+                    arena,
+                    delta,
+                    combined,
+                    match_quality(query, record.name.as_bytes()),
+                    record.name.len() as u32,
+                ),
                 limit,
             );
         }
     }
 
-    heap.into_sorted_vec()
-        .into_iter()
-        .map(|hit| materialize(arena, delta, hit.record))
-        .collect()
+    drain_heap(arena, delta, &mut heap)
 }
 
-fn materialize(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> ResultEntry {
-    if record < arena.len() as u32 {
-        ResultEntry {
-            path: arena.full_path(record, '\\'),
-            size: arena.size_bytes(record),
-            is_dir: arena.is_dir(record),
-        }
-    } else {
-        let index = record - arena.len() as u32;
-        let added = &delta.added[index as usize];
-        ResultEntry {
-            path: delta_path(arena, delta, index),
-            size: added.size_bytes,
-            is_dir: added.is_dir,
-        }
+/// Reconstruct the path of one hit. Separated from matching and ranking
+/// because it is the expensive part — see [`Hit`].
+fn materialize(arena: &crate::ArchivedArena, delta: &Delta, hit: &Hit) -> ResultEntry {
+    ResultEntry {
+        path: path_of(arena, delta, hit.record),
+        size: hit.size,
+        mtime: hit.mtime,
+        is_dir: hit.is_dir,
+    }
+}
+
+fn path_of(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> String {
+    match record.checked_sub(arena.len() as u32) {
+        None => arena.full_path(record, '\\'),
+        Some(index) => delta_path(arena, delta, index),
     }
 }
 
@@ -978,9 +1193,9 @@ pub fn search_path_terms(
     delta: &Delta,
     path_index: &PathIndex,
     terms: &[String],
-    limit: usize,
-) -> Vec<ResultEntry> {
-    search_path_terms_cancellable(arena, delta, path_index, terms, limit, None)
+    options: SearchOptions,
+) -> Vec<Hit> {
+    search_path_terms_cancellable(arena, delta, path_index, terms, options, None)
 }
 
 fn search_path_terms_cancellable(
@@ -988,16 +1203,16 @@ fn search_path_terms_cancellable(
     delta: &Delta,
     path_index: &PathIndex,
     terms: &[String],
-    limit: usize,
+    options: SearchOptions,
     cancel: Option<Cancellation>,
-) -> Vec<ResultEntry> {
+) -> Vec<Hit> {
     PATH_SEARCH_SCRATCH.with(|scratch| {
         search_path_terms_with_scratch(
             arena,
             delta,
             path_index,
             terms,
-            limit,
+            options,
             &mut scratch.borrow_mut(),
             true,
             cancel,
@@ -1011,11 +1226,12 @@ fn search_path_terms_with_scratch(
     delta: &Delta,
     path_index: &PathIndex,
     terms: &[String],
-    limit: usize,
+    options: SearchOptions,
     scratch: &mut PathSearchScratch,
     use_filter: bool,
     cancel: Option<Cancellation>,
-) -> Vec<ResultEntry> {
+) -> Vec<Hit> {
+    let SearchOptions { limit, order } = options;
     if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS || limit == 0 {
         return Vec::new();
     }
@@ -1023,6 +1239,7 @@ fn search_path_terms_with_scratch(
         return Vec::new();
     }
     scratch.reset(path_index.directory_count(), limit);
+    let needs_name = !order.needs_metadata();
     let automaton = match aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
         .build(terms)
@@ -1174,30 +1391,34 @@ fn search_path_terms_with_scratch(
             .and_then(|parent| scratch.parent_cache.dir_ord(path_index, parent))
             .map_or(0, |directory| scratch.dir_mask[directory as usize]);
         if own | inherited == full_mask {
-            let name_len = if record < arena.len() as u32 {
-                arena.name_into(record, &mut scratch.name);
-                scratch.name.len()
+            // As in `search_ranked_cancellable`: the name is read only for the
+            // ordering that ranks on it.
+            let name_len = if needs_name {
+                if record < arena.len() as u32 {
+                    arena.name_into(record, &mut scratch.name);
+                    scratch.name.len() as u32
+                } else {
+                    let index = record - arena.len() as u32;
+                    delta.added[index as usize].name.len() as u32
+                }
             } else {
-                let index = record - arena.len() as u32;
-                delta.added[index as usize].name.len()
+                0
             };
             retain_hit(
                 &mut scratch.heap,
-                RankedHit {
-                    quality: (terms.len() as u32 - own.count_ones()) as u8,
-                    name_len: name_len as u32,
+                sort_key(
+                    order,
+                    arena,
+                    delta,
                     record,
-                },
+                    (terms.len() as u32 - own.count_ones()) as u8,
+                    name_len,
+                ),
                 limit,
             );
         }
     }
-    let mut results = Vec::with_capacity(scratch.heap.len());
-    while let Some(hit) = scratch.heap.pop() {
-        results.push(materialize(arena, delta, hit.record));
-    }
-    results.reverse();
-    results
+    drain_heap(arena, delta, &mut scratch.heap)
 }
 
 fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {

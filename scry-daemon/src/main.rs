@@ -20,9 +20,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use scry_core::delta::{ApplyOutcome, DeltaEvent};
 use scry_core::protocol::{
-    decode_request, encode_results, encode_shared_index, QueryKind, ResultEntry,
+    decode_request, encode_results, encode_shared_index, Order, QueryKind, ResultEntry,
     SharedIndexResponse,
 };
+use scry_core::view::SearchOptions;
 use scry_core::{ArenaStore, IndexView, Query};
 use std::sync::Arc;
 
@@ -860,6 +861,11 @@ fn refinement_cache_enabled() -> bool {
 #[derive(Default)]
 struct RefinementCache {
     kind: Option<QueryKind>,
+    /// The ordering the cached candidates were collected under. A cached set
+    /// is only a superset of a refined query's matches for the *same*
+    /// ordering: the scan keeps the best `REFINEMENT_CACHE_CAP` by that
+    /// ordering, and a different one would have kept different records.
+    order: Order,
     terms: Vec<String>,
     per_volume: Vec<Option<VolumeCandidates>>,
 }
@@ -939,18 +945,20 @@ fn search_indexes_with_cache(
     indexes: &VolumeIndexes,
     kind: QueryKind,
     query: &Query,
-    limit: usize,
+    options: SearchOptions,
     cancel: scry_core::Cancellation,
     cache: &mut RefinementCache,
 ) -> Vec<ResultEntry> {
+    let SearchOptions { limit, order } = options;
     if limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
     let Some(new_terms) = refinable_terms(kind, query).filter(|_| refinement_cache_enabled())
     else {
-        return search_indexes_cancellable(indexes, query, limit, cancel);
+        return search_indexes_cancellable(indexes, query, options, cancel);
     };
-    let refine = cache.kind == Some(kind) && is_refinement(&cache.terms, &new_terms);
+    let refine =
+        cache.kind == Some(kind) && cache.order == order && is_refinement(&cache.terms, &new_terms);
     if !refine || cache.per_volume.len() != indexes.len() {
         cache.per_volume.clear();
         cache.per_volume.resize_with(indexes.len(), || None);
@@ -989,7 +997,13 @@ fn search_indexes_with_cache(
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            view.search_cancellable_pooled(query, scan_limit, Some(cancel), query_thread_count())
+            let hits = view.search_hits_cancellable(
+                query,
+                SearchOptions::ordered(scan_limit, order),
+                Some(cancel),
+                query_thread_count(),
+            );
+            view.materialize(&hits)
         };
         if cancel.is_cancelled() {
             return Vec::new();
@@ -1008,10 +1022,11 @@ fn search_indexes_with_cache(
         );
     }
     cache.kind = Some(kind);
+    cache.order = order;
     cache.terms = new_terms;
     cache.per_volume = next_per_volume;
 
-    rank_sort_truncate(query, &mut merged, limit);
+    rank_sort_truncate(query, order, &mut merged, limit);
     merged
 }
 
@@ -1111,8 +1126,14 @@ fn handle_request(
         }
         QueryKind::ShareIndex => unreachable!(),
     };
-    let entries =
-        search_indexes_with_cache(indexes, req.kind, &query, req.limit as usize, cancel, cache);
+    let entries = search_indexes_with_cache(
+        indexes,
+        req.kind,
+        &query,
+        SearchOptions::ordered(req.limit as usize, req.order),
+        cancel,
+        cache,
+    );
     Ok(encode_results(&entries))
 }
 
@@ -1122,10 +1143,10 @@ fn handle_request(
 fn search_indexes_cancellable(
     indexes: &VolumeIndexes,
     query: &Query,
-    limit: usize,
+    options: SearchOptions,
     cancel: scry_core::Cancellation,
 ) -> Vec<ResultEntry> {
-    if limit == 0 || cancel.is_cancelled() {
+    if options.limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
     let mut entries = Vec::new();
@@ -1133,28 +1154,36 @@ fn search_indexes_cancellable(
         if cancel.is_cancelled() {
             return Vec::new();
         }
-        entries.extend(index.store.load_full().search_cancellable_pooled(
-            query,
-            limit,
-            Some(cancel),
-            query_thread_count(),
-        ));
+        let view = index.store.load_full();
+        let hits = view.search_hits_cancellable(query, options, Some(cancel), query_thread_count());
+        entries.extend(view.materialize(&hits));
     }
     if cancel.is_cancelled() {
         return Vec::new();
     }
-    rank_sort_truncate(query, &mut entries, limit);
+    rank_sort_truncate(query, options.order, &mut entries, options.limit);
     entries
 }
 
 /// Orders merged cross-volume results by rank and keeps the best `limit`.
+///
+/// The per-volume search already ranked within its own volume; this is the
+/// merge step, and it has only `ResultEntry`s to work from — the record
+/// indices that made the in-volume keys unique belong to different volumes
+/// and are not comparable across them. So the key is rebuilt from the fields
+/// that survive the volume boundary.
 ///
 /// `result_rank` is not free — for `PathTerms` it is a naive substring scan
 /// per term over the leaf name — so it is computed exactly once per entry
 /// here, into a permutation that is sorted instead of the entries themselves.
 /// Passing it to `sort_by` directly, as this used to, re-derived both operands
 /// on every one of the O(n log n) comparisons.
-fn rank_sort_truncate(query: &Query, entries: &mut Vec<ResultEntry>, limit: usize) {
+fn rank_sort_truncate(
+    query: &Query,
+    ordering: Order,
+    entries: &mut Vec<ResultEntry>,
+    limit: usize,
+) {
     if entries.len() <= 1 {
         entries.truncate(limit);
         return;
@@ -1162,7 +1191,7 @@ fn rank_sort_truncate(query: &Query, entries: &mut Vec<ResultEntry>, limit: usiz
     let mut order: Vec<((u8, usize), u32)> = entries
         .iter()
         .enumerate()
-        .map(|(position, entry)| (result_rank(query, entry), position as u32))
+        .map(|(position, entry)| (merge_rank(query, ordering, entry), position as u32))
         .collect();
     // Path is the tiebreak rather than the scan order the entries arrived in,
     // so that a result set is stable across a reindex that renumbers records.
@@ -1181,6 +1210,20 @@ fn rank_sort_truncate(query: &Query, entries: &mut Vec<ResultEntry>, limit: usiz
             .take()
             .expect("each position appears exactly once in the permutation")
     }));
+}
+
+/// The cross-volume merge key for one entry under `ordering`.
+///
+/// `Recent`/`Largest` complement their field for the same reason
+/// [`scry_core::rank`] does — descending on an ascending-sorted key — and are
+/// widened to the `(u8, usize)` shape the permutation sort already uses rather
+/// than growing a second code path for two orderings.
+fn merge_rank(query: &Query, ordering: Order, entry: &ResultEntry) -> (u8, usize) {
+    match ordering {
+        Order::Relevance => result_rank(query, entry),
+        Order::Recent => (0, !entry.mtime as usize),
+        Order::Largest => (0, !entry.size as usize),
+    }
 }
 
 fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
@@ -1287,8 +1330,12 @@ mod tests {
         }]);
         let generation = std::sync::atomic::AtomicU64::new(1);
         let cancel = scry_core::Cancellation::new(&generation, 0); // stale: expects 0, generation is 1
-        let entries =
-            search_indexes_cancellable(&indexes, &Query::Substring("file".into()), 50, cancel);
+        let entries = search_indexes_cancellable(
+            &indexes,
+            &Query::Substring("file".into()),
+            SearchOptions::new(50),
+            cancel,
+        );
         assert!(entries.is_empty());
     }
 
@@ -1329,6 +1376,7 @@ mod tests {
             kind: QueryKind::Substring,
             pattern: "file".to_string(),
             limit: 50,
+            order: Order::default(),
         };
         // Both requests are written before either response is read, so the
         // daemon's peek thread should see the second one arrive while (or
@@ -1418,7 +1466,7 @@ mod tests {
                     &indexes,
                     QueryKind::Substring,
                     &Query::Substring(pattern.clone()),
-                    50,
+                    SearchOptions::new(50),
                     scry_core::Cancellation::new(&generation, 0),
                     &mut cache,
                 );
@@ -1430,7 +1478,7 @@ mod tests {
                     &indexes,
                     QueryKind::Substring,
                     &Query::Substring(pattern.clone()),
-                    50,
+                    SearchOptions::new(50),
                     scry_core::Cancellation::new(&generation, 0),
                     &mut uncached,
                 );
@@ -1455,7 +1503,7 @@ mod tests {
             &indexes,
             QueryKind::Substring,
             &Query::Substring("resu".to_string()),
-            50,
+            SearchOptions::new(50),
             scry_core::Cancellation::new(&generation, 0),
             &mut cache,
         );
@@ -1466,14 +1514,14 @@ mod tests {
             &indexes,
             QueryKind::Wildcard,
             &wildcard_query,
-            50,
+            SearchOptions::new(50),
             scry_core::Cancellation::new(&generation, 0),
             &mut cache,
         );
         let expected = search_indexes_cancellable(
             &indexes,
             &wildcard_query,
-            50,
+            SearchOptions::new(50),
             scry_core::Cancellation::new(&generation, 0),
         );
         assert_eq!(actual, expected);
@@ -1497,7 +1545,7 @@ mod tests {
             &indexes,
             QueryKind::Substring,
             &Query::Substring("re".to_string()),
-            5,
+            SearchOptions::new(5),
             scry_core::Cancellation::new(&generation, 0),
             &mut cache,
         );
@@ -1511,13 +1559,87 @@ mod tests {
             &indexes,
             QueryKind::Substring,
             &Query::Substring("res".to_string()),
-            5,
+            SearchOptions::new(5),
             scry_core::Cancellation::new(&generation, 0),
             &mut cache,
         );
         assert!(
             cache.per_volume.iter().all(Option::is_some),
             "the second refinable query on a connection should scan wide and cache"
+        );
+    }
+
+    /// The merge across volumes has only `ResultEntry`s to sort, so a bug
+    /// here would show up as results that are correctly ranked *within* each
+    /// volume and shuffled across them — which no per-volume test can catch.
+    #[test]
+    fn the_cross_volume_merge_honors_the_requested_order() {
+        let entry = |path: &str, size: u64, mtime: u32| ResultEntry {
+            path: path.to_string(),
+            size,
+            mtime,
+            is_dir: false,
+        };
+        let query = Query::Substring("report".to_string());
+        let merged = vec![
+            entry(
+                r"C:
+eport.txt",
+                10,
+                300,
+            ),
+            entry(
+                r"D:
+eport.txt",
+                30,
+                100,
+            ),
+            entry(
+                r"C:
+eport.txt",
+                20,
+                200,
+            ),
+        ];
+
+        let paths = |ordering| {
+            let mut entries = merged.clone();
+            rank_sort_truncate(&query, ordering, &mut entries, 10);
+            entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(Order::Recent),
+            [
+                r"C:
+eport.txt",
+                r"C:
+eport.txt",
+                r"D:
+eport.txt"
+            ]
+        );
+        assert_eq!(
+            paths(Order::Largest),
+            [
+                r"D:
+eport.txt",
+                r"C:
+eport.txt",
+                r"C:
+eport.txt"
+            ]
+        );
+
+        let mut truncated = merged.clone();
+        rank_sort_truncate(&query, Order::Largest, &mut truncated, 1);
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(
+            truncated[0].path,
+            r"D:
+eport.txt"
         );
     }
 
@@ -1539,6 +1661,7 @@ mod tests {
         .map(|path| ResultEntry {
             path: (*path).to_string(),
             size: 0,
+            mtime: 0,
             is_dir: false,
         })
         .collect();
@@ -1552,7 +1675,7 @@ mod tests {
 
         for limit in 0..=entries.len() + 1 {
             let mut actual = entries.clone();
-            rank_sort_truncate(&query, &mut actual, limit);
+            rank_sort_truncate(&query, Order::Relevance, &mut actual, limit);
             let mut want = expected.clone();
             want.truncate(limit);
             assert_eq!(actual, want, "limit {limit}");

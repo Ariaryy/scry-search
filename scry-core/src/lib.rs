@@ -9,6 +9,7 @@ mod literals;
 pub mod pathindex;
 pub mod protocol;
 pub mod query;
+pub mod rank;
 pub mod record;
 pub mod store;
 pub mod terms;

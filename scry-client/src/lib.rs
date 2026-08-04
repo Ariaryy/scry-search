@@ -4,7 +4,8 @@
 //! be a thin wrapper around the same `Client::query` call.
 
 use scry_core::protocol::{decode_results, decode_shared_index, encode_request, Request};
-pub use scry_core::protocol::{QueryKind, ResultEntry};
+pub use scry_core::protocol::{Order, QueryKind, ResultEntry};
+use scry_core::view::SearchOptions;
 
 struct LocalIndex {
     view: scry_ipc::SectionView,
@@ -47,10 +48,22 @@ impl Client {
         pattern: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<ResultEntry>> {
+        self.query_ordered(kind, pattern, limit, Order::default())
+    }
+
+    /// As [`Self::query`], but with an explicit result ordering.
+    pub fn query_ordered(
+        &self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+        order: Order,
+    ) -> anyhow::Result<Vec<ResultEntry>> {
         let req = Request {
             kind,
             pattern: pattern.to_string(),
             limit,
+            order,
         };
         self.pipe.write_frame(&encode_request(&req))?;
         let resp = self.pipe.read_frame()?;
@@ -89,6 +102,7 @@ impl Client {
             kind,
             pattern: pattern.to_string(),
             limit,
+            order: Order::default(),
         };
         self.pipe.write_frame(&encode_request(&req))?;
         self.pending_interactive += 1;
@@ -121,6 +135,17 @@ impl Client {
         pattern: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<ResultEntry>> {
+        self.search_local_ordered(kind, pattern, limit, Order::default())
+    }
+
+    /// As [`Self::search_local`], but with an explicit result ordering.
+    pub fn search_local_ordered(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+        order: Order,
+    ) -> anyhow::Result<Vec<ResultEntry>> {
         if kind == QueryKind::ShareIndex {
             return Err(anyhow::anyhow!("invalid search kind"));
         }
@@ -132,6 +157,7 @@ impl Client {
                 .map(|local| local.generation.to_string())
                 .unwrap_or_default(),
             limit: 0,
+            order: Order::default(),
         };
         let shared = (|| -> anyhow::Result<_> {
             self.pipe.write_frame(&encode_request(&request))?;
@@ -142,7 +168,7 @@ impl Client {
             Ok(shared) => shared,
             Err(_) => {
                 self.pipe = scry_ipc::connect_client(&self.pipe_name)?;
-                return self.query(kind, pattern, limit);
+                return self.query_ordered(kind, pattern, limit, order);
             }
         };
 
@@ -162,14 +188,14 @@ impl Client {
             })();
             match mapped {
                 Ok(local) => self.local = Some(local),
-                Err(_) => return self.query(kind, pattern, limit),
+                Err(_) => return self.query_ordered(kind, pattern, limit, order),
             }
         } else if self
             .local
             .as_ref()
             .is_none_or(|local| local.generation != shared.generation)
         {
-            return self.query(kind, pattern, limit);
+            return self.query_ordered(kind, pattern, limit, order);
         }
 
         let local = self.local.as_mut().unwrap();
@@ -185,23 +211,24 @@ impl Client {
             ),
             QueryKind::ShareIndex => unreachable!(),
         };
+        let options = SearchOptions::ordered(limit as usize, order);
         if let scry_core::Query::PathTerms(terms) = &query {
             let path_index = local
                 .path_index
                 .get_or_insert_with(|| scry_core::pathindex::PathIndex::build(arena, &local.delta));
-            return Ok(scry_core::view::search_path_terms(
+            let hits =
+                scry_core::view::search_path_terms(arena, &local.delta, path_index, terms, options);
+            return Ok(scry_core::view::materialize_hits(
                 arena,
                 &local.delta,
-                path_index,
-                terms,
-                limit as usize,
+                &hits,
             ));
         }
         Ok(scry_core::view::search_archived_with_delta(
             arena,
             &local.delta,
             &query,
-            limit as usize,
+            options,
         ))
     }
 
@@ -253,6 +280,7 @@ mod tests {
         ResultEntry {
             path: name.to_string(),
             size: 0,
+            mtime: 0,
             is_dir: false,
         }
     }
@@ -287,6 +315,7 @@ mod tests {
                 kind: QueryKind::Substring,
                 pattern: "stale-query".to_string(),
                 limit: 50,
+                order: Order::default(),
             }))
             .unwrap();
         client.pending_interactive = 1;

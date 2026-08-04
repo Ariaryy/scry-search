@@ -4,11 +4,13 @@
 //! `*`/`?` in the pattern switch to a wildcard search automatically.
 //! `--interactive` types the query live against the daemon's pipelined
 //! as-you-type endpoint instead of running one query and exiting.
+//! `--sort recent|size|relevance` picks the result ordering (default
+//! relevance).
 
 mod console;
 
 use scry_client::Client;
-use scry_core::protocol::{QueryKind, ResultEntry};
+use scry_core::protocol::{Order, QueryKind, ResultEntry};
 
 const INTERACTIVE_LIMIT: u32 = 20;
 
@@ -17,8 +19,10 @@ fn main() -> anyhow::Result<()> {
     let mut verbose = false;
     let mut interactive = false;
     let mut explicit_kind = None;
+    let mut order = Order::default();
     let mut terms = Vec::new();
-    for argument in std::env::args().skip(1) {
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--shared-index" => shared = true,
             "--no-shared-index" => shared = false,
@@ -27,6 +31,14 @@ fn main() -> anyhow::Result<()> {
             "--prefix" => explicit_kind = Some(QueryKind::Prefix),
             "--substring" => explicit_kind = Some(QueryKind::Substring),
             "--wildcard" => explicit_kind = Some(QueryKind::Wildcard),
+            "--sort" => {
+                let value = arguments.next().unwrap_or_default();
+                order = parse_order(&value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown --sort value {value:?}; expected relevance, recent or size"
+                    )
+                })?;
+            }
             _ => terms.push(argument),
         }
     }
@@ -49,22 +61,37 @@ fn main() -> anyhow::Result<()> {
         if verbose {
             eprintln!("scry: shared-index query path (automatic RPC fallback)");
         }
-        client.search_local(kind, &query, 200)?
+        client.search_local_ordered(kind, &query, 200, order)?
     } else {
         if verbose {
             eprintln!("scry: RPC query path");
         }
-        client.query(kind, &query, 200)?
+        client.query_ordered(kind, &query, 200, order)?
     };
     if results.is_empty() {
         println!("no matches");
         return Ok(());
     }
     for entry in results {
-        let marker = if entry.is_dir { "/" } else { "" };
-        println!("{}{marker}\t{}", entry.path, entry.size);
+        print_entry(&entry);
     }
     Ok(())
+}
+
+/// The ordering names accepted by `--sort`. `size` rather than `largest`
+/// because that is what the column is called on screen.
+fn parse_order(value: &str) -> Option<Order> {
+    match value {
+        "relevance" => Some(Order::Relevance),
+        "recent" => Some(Order::Recent),
+        "size" => Some(Order::Largest),
+        _ => None,
+    }
+}
+
+fn print_entry(entry: &ResultEntry) {
+    let marker = if entry.is_dir { "/" } else { "" };
+    println!("{}{marker}\t{}\t{}", entry.path, entry.size, entry.mtime);
 }
 
 /// Redraws the query line and its current results as the user types, using
@@ -130,8 +157,7 @@ fn run_interactive(
     drop(raw);
 
     for entry in &results {
-        let marker = if entry.is_dir { "/" } else { "" };
-        println!("{}{marker}\t{}", entry.path, entry.size);
+        print_entry(entry);
     }
     Ok(())
 }
@@ -177,6 +203,14 @@ fn infer_query_kind(explicit_kind: Option<QueryKind>, query: &str) -> QueryKind 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_names_map_onto_orders() {
+        assert_eq!(parse_order("recent"), Some(Order::Recent));
+        assert_eq!(parse_order("size"), Some(Order::Largest));
+        assert_eq!(parse_order("relevance"), Some(Order::Relevance));
+        assert_eq!(parse_order("largest"), None);
+    }
 
     #[test]
     fn infers_wildcard_from_glob_metacharacters() {
