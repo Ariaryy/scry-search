@@ -39,24 +39,38 @@ pub struct MftEnumReport {
     pub nonresident_attribute_lists: usize,
     pub targeted_extension_reads: usize,
     pub extra_hard_links_ignored: usize,
-    /// Non-directory records emitted with a size of zero.
-    ///
-    /// A genuinely empty file is rare, so this should stay near zero on a real
-    /// volume. A large count means `$DATA` is not being found — the usual
-    /// causes being a base record whose unnamed `$DATA` lives in an extension
-    /// reached through an `$ATTRIBUTE_LIST` we could not resolve, or a stream
-    /// that is entirely named. `size` reaching the index as 0 is documented to
-    /// mean *unknown*, so without this counter the gap is indistinguishable
-    /// from a volume full of empty files.
-    pub files_with_zero_size: usize,
+    /// Non-directory records emitted with a size of zero because no unnamed
+    /// `$DATA` attribute was ever found for them — in the base record, in an
+    /// extension record we read directly, or in one resolved through an
+    /// `$ATTRIBUTE_LIST`. The index's `size == 0` is documented to mean
+    /// *unknown* for exactly this reason; a large count here means `$DATA`
+    /// is not being found, the usual causes being a base record whose
+    /// unnamed `$DATA` lives in an extension reached through an
+    /// `$ATTRIBUTE_LIST` we could not resolve, or a stream that is entirely
+    /// named.
+    pub files_with_unknown_size: usize,
+    /// Non-directory records emitted with a size of zero because an unnamed
+    /// `$DATA` attribute *was* found and it reported a length of zero — a
+    /// genuinely empty file, not a coverage gap. Kept separate from
+    /// `files_with_unknown_size` because both reach the index as the same
+    /// `size == 0`, and conflating them makes the unknown-size count (the
+    /// one that matters for judging reader coverage) useless.
+    pub files_with_confirmed_empty_size: usize,
 }
 
 /// Records one emitted entry. Both emit sites go through here so the size
-/// coverage counter can't drift away from `emitted`.
-fn note_emitted(report: &mut MftEnumReport, is_dir: bool, size: u64) {
+/// coverage counters can't drift away from `emitted`. `size_known` is
+/// whether an unnamed `$DATA` attribute was actually found for this record
+/// (in the base record or a resolved extension) — as opposed to `size`
+/// merely defaulting to zero because none was found.
+fn note_emitted(report: &mut MftEnumReport, is_dir: bool, size: u64, size_known: bool) {
     report.emitted += 1;
     if !is_dir && size == 0 {
-        report.files_with_zero_size += 1;
+        if size_known {
+            report.files_with_confirmed_empty_size += 1;
+        } else {
+            report.files_with_unknown_size += 1;
+        }
     }
 }
 
@@ -67,6 +81,13 @@ struct DeferredRecord {
     is_dir: bool,
     mtime: u32,
     size: u64,
+    /// Whether `size` came from an unnamed `$DATA` attribute actually seen
+    /// in the base record, as opposed to defaulting to zero because none
+    /// was found there. Carried through to `resolve_deferred` so a size
+    /// resolved from an extension record doesn't get miscounted against
+    /// this flag, and so a record whose size is *never* found (base or
+    /// extension) is still reported as unknown rather than empty.
+    size_known: bool,
 }
 
 struct ExtensionRecord {
@@ -377,6 +398,7 @@ fn parse_and_emit(
             is_dir: record.is_dir(),
             mtime,
             size,
+            size_known: has_data,
         });
         return Ok(());
     }
@@ -401,7 +423,7 @@ fn parse_and_emit(
         mtime,
         size,
     );
-    note_emitted(&mut state.report, record.is_dir(), size);
+    note_emitted(&mut state.report, record.is_dir(), size, has_data);
     Ok(())
 }
 
@@ -512,6 +534,7 @@ fn resolve_deferred(
             .or_else(|| names.iter().find(|name| name.namespace == 0));
         if let Some(name) = selected {
             state.report.extra_hard_links_ignored += names.len().saturating_sub(1);
+            let size_known = resolved_sizes[base_index].is_some() || base.size_known;
             let size = resolved_sizes[base_index].unwrap_or(base.size);
             sink(
                 base.frn,
@@ -521,7 +544,7 @@ fn resolve_deferred(
                 resolved_mtimes[base_index].unwrap_or(base.mtime),
                 size,
             );
-            note_emitted(&mut state.report, base.is_dir, size);
+            note_emitted(&mut state.report, base.is_dir, size, size_known);
         }
         if resolved_children[base_index] {
             state.report.attribute_list_resolved += 1;

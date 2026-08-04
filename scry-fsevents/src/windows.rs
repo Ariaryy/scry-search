@@ -175,13 +175,16 @@ impl WindowsBackend {
         // from a volume where every file happens to be empty.
         match build_raw_index(volume) {
             Ok((arena, frns, report)) => {
-                let unknown = report.files_with_zero_size;
+                let unknown = report.files_with_unknown_size;
+                let empty = report.files_with_confirmed_empty_size;
                 eprintln!(
                     "scry: {volume} indexed by the raw $MFT reader: {} entries, \
                      {unknown} of them files with unknown size ({:.2}%), \
+                     {empty} confirmed genuinely empty ({:.2}%), \
                      {} unresolved attribute lists",
                     report.emitted,
                     100.0 * unknown as f64 / report.emitted.max(1) as f64,
+                    100.0 * empty as f64 / report.emitted.max(1) as f64,
                     report.attribute_list_unresolved,
                 );
                 eprintln!("scry: {volume} raw reader detail: {report:?}");

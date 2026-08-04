@@ -90,7 +90,17 @@
   saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
   it 0 because USN records do not carry size, so 0 means unknown rather than
   empty. The raw reader is used for a supported elevated NTFS volume and
-  demotes to USN on parse errors or excessive torn records.
+  demotes to USN on parse errors or excessive torn records. `MftEnumReport`
+  (`scry-fsevents/src/mft/mod.rs`) splits `size == 0` into
+  `files_with_unknown_size` (no unnamed `$DATA` attribute was ever found —
+  a coverage gap) and `files_with_confirmed_empty_size` (an unnamed `$DATA`
+  attribute was found and reported zero length — a genuine empty file), since
+  conflating the two makes the coverage number meaningless. On the reference
+  C: measurement the two were 1.38% and 1.36% of entries respectively — nearly
+  even, and both far larger than the ~0.08% (1,540 of 2,003,924) explained by
+  unresolved `$ATTRIBUTE_LIST`s; on D: they were 0.93% and roughly 0.9%. Most
+  of `files_with_unknown_size` is therefore not attribute-list residue — the
+  actual cause of the remainder is still open.
 - **Non-resident `$ATTRIBUTE_LIST` streams are detected but not decoded.** The
   reference C: measurement reported 4,220 such lists, 1,540 unresolved base
   records, and a stable 1,555–1,564 USN-only residual versus 18–25 raw-only
