@@ -15,6 +15,7 @@ use scry_core::protocol::{Order, QueryKind, ResultEntry};
 const INTERACTIVE_LIMIT: u32 = 20;
 
 fn main() -> anyhow::Result<()> {
+    let t0 = std::time::Instant::now();
     let mut shared = false;
     let mut verbose = false;
     let mut interactive = false;
@@ -44,7 +45,9 @@ fn main() -> anyhow::Result<()> {
     }
     let query = terms.join(" ");
 
+    let t_args = t0.elapsed();
     let mut client = Client::connect().map_err(|e| anyhow::anyhow!("{e}\nis scryd running?"))?;
+    let t_connect = t0.elapsed();
 
     if interactive {
         return run_interactive(&mut client, explicit_kind, query);
@@ -68,12 +71,31 @@ fn main() -> anyhow::Result<()> {
         }
         client.query_ordered(kind, &query, 200, order)?
     };
-    if results.is_empty() {
+    let t_query = t0.elapsed();
+    let empty = results.is_empty();
+    if empty {
         println!("no matches");
-        return Ok(());
+    } else {
+        for entry in results {
+            print_entry(&entry);
+        }
     }
-    for entry in results {
-        print_entry(&entry);
+    let t_print = t0.elapsed();
+    if verbose {
+        // Measured against a two-volume, ~2.7M-record corpus: `connect` and
+        // `print` are consistently sub-millisecond, and `args` is
+        // microseconds — process creation (before this process's `main`
+        // even starts, so it isn't captured here) and the RPC round trip
+        // are where end-to-end latency actually goes. See the "measure CLI
+        // overhead" note in AGENTS.md.
+        eprintln!(
+            "scry: timing args={:?} connect={:?} query={:?} print={:?} total={:?}",
+            t_args,
+            t_connect - t_args,
+            t_query - t_connect,
+            t_print - t_query,
+            t_print
+        );
     }
     Ok(())
 }

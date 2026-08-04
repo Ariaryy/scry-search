@@ -96,6 +96,14 @@
   aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
   (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
   record indices from different volumes are not comparable.
+- **`scry --verbose` prints in-process CLI phase timings** for argument parsing,
+  connection, query round trip, and result printing. They begin in `main`, so exclude
+  process startup/loader and teardown. A local two-volume, ~2.7M-record measurement found
+  arguments at ~20–30 µs, pipe connection at ~55–65 µs, and printing at ~1–2 ms;
+  the RPC query dominated at ~100–170 ms. Process wall time added ~20–25 ms outside
+  `main`. A no-match path-term query still took ~34 ms, consistent with its fixed
+  directory-closure pass. Treat these as diagnostic local measurements, not a regression
+  benchmark; do not try to remove that closure cost as a small CLI optimization.
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
