@@ -92,7 +92,8 @@
   the other orderings skip the name decode.
 - **Matching, ranking and path reconstruction are three separate steps.** `search_hits`
   returns `Hit`s (record, size, mtime, is_dir); `full_path` costs a parent-chain walk and a
-  `String` (~3.5 µs) and happens only in `materialize_hits`. A consumer that counts,
+  `String` (~2.4–3.0 µs per hit, measured via the `materialize` criterion bench at 50/1000/20000
+  hits on a 440k-record corpus) and happens only in `materialize_hits`. A consumer that counts,
   aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
   (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
   record indices from different volumes are not comparable.
