@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! scryd: background indexing daemon. Bulk-indexes an NTFS volume via
 //! scry-fsevents, serves queries over a named pipe, and keeps the index
 //! current by watching the USN journal.
@@ -19,11 +21,12 @@ mod ffi;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use scry_core::delta::{ApplyOutcome, DeltaEvent};
+use scry_core::metrics::QuerySpans;
 use scry_core::protocol::{
     decode_request, encode_results, encode_shared_index, Order, QueryKind, ResultEntry,
     SharedIndexResponse,
 };
-use scry_core::view::SearchOptions;
+use scry_core::view::{Hit, SearchOptions};
 use scry_core::{ArenaStore, IndexView, Query};
 use std::sync::Arc;
 
@@ -47,6 +50,168 @@ struct StartupView {
 }
 
 type VolumeIndexes = Arc<Vec<VolumeIndex>>;
+
+#[derive(Default, Clone, Copy, Debug)]
+struct MemorySample {
+    private_usage: u64,
+    working_set: u64,
+    peak_working_set: u64,
+    page_faults: u32,
+}
+
+struct QueryMetrics {
+    count: u64,
+    total: QuerySpans,
+    max: QuerySpans,
+    samples: [QuerySpans; 1024],
+    next: usize,
+    sample_count: usize,
+    memory: MemorySample,
+    last_memory: std::time::Instant,
+}
+
+impl QueryMetrics {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            total: QuerySpans::default(),
+            max: QuerySpans::default(),
+            samples: [QuerySpans::default(); 1024],
+            next: 0,
+            sample_count: 0,
+            memory: MemorySample::default(),
+            last_memory: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn record(&mut self, spans: QuerySpans) {
+        self.count += 1;
+        add_spans(&mut self.total, spans);
+        max_spans(&mut self.max, spans);
+        self.samples[self.next] = spans;
+        self.next = (self.next + 1) % self.samples.len();
+        self.sample_count = (self.sample_count + 1).min(self.samples.len());
+        self.sample_memory(false);
+    }
+
+    fn sample_memory(&mut self, force: bool) {
+        if force || self.last_memory.elapsed() >= std::time::Duration::from_secs(1) {
+            self.memory = process_memory();
+            self.last_memory = std::time::Instant::now();
+        }
+    }
+
+    fn report(&mut self) -> String {
+        self.sample_memory(true);
+        let mut out = format!("queries: {}\n", self.count);
+        for (label, get) in [
+            ("match_ns", span_match as fn(QuerySpans) -> u64),
+            ("rank_ns", span_rank),
+            ("materialize_ns", span_materialize),
+            ("encode_ns", span_encode),
+            ("candidates", span_candidates),
+            ("emitted", span_emitted),
+            ("blocks_scanned", span_blocks_scanned),
+            ("blocks_total", span_blocks_total),
+        ] {
+            let mut values: Vec<u64> = self.samples[..self.sample_count]
+                .iter()
+                .copied()
+                .map(get)
+                .collect();
+            values.sort_unstable();
+            let p50 = values.get(values.len() / 2).copied().unwrap_or_default();
+            let p99 = values
+                .get(values.len().saturating_mul(99) / 100)
+                .copied()
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{label}: sum={} max={} p50={p50} p99={p99}\n",
+                get(self.total),
+                get(self.max)
+            ));
+        }
+        out.push_str(&format!(
+            "private_usage={} working_set={} peak_working_set={} page_faults={}",
+            self.memory.private_usage,
+            self.memory.working_set,
+            self.memory.peak_working_set,
+            self.memory.page_faults,
+        ));
+        out
+    }
+}
+
+static QUERY_METRICS: std::sync::OnceLock<std::sync::Mutex<QueryMetrics>> =
+    std::sync::OnceLock::new();
+
+fn query_metrics() -> &'static std::sync::Mutex<QueryMetrics> {
+    QUERY_METRICS.get_or_init(|| std::sync::Mutex::new(QueryMetrics::new()))
+}
+
+macro_rules! span_fields {
+    ($target:expr, $source:expr, $op:expr) => {{
+        $op(&mut $target.match_ns, $source.match_ns);
+        $op(&mut $target.rank_ns, $source.rank_ns);
+        $op(&mut $target.materialize_ns, $source.materialize_ns);
+        $op(&mut $target.encode_ns, $source.encode_ns);
+        $op(&mut $target.candidates, $source.candidates);
+        $op(&mut $target.emitted, $source.emitted);
+        $op(&mut $target.blocks_scanned, $source.blocks_scanned);
+        $op(&mut $target.blocks_total, $source.blocks_total);
+    }};
+}
+
+fn add_spans(target: &mut QuerySpans, source: QuerySpans) {
+    span_fields!(target, source, |field: &mut u64, value| *field =
+        field.saturating_add(value));
+}
+
+fn max_spans(target: &mut QuerySpans, source: QuerySpans) {
+    span_fields!(target, source, |field: &mut u64, value| *field =
+        (*field).max(value));
+}
+
+fn span_match(spans: QuerySpans) -> u64 {
+    spans.match_ns
+}
+fn span_rank(spans: QuerySpans) -> u64 {
+    spans.rank_ns
+}
+fn span_materialize(spans: QuerySpans) -> u64 {
+    spans.materialize_ns
+}
+fn span_encode(spans: QuerySpans) -> u64 {
+    spans.encode_ns
+}
+fn span_candidates(spans: QuerySpans) -> u64 {
+    spans.candidates
+}
+fn span_emitted(spans: QuerySpans) -> u64 {
+    spans.emitted
+}
+fn span_blocks_scanned(spans: QuerySpans) -> u64 {
+    spans.blocks_scanned
+}
+fn span_blocks_total(spans: QuerySpans) -> u64 {
+    spans.blocks_total
+}
+
+fn process_memory() -> MemorySample {
+    let mut counters: ffi::ProcessMemoryCountersEx = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<ffi::ProcessMemoryCountersEx>() as u32;
+    if unsafe { ffi::GetProcessMemoryInfo(ffi::GetCurrentProcess(), &mut counters, counters.cb) }
+        == 0
+    {
+        return MemorySample::default();
+    }
+    MemorySample {
+        private_usage: counters.PrivateUsage as u64,
+        working_set: counters.WorkingSetSize as u64,
+        peak_working_set: counters.PeakWorkingSetSize as u64,
+        page_faults: counters.PageFaultCount,
+    }
+}
 
 /// Read by `handle_console_ctrl`, which — being a plain Win32 callback — has
 /// no way to receive the indexes as an argument. Set once at startup, never
@@ -171,8 +336,7 @@ fn main() -> anyhow::Result<()> {
     let mut indexed = Vec::new();
     for volume in volume_names {
         eprintln!("scryd: indexing {volume}...");
-        let initial = match build_or_resume_view(&volume, &all_volumes, auxiliary_marking_enabled)
-        {
+        let initial = match build_or_resume_view(&volume, &all_volumes, auxiliary_marking_enabled) {
             Ok(view) => view,
             Err(error) => {
                 eprintln!("scryd: skipping {volume}: {error}");
@@ -923,7 +1087,7 @@ struct RefinementCache {
 
 struct VolumeCandidates {
     generation: u64,
-    candidates: Vec<ResultEntry>,
+    hits: Vec<Hit>,
 }
 
 /// The term list a query would need to have matched to be filterable from a
@@ -953,36 +1117,28 @@ fn is_refinement(old_terms: &[String], new_terms: &[String]) -> bool {
         })
 }
 
-fn leaf_name(path: &str) -> &str {
-    path.rsplit('\\').next().unwrap_or(path)
-}
-
-fn contains_ci(haystack: &str, needle: &str) -> bool {
-    needle.is_empty()
-        || haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
 /// Re-checks a cached hit against a refined query without touching the
 /// index, mirroring the matching rules `search_base`/`search_path_terms` use
 /// so a filtered cache and a full rescan never disagree.
-fn matches_refined(entry: &ResultEntry, kind: QueryKind, terms: &[String]) -> bool {
+fn matches_refined(
+    view: &IndexView,
+    hit: Hit,
+    kind: QueryKind,
+    terms: &[String],
+    name: &mut Vec<u8>,
+) -> bool {
     match kind {
         QueryKind::Prefix => {
-            let name = leaf_name(&entry.path);
+            view.name_into(hit.record, name);
             name.len() >= terms[0].len()
-                && name.as_bytes()[..terms[0].len()].eq_ignore_ascii_case(terms[0].as_bytes())
+                && name[..terms[0].len()].eq_ignore_ascii_case(terms[0].as_bytes())
         }
-        QueryKind::Substring => contains_ci(leaf_name(&entry.path), &terms[0]),
-        QueryKind::PathTerms => terms.iter().all(|term| {
-            entry
-                .path
-                .split('\\')
-                .any(|segment| contains_ci(segment, term))
-        }),
-        QueryKind::Wildcard | QueryKind::ShareIndex => false,
+        QueryKind::Substring => {
+            view.name_into(hit.record, name);
+            scry_core::ascii::contains_ci(name, terms[0].as_bytes())
+        }
+        QueryKind::PathTerms => view.matches_path_terms(hit.record, terms, name),
+        QueryKind::Wildcard | QueryKind::ShareIndex | QueryKind::QueryStats => false,
     }
 }
 
@@ -992,6 +1148,7 @@ fn matches_refined(entry: &ResultEntry, kind: QueryKind, terms: &[String]) -> bo
 /// rescanning that volume. A volume whose index generation moved, or whose
 /// cached set hit `REFINEMENT_CACHE_CAP` last time, is rescanned on its own —
 /// one volume reindexing must not force a rescan of the others.
+#[cfg(test)]
 fn search_indexes_with_cache(
     indexes: &VolumeIndexes,
     kind: QueryKind,
@@ -1000,13 +1157,33 @@ fn search_indexes_with_cache(
     cancel: scry_core::Cancellation,
     cache: &mut RefinementCache,
 ) -> Vec<ResultEntry> {
+    search_indexes_with_cache_with_spans(
+        indexes,
+        kind,
+        query,
+        options,
+        cancel,
+        cache,
+        &mut QuerySpans::default(),
+    )
+}
+
+fn search_indexes_with_cache_with_spans(
+    indexes: &VolumeIndexes,
+    kind: QueryKind,
+    query: &Query,
+    options: SearchOptions,
+    cancel: scry_core::Cancellation,
+    cache: &mut RefinementCache,
+    spans: &mut QuerySpans,
+) -> Vec<ResultEntry> {
     let SearchOptions { limit, order } = options;
     if limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
     let Some(new_terms) = refinable_terms(kind, query).filter(|_| refinement_cache_enabled())
     else {
-        return search_indexes_cancellable(indexes, query, options, cancel);
+        return search_indexes_cancellable_with_spans(indexes, query, options, cancel, spans);
     };
     let refine =
         cache.kind == Some(kind) && cache.order == order && is_refinement(&cache.terms, &new_terms);
@@ -1029,6 +1206,7 @@ fn search_indexes_with_cache(
         limit
     };
 
+    let mut views = Vec::with_capacity(indexes.len());
     let mut merged = Vec::new();
     let mut next_per_volume = Vec::with_capacity(indexes.len());
     for (i, index) in indexes.iter().enumerate() {
@@ -1040,45 +1218,56 @@ fn search_indexes_with_cache(
             .then(|| cache.per_volume[i].as_ref())
             .flatten()
             .filter(|cached| cached.generation == view.generation);
-        let candidates = if let Some(cached) = reused {
+        let mut name = Vec::new();
+        let hits = if let Some(cached) = reused {
             cached
-                .candidates
+                .hits
                 .iter()
-                .filter(|entry| matches_refined(entry, kind, &new_terms))
-                .cloned()
+                .copied()
+                .filter(|hit| matches_refined(&view, *hit, kind, &new_terms, &mut name))
                 .collect::<Vec<_>>()
         } else {
-            let hits = view.search_hits_cancellable(
+            view.search_hits_cancellable_with_spans(
                 query,
                 SearchOptions::ordered(scan_limit, order),
                 Some(cancel),
                 query_thread_count(),
-            );
-            view.materialize(&hits)
+                Some(&mut *spans),
+            )
         };
         if cancel.is_cancelled() {
             return Vec::new();
         }
-        merged.extend(candidates.iter().cloned());
+        merged.extend(hits.iter().copied().map(|hit| (i, hit)));
         // Only a set scanned at the full cap is known to be a superset of what
         // a refined query could match. A set truncated at `limit` is not, and
         // caching it would let a later keystroke miss real hits.
         next_per_volume.push(
-            (scan_limit == REFINEMENT_CACHE_CAP && candidates.len() < REFINEMENT_CACHE_CAP).then(
-                || VolumeCandidates {
+            (scan_limit == REFINEMENT_CACHE_CAP && hits.len() < REFINEMENT_CACHE_CAP).then(|| {
+                VolumeCandidates {
                     generation: view.generation,
-                    candidates,
-                },
-            ),
+                    hits,
+                }
+            }),
         );
+        views.push(view);
     }
     cache.kind = Some(kind);
     cache.order = order;
     cache.terms = new_terms;
     cache.per_volume = next_per_volume;
 
-    rank_sort_truncate(query, order, &mut merged, limit);
-    merged
+    rank_sort_truncate_hits(query, order, &views, &mut merged, limit);
+    let started = std::time::Instant::now();
+    let entries: Vec<_> = merged
+        .into_iter()
+        .map(|(volume, hit)| views[volume].materialize_one(&hit))
+        .collect();
+    spans.materialize_ns = spans
+        .materialize_ns
+        .saturating_add(started.elapsed().as_nanos() as u64);
+    spans.emitted = spans.emitted.saturating_add(entries.len() as u64);
+    entries
 }
 
 /// A connection does its read/search/write cycle on one thread — the pipe's
@@ -1124,8 +1313,18 @@ fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::
             };
             let gen = generation.load(std::sync::atomic::Ordering::Relaxed);
             let cancel = scry_core::Cancellation::new(&generation, gen);
-            let response = handle_request(&req, indexes, &pipe, cancel, &mut cache)?;
+            let mut spans = QuerySpans::default();
+            let response = handle_request(&req, indexes, &pipe, cancel, &mut cache, &mut spans)?;
+            let write_started = (req.kind != QueryKind::QueryStats).then(std::time::Instant::now);
             pipe.write_frame(&response)?;
+            if let Some(started) = write_started {
+                spans.encode_ns = spans
+                    .encode_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+                if req.kind != QueryKind::ShareIndex {
+                    query_metrics().lock().unwrap().record(spans);
+                }
+            }
         }
     })();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1143,6 +1342,7 @@ fn handle_request(
     pipe: &scry_ipc::Pipe,
     cancel: scry_core::Cancellation,
     cache: &mut RefinementCache,
+    spans: &mut QuerySpans,
 ) -> std::io::Result<Vec<u8>> {
     // `load_full` clones the Arc, keeping this index alive for the whole
     // query even if the reindex thread swaps in a new one mid-search.
@@ -1168,6 +1368,9 @@ fn handle_request(
             overlay: snapshot.delta.encode_query_overlay(),
         }));
     }
+    if req.kind == QueryKind::QueryStats {
+        return Ok(query_metrics().lock().unwrap().report().into_bytes());
+    }
     let query = match req.kind {
         QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
         QueryKind::Substring => Query::Substring(req.pattern.clone()),
@@ -1176,44 +1379,153 @@ fn handle_request(
             Query::PathTerms(scry_core::terms::parse_terms(&req.pattern).unwrap_or_default())
         }
         QueryKind::ShareIndex => unreachable!(),
+        QueryKind::QueryStats => unreachable!(),
     };
-    let entries = search_indexes_with_cache(
+    let entries = search_indexes_with_cache_with_spans(
         indexes,
         req.kind,
         &query,
         SearchOptions::ordered(req.limit as usize, req.order),
         cancel,
         cache,
+        spans,
     );
-    Ok(encode_results(&entries))
+    let started = std::time::Instant::now();
+    let response = encode_results(&entries);
+    spans.encode_ns = spans
+        .encode_ns
+        .saturating_add(started.elapsed().as_nanos() as u64);
+    Ok(response)
 }
 
 /// Fans a query out across every volume's index and merges by rank, in one
 /// bounded top-k pass per volume. Abandons the fan-out (returning an empty
 /// result) once `cancel` reports this request was superseded.
+#[cfg(test)]
 fn search_indexes_cancellable(
     indexes: &VolumeIndexes,
     query: &Query,
     options: SearchOptions,
     cancel: scry_core::Cancellation,
 ) -> Vec<ResultEntry> {
+    search_indexes_cancellable_with_spans(
+        indexes,
+        query,
+        options,
+        cancel,
+        &mut QuerySpans::default(),
+    )
+}
+
+fn search_indexes_cancellable_with_spans(
+    indexes: &VolumeIndexes,
+    query: &Query,
+    options: SearchOptions,
+    cancel: scry_core::Cancellation,
+    spans: &mut QuerySpans,
+) -> Vec<ResultEntry> {
     if options.limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
-    let mut entries = Vec::new();
-    for index in indexes.iter() {
+    let mut views = Vec::with_capacity(indexes.len());
+    let mut hits_by_volume = Vec::new();
+    for (volume, index) in indexes.iter().enumerate() {
         if cancel.is_cancelled() {
             return Vec::new();
         }
         let view = index.store.load_full();
-        let hits = view.search_hits_cancellable(query, options, Some(cancel), query_thread_count());
-        entries.extend(view.materialize(&hits));
+        let hits = view.search_hits_cancellable_with_spans(
+            query,
+            options,
+            Some(cancel),
+            query_thread_count(),
+            Some(&mut *spans),
+        );
+        hits_by_volume.extend(hits.into_iter().map(|hit| (volume, hit)));
+        views.push(view);
     }
     if cancel.is_cancelled() {
         return Vec::new();
     }
-    rank_sort_truncate(query, options.order, &mut entries, options.limit);
+    rank_sort_truncate_hits(
+        query,
+        options.order,
+        &views,
+        &mut hits_by_volume,
+        options.limit,
+    );
+    let started = std::time::Instant::now();
+    let entries: Vec<_> = hits_by_volume
+        .into_iter()
+        .map(|(volume, hit)| views[volume].materialize_one(&hit))
+        .collect();
+    spans.materialize_ns = spans
+        .materialize_ns
+        .saturating_add(started.elapsed().as_nanos() as u64);
+    spans.emitted = spans.emitted.saturating_add(entries.len() as u64);
     entries
+}
+
+/// Rank cross-volume hits before paths are reconstructed. Record ids are
+/// volume-local, so the volume index finishes the otherwise-local key.
+fn rank_sort_truncate_hits(
+    query: &Query,
+    ordering: Order,
+    views: &[Arc<IndexView>],
+    hits: &mut Vec<(usize, Hit)>,
+    limit: usize,
+) {
+    if hits.len() <= 1 {
+        hits.truncate(limit);
+        return;
+    }
+    let mut name = Vec::new();
+    let mut order = Vec::with_capacity(hits.len());
+    for (position, (volume, hit)) in hits.iter().enumerate() {
+        let key = match ordering {
+            Order::Relevance => {
+                views[*volume].name_into(hit.record, &mut name);
+                let quality = hit_quality(query, &name);
+                scry_core::rank::relevance_key(quality, name.len() as u32, hit.record)
+            }
+            Order::Recent => scry_core::rank::recent_key(hit.mtime, hit.record),
+            Order::Largest => scry_core::rank::largest_key(
+                (hit.size / 1024).min(u32::MAX as u64) as u32,
+                hit.record,
+            ),
+        };
+        order.push((key, *volume as u32, position));
+    }
+    order.sort_unstable();
+    order.truncate(limit);
+    let mut taken: Vec<Option<(usize, Hit)>> = hits.drain(..).map(Some).collect();
+    hits.extend(order.into_iter().map(|(_, _, position)| {
+        taken[position]
+            .take()
+            .expect("each position appears exactly once in the permutation")
+    }));
+}
+
+fn hit_quality(query: &Query, name: &[u8]) -> u8 {
+    match query {
+        Query::Prefix(pattern) | Query::Substring(pattern) => {
+            if name.eq_ignore_ascii_case(pattern.as_bytes()) {
+                0
+            } else if name.len() >= pattern.len()
+                && name[..pattern.len()].eq_ignore_ascii_case(pattern.as_bytes())
+            {
+                1
+            } else {
+                2
+            }
+        }
+        Query::PathTerms(terms) => u8::from(
+            !terms
+                .iter()
+                .all(|term| scry_core::ascii::contains_ci(name, term.as_bytes())),
+        ),
+        Query::Regex(_) => 2,
+    }
 }
 
 /// Orders merged cross-volume results by rank and keeps the best `limit`.
@@ -1229,6 +1541,7 @@ fn search_indexes_cancellable(
 /// here, into a permutation that is sorted instead of the entries themselves.
 /// Passing it to `sort_by` directly, as this used to, re-derived both operands
 /// on every one of the O(n log n) comparisons.
+#[cfg(test)]
 fn rank_sort_truncate(
     query: &Query,
     ordering: Order,
@@ -1269,6 +1582,7 @@ fn rank_sort_truncate(
 /// [`scry_core::rank`] does — descending on an ascending-sorted key — and are
 /// widened to the `(u8, usize)` shape the permutation sort already uses rather
 /// than growing a second code path for two orderings.
+#[cfg(test)]
 fn merge_rank(query: &Query, ordering: Order, entry: &ResultEntry) -> (u8, usize) {
     match ordering {
         Order::Relevance => result_rank(query, entry),
@@ -1277,6 +1591,7 @@ fn merge_rank(query: &Query, ordering: Order, entry: &ResultEntry) -> (u8, usize
     }
 }
 
+#[cfg(test)]
 fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
     let name = entry.path.rsplit('\\').next().unwrap_or(&entry.path);
     let quality = match query {
@@ -1456,7 +1771,7 @@ mod tests {
         let root = b.push("C:", 0, true);
         let dirs = ["Documents", "Photos", "Projects"];
         let vocab = [
-            "resume", "report", "invoice", "photo", "backup", "notes", "draft", "project",
+            "ledger", "report", "invoice", "photo", "backup", "notes", "draft", "project",
         ];
         let exts = ["txt", "pdf", "png", "docx"];
         let mut i: u32 = 0;
@@ -1497,7 +1812,7 @@ mod tests {
         let indexes = single_volume(view);
         let generation = std::sync::atomic::AtomicU64::new(0);
         let vocab = [
-            "resume", "report", "invoice", "photo", "backup", "notes", "draft", "project",
+            "ledger", "report", "invoice", "photo", "backup", "notes", "draft", "project",
         ];
         let mut rng: u64 = 0x243F_6A88_85A3_08D3;
         let mut next_rand = || {
@@ -1618,6 +1933,163 @@ mod tests {
             cache.per_volume.iter().all(Option::is_some),
             "the second refinable query on a connection should scan wide and cache"
         );
+    }
+
+    /// Before caching `Hit`s instead of `ResultEntry`s, a refined query paid a
+    /// `full_path` reconstruction for every one of the up to
+    /// `REFINEMENT_CACHE_CAP` overscanned candidates instead of just the
+    /// emitted `limit`. `materialize_one` is called exactly once per emitted
+    /// entry, so `spans.emitted` is a direct proxy for that call count.
+    #[test]
+    fn refined_query_materializes_at_most_limit_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Larger than `REFINEMENT_CACHE_CAP` so the second query's cache
+        // population actually exercises the wide overscan this test guards.
+        let view = build_store_with_n_records(30_000, &dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let mut cache = RefinementCache::default();
+        let limit = 50;
+
+        // First refinable query on the connection: establishes the cache but
+        // does not itself overscan (see the test above).
+        search_indexes_with_cache_with_spans(
+            &indexes,
+            QueryKind::Substring,
+            &Query::Substring("f".to_string()),
+            SearchOptions::new(limit),
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+            &mut QuerySpans::default(),
+        );
+
+        let mut spans = QuerySpans::default();
+        let results = search_indexes_with_cache_with_spans(
+            &indexes,
+            QueryKind::Substring,
+            &Query::Substring("fi".to_string()),
+            SearchOptions::new(limit),
+            scry_core::Cancellation::new(&generation, 0),
+            &mut cache,
+            &mut spans,
+        );
+        assert!(results.len() <= limit);
+        assert!(
+            spans.emitted as usize <= limit,
+            "materialized {} entries for a limit of {limit}",
+            spans.emitted
+        );
+    }
+
+    /// Not a pass/fail test: exercises the daemon's real query path (cache,
+    /// span accumulation, memory sampling) end to end over a synthetic
+    /// corpus and prints a report, so the numbers in
+    /// `docs/query-latency-baseline.md` come from this code path rather than
+    /// from a description of it. Run with
+    /// `cargo test -p scry-daemon --release -- --ignored span_report --nocapture`.
+    #[test]
+    #[ignore = "prints a report; not a pass/fail gate"]
+    fn span_report_over_a_synthetic_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = Arena::builder();
+        let root = b.push("C:", 0, true);
+        let teamdir = b.push("TEAMDIR", 0, true);
+        b.set_parent(teamdir, root);
+        let dirs = ["Documents", "Photos", "Projects", "Downloads"];
+        let vocab = [
+            "ledger", "report", "invoice", "photo", "backup", "notes", "draft", "project",
+            "budget", "sketch", "summary", "ticket",
+        ];
+        let exts = ["txt", "pdf", "png", "docx", "log", "dll"];
+        let mut i: u32 = 0;
+        for &parent in &[teamdir, root] {
+            for &d in &dirs {
+                let dnode = b.push(&format!("{d}_{parent}"), 0, true);
+                b.set_parent(dnode, parent);
+                for &w in &vocab {
+                    for &ext in &exts {
+                        for _ in 0..12 {
+                            let name = format!("{w}_{i}.{ext}");
+                            let f = b.push(&name, 1_700_000_000, false);
+                            b.set_parent(f, dnode);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let arena = b.build().0;
+        let path = dir.path().join("report.rkyv");
+        save(&arena, &path).unwrap();
+        let view = Arc::new(IndexView::new(Arc::new(ArenaStore::open(&path).unwrap())));
+        println!("\ncorpus: {i} records");
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+
+        let report_one = |label: &str, cache: &mut RefinementCache, kind, query: &Query| {
+            let mut spans = QuerySpans::default();
+            let entries = search_indexes_with_cache_with_spans(
+                &indexes,
+                kind,
+                query,
+                SearchOptions::new(50),
+                scry_core::Cancellation::new(&generation, 0),
+                cache,
+                &mut spans,
+            );
+            println!(
+                "  {label:22} hits={:<6} match_ns={:<9} rank_ns={:<8} materialize_ns={:<8} \
+                 candidates={:<7} emitted={}",
+                entries.len(),
+                spans.match_ns,
+                spans.rank_ns,
+                spans.materialize_ns,
+                spans.candidates,
+                spans.emitted,
+            );
+        };
+
+        println!("\nmemory, cold:");
+        println!("  {:?}", process_memory());
+
+        println!("\nkeystroke sequence \"ledger\" (first query, then each refinement):");
+        let mut cache = RefinementCache::default();
+        let word = "ledger";
+        for step in 1..=word.len() {
+            let pattern = word[..step].to_string();
+            let label = if step == 1 {
+                "first (\"l\")".to_string()
+            } else {
+                pattern.clone()
+            };
+            report_one(
+                &label,
+                &mut cache,
+                QueryKind::Substring,
+                &Query::Substring(pattern),
+            );
+        }
+
+        println!("\ncold query \".pdf\" (fresh connection):");
+        let mut cache = RefinementCache::default();
+        report_one(
+            ".pdf",
+            &mut cache,
+            QueryKind::Substring,
+            &Query::Substring("pdf".to_string()),
+        );
+
+        println!("\ncold query \"TEAMDIR ledger\" (PathTerms, fresh connection):");
+        let mut cache = RefinementCache::default();
+        report_one(
+            "TEAMDIR ledger",
+            &mut cache,
+            QueryKind::PathTerms,
+            &Query::PathTerms(vec!["TEAMDIR".to_string(), "ledger".to_string()]),
+        );
+
+        println!("\nmemory, warm (after the above):");
+        println!("  {:?}", process_memory());
     }
 
     /// The merge across volumes has only `ResultEntry`s to sort, so a bug

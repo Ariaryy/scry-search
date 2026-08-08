@@ -59,6 +59,22 @@ pub struct MemoryPriorityInformation {
     pub memory_priority: Dword,
 }
 
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct ProcessMemoryCountersEx {
+    pub cb: Dword,
+    pub PageFaultCount: Dword,
+    pub PeakWorkingSetSize: usize,
+    pub WorkingSetSize: usize,
+    pub QuotaPeakPagedPoolUsage: usize,
+    pub QuotaPagedPoolUsage: usize,
+    pub QuotaPeakNonPagedPoolUsage: usize,
+    pub QuotaNonPagedPoolUsage: usize,
+    pub PagefileUsage: usize,
+    pub PeakPagefileUsage: usize,
+    pub PrivateUsage: usize,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetCurrentProcess() -> Handle;
@@ -87,6 +103,15 @@ extern "system" {
         flags: Dword,
     ) -> Bool;
     pub fn SetConsoleCtrlHandler(handler: HandlerRoutine, add: Bool) -> Bool;
+}
+
+#[link(name = "psapi")]
+extern "system" {
+    pub fn GetProcessMemoryInfo(
+        process: Handle,
+        counters: *mut ProcessMemoryCountersEx,
+        size: Dword,
+    ) -> Bool;
 }
 
 extern "C" {
