@@ -2,8 +2,13 @@ use crate::arena::{ArchivedArena, Arena};
 use crate::frnmap::{FrnEntry, FrnMap};
 use crate::record::FORMAT_VERSION;
 use memmap2::Mmap;
+use rkyv::ser::serializers::{
+    AllocScratch, CompositeSerializer, FallbackScratch, HeapScratch, SharedSerializeMap,
+    WriteSerializer,
+};
+use rkyv::ser::Serializer as _;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use thiserror::Error;
 
@@ -37,7 +42,25 @@ const MAGIC: [u8; 8] = *b"SCRYIDX\0";
 /// rkyv's validator rejects a misaligned buffer.
 const HEADER_LEN: usize = 16;
 
-/// The complete snapshot image — header followed by the rkyv archive.
+/// Serializer that writes the archive straight to a `BufWriter<File>` instead
+/// of building it up in an in-memory `AlignedVec` first. Scratch space and the
+/// shared-pointer map still allocate — `Arena` has no shared (`Rc`-style)
+/// fields, so `SharedSerializeMap` stays empty, and 1024 bytes of inline
+/// scratch is enough for `Arena`'s own out-of-line `Vec` resolvers before it
+/// would spill to the heap — but the archive's bytes themselves are streamed
+/// out one write at a time rather than buffered, which is what made
+/// `rkyv::to_bytes` cost one ~50 MB allocation on a large index.
+type StreamingSerializer = CompositeSerializer<
+    WriteSerializer<BufWriter<File>>,
+    FallbackScratch<HeapScratch<1024>, AllocScratch>,
+    SharedSerializeMap,
+>;
+
+/// The complete snapshot image — header followed by the rkyv archive — built
+/// entirely in memory. Only for callers that need a contiguous, in-memory
+/// image rather than a file (e.g. copying an archive straight into a shared
+/// section for a test fixture); `save_with` below is the on-disk path and
+/// streams instead of buffering.
 ///
 /// Returned as an `AlignedVec` because the archive behind the 16-byte header
 /// must stay 8-aligned; a plain `Vec<u8>` gives no such guarantee and rkyv's
@@ -83,14 +106,31 @@ pub fn save_with<F>(arena: &Arena, path: &Path, on_create: F) -> Result<(), Stor
 where
     F: FnOnce(&File),
 {
-    let bytes = to_bytes(arena)?;
     let tmp_path = path.with_extension("tmp");
-    {
-        let mut f = File::create(&tmp_path)?;
+    let file = {
+        let f = File::create(&tmp_path)?;
         on_create(&f);
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
+        let mut writer = BufWriter::new(f);
+        writer.write_all(&MAGIC)?;
+        writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?;
+
+        let mut serializer = StreamingSerializer::new(
+            WriteSerializer::new(writer),
+            FallbackScratch::default(),
+            SharedSerializeMap::default(),
+        );
+        serializer
+            .serialize_value(arena)
+            .map_err(|e| StoreError::Validation(e.to_string()))?;
+        let (writer, _, _) = serializer.into_components();
+        let mut buf_writer = writer.into_inner();
+        buf_writer.flush()?;
+        buf_writer
+            .into_inner()
+            .map_err(|e| StoreError::Io(e.into_error()))?
+    };
+    file.sync_all()?;
     std::fs::rename(tmp_path, path)?;
     Ok(())
 }
