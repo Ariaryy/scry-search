@@ -147,3 +147,8 @@
   (`Start-Process -Verb RunAs`), since the working shell itself isn't elevated. Use absolute paths
   for `-FilePath` — a relative path against a directory containing `[...]` in its name fails wildcard
   resolution.
+
+## Misc
+
+- Conventional commit titles, plain language: fix(<feature>): <message>
+- Do not include references / hard code paths to files in the user's file system
