@@ -70,6 +70,19 @@ impl Client {
         decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
     }
 
+    /// Read daemon-side query timings and process memory counters.
+    pub fn stats(&self) -> anyhow::Result<String> {
+        let req = Request {
+            kind: QueryKind::QueryStats,
+            pattern: String::new(),
+            limit: 0,
+            order: Order::default(),
+        };
+        self.pipe.write_frame(&encode_request(&req))?;
+        String::from_utf8(self.pipe.read_frame()?)
+            .map_err(|_| anyhow::anyhow!("malformed statistics response from scryd"))
+    }
+
     /// As-you-type querying over a single pipelined connection: writes the
     /// request immediately (even if an earlier call's response hasn't been
     /// read yet), then reads and discards every response older than this
@@ -146,7 +159,7 @@ impl Client {
         limit: u32,
         order: Order,
     ) -> anyhow::Result<Vec<ResultEntry>> {
-        if kind == QueryKind::ShareIndex {
+        if matches!(kind, QueryKind::ShareIndex | QueryKind::QueryStats) {
             return Err(anyhow::anyhow!("invalid search kind"));
         }
         let request = Request {
@@ -210,6 +223,7 @@ impl Client {
                 scry_core::terms::parse_terms(pattern).unwrap_or_default(),
             ),
             QueryKind::ShareIndex => unreachable!(),
+            QueryKind::QueryStats => unreachable!(),
         };
         let options = SearchOptions::ordered(limit as usize, order);
         if let scry_core::Query::PathTerms(terms) = &query {

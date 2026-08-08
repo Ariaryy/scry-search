@@ -19,6 +19,7 @@ fn main() -> anyhow::Result<()> {
     let mut shared = false;
     let mut verbose = false;
     let mut interactive = false;
+    let mut stats = false;
     let mut explicit_kind = None;
     let mut order = Order::default();
     let mut terms = Vec::new();
@@ -29,6 +30,7 @@ fn main() -> anyhow::Result<()> {
             "--no-shared-index" => shared = false,
             "--verbose" => verbose = true,
             "--interactive" => interactive = true,
+            "--stats" => stats = true,
             "--prefix" => explicit_kind = Some(QueryKind::Prefix),
             "--substring" => explicit_kind = Some(QueryKind::Substring),
             "--wildcard" => explicit_kind = Some(QueryKind::Wildcard),
@@ -51,6 +53,11 @@ fn main() -> anyhow::Result<()> {
 
     if interactive {
         return run_interactive(&mut client, explicit_kind, query);
+    }
+
+    if stats {
+        println!("{}", client.stats()?);
+        return Ok(());
     }
 
     if query.is_empty() {
