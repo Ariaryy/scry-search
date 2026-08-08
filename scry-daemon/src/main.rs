@@ -1620,20 +1620,51 @@ fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
     (quality, name.len())
 }
 
-fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
-    use std::sync::{Mutex, OnceLock};
-    type SectionCache = Mutex<Option<(usize, Arc<scry_ipc::Section>)>>;
-    static CACHE: OnceLock<SectionCache> = OnceLock::new();
-    let key = Arc::as_ptr(&view.base) as usize;
-    let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if let Some((cached_key, section)) = &*cache {
-        if *cached_key == key {
-            return Ok(section.clone());
-        }
+/// Cache key for [`shared_section`]. Keying on `Arc::as_ptr(&view.base)` is an
+/// ABA hazard: once a generation's base is dropped, the allocator can reuse
+/// its address for a later generation, and the cache would then hand out a
+/// stale mapping under a key that looks fresh. `generation` is monotonic
+/// (`scry_core::view::fresh_generation`) and never reused, so it cannot
+/// collide this way.
+fn shared_section_cache_key(view: &IndexView) -> u64 {
+    view.generation
+}
+
+/// Bound on the number of generations the section cache keeps entries for.
+/// A client mid-request may still hold a reference to the previous
+/// generation's shared section, so evicting immediately on publish would
+/// race a concurrent reader; keeping 2 covers "one in flight, one current"
+/// without letting the cache grow forever across a long-running daemon's
+/// lifetime of compactions.
+const SHARED_SECTION_CACHE_GENERATIONS: usize = 2;
+
+// Each entry holds `base` alongside the section so the section can never
+// outlive, or be mismatched with, the memory it maps.
+type SectionCache = std::sync::Mutex<Vec<(u64, Arc<ArenaStore>, Arc<scry_ipc::Section>)>>;
+
+fn shared_section_from_cache(
+    view: &IndexView,
+    cache: &SectionCache,
+) -> std::io::Result<Arc<scry_ipc::Section>> {
+    let key = shared_section_cache_key(view);
+    let mut cache = cache.lock().unwrap();
+    if let Some((_, _, section)) = cache.iter().find(|(cached_key, ..)| *cached_key == key) {
+        return Ok(section.clone());
     }
     let section = Arc::new(scry_ipc::Section::from_file(view.base.snapshot_file())?);
-    *cache = Some((key, section.clone()));
+    cache.push((key, view.base.clone(), section.clone()));
+    if cache.len() > SHARED_SECTION_CACHE_GENERATIONS {
+        cache.remove(0);
+    }
     Ok(section)
+}
+
+fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
+    static CACHE: std::sync::OnceLock<SectionCache> = std::sync::OnceLock::new();
+    shared_section_from_cache(
+        view,
+        CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new())),
+    )
 }
 
 #[cfg(test)]
@@ -1685,6 +1716,66 @@ mod tests {
         drop(client);
         thread.join().unwrap();
     }
+    #[test]
+    fn shared_section_key_is_unique_per_generation() {
+        // Two views sharing the exact same `base` allocation (as happens right
+        // before the allocator would reuse a freed generation's address) must
+        // still get distinct cache keys, or `shared_section` hands out a stale
+        // mapping under a key that looks fresh (the ABA hazard this guards).
+        let dir = tempfile::tempdir().unwrap();
+        let view1 = build_store_with_n_records(10, &dir);
+        let view2 = IndexView {
+            base: view1.base.clone(),
+            delta: view1.delta.clone(),
+            generation: view1.generation + 1,
+            path_index: view1.path_index.clone(),
+            journal_id: view1.journal_id,
+            next_usn: view1.next_usn,
+            volume_serial: view1.volume_serial,
+        };
+        assert_ne!(
+            shared_section_cache_key(&view1),
+            shared_section_cache_key(&view2),
+            "same base allocation, different generation: keys must not collide"
+        );
+    }
+
+    #[test]
+    fn shared_section_cache_keeps_base_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache: SectionCache = std::sync::Mutex::new(Vec::new());
+        let view = build_store_with_n_records(10, &dir);
+        let base_weak = Arc::downgrade(&view.base);
+        shared_section_from_cache(&view, &cache).unwrap();
+        // Drop every strong reference this test holds directly; the cache
+        // entry inserted by `shared_section_from_cache` must be the one
+        // keeping it alive.
+        drop(view);
+        assert!(
+            base_weak.upgrade().is_some(),
+            "cached section entry did not keep its base alive"
+        );
+    }
+
+    #[test]
+    fn shared_section_cache_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache: SectionCache = std::sync::Mutex::new(Vec::new());
+        let stale = build_store_with_n_records(10, &dir);
+        let stale_weak = Arc::downgrade(&stale.base);
+        shared_section_from_cache(&stale, &cache).unwrap();
+        drop(stale);
+        for n in 11..11 + SHARED_SECTION_CACHE_GENERATIONS {
+            let view = build_store_with_n_records(n, &dir);
+            shared_section_from_cache(&view, &cache).unwrap();
+        }
+        assert!(
+            stale_weak.upgrade().is_none(),
+            "cache grew past its documented bound of {SHARED_SECTION_CACHE_GENERATIONS} generations"
+        );
+        assert!(cache.lock().unwrap().len() <= SHARED_SECTION_CACHE_GENERATIONS);
+    }
+
     #[test]
     fn cancelled_request_returns_empty_results() {
         let dir = tempfile::tempdir().unwrap();
