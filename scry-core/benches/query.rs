@@ -22,7 +22,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use scry_core::pathindex::PathIndex;
 use scry_core::store::ArenaStore;
-use scry_core::view::IndexView;
+use scry_core::view::{materialize_hits, Hit, IndexView};
 use scry_core::{Arena, Query};
 
 /// xorshift64*, so the corpus is identical on every machine and every run.
@@ -319,20 +319,25 @@ fn fixed_costs(c: &mut Criterion) {
 }
 
 /// Path reconstruction, the cost any consumer that only wants to *count* or
-/// *aggregate* records should never have to pay.
+/// *aggregate* records should never have to pay. Goes through
+/// [`materialize_hits`] rather than calling `full_path` per record directly,
+/// since that's the real entry point callers use and the one whose buffer
+/// reuse this benchmark is meant to measure.
 fn materialize(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let arena = view.base.archived();
     let mut group = c.benchmark_group("materialize");
     for count in [50usize, 1_000, 20_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter(|| {
-                let mut total = 0usize;
-                for record in 0..count as u32 {
-                    total += arena.full_path(record, '\\').len();
-                }
-                black_box(total)
+        let hits: Vec<Hit> = (0..count as u32)
+            .map(|record| Hit {
+                record,
+                size: 0,
+                mtime: 0,
+                is_dir: false,
             })
+            .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(count), &hits, |b, hits| {
+            b.iter(|| black_box(materialize_hits(arena, &view.delta, hits)))
         });
     }
     group.finish();

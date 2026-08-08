@@ -518,30 +518,49 @@ impl ArchivedArena {
     ///
     /// Guarded against cycles and corrupt parent links: stops after 512 hops
     /// and returns whatever has been collected.
-    pub fn full_path(&self, mut idx: u32, sep: char) -> String {
+    pub fn full_path(&self, idx: u32, sep: char) -> String {
+        let mut out = String::new();
+        self.full_path_into(idx, sep, &mut out);
+        out
+    }
+
+    /// Same as [`Self::full_path`], but appends into a caller-owned buffer
+    /// instead of allocating a fresh `String`. `out` is cleared first, so a
+    /// caller materializing many hits can reuse one buffer across calls.
+    pub fn full_path_into(&self, mut idx: u32, sep: char, out: &mut String) {
         #[cfg(test)]
         FULL_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let mut parts: Vec<Vec<u8>> = Vec::new();
-        let mut name_buf = Vec::new();
-        for _ in 0..512 {
-            self.name_into(idx, &mut name_buf);
-            parts.push(name_buf.clone());
+        out.clear();
+        // Record indices, not name bytes: the chain is walked once to find
+        // the root, then a second time in reverse to decode names in path
+        // order, so nothing but a fixed-size array of u32s is held across
+        // the two passes.
+        let mut chain = [0u32; 512];
+        let mut len = 0usize;
+        loop {
+            chain[len] = idx;
+            len += 1;
             // `self.parent(idx)` reads only from the hot `parents` column;
             // mtime and size stay evicted.
             let parent = self.parent(idx);
-            if parent == PARENT_NONE {
+            if parent == PARENT_NONE || len == chain.len() {
                 break;
             }
             idx = parent;
         }
-        parts.reverse();
-        let sep_str = sep.to_string();
-        parts
-            .iter()
-            .filter(|part| part.as_slice() != b".")
-            .map(|b| String::from_utf8_lossy(b))
-            .collect::<Vec<_>>()
-            .join(&sep_str)
+        let mut name_buf = Vec::new();
+        let mut first = true;
+        for &record in chain[..len].iter().rev() {
+            self.name_into(record, &mut name_buf);
+            if name_buf == b"." {
+                continue;
+            }
+            if !first {
+                out.push(sep);
+            }
+            first = false;
+            out.push_str(&String::from_utf8_lossy(&name_buf));
+        }
     }
 
     /// Range of record indices (contiguous, in name order) whose names begin
@@ -1162,6 +1181,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `full_path_into` clears its buffer before writing, so calling it
+    /// twice with two different records into the same `String` must produce
+    /// exactly what two independent `full_path` calls would.
+    #[test]
+    fn full_path_into_reuses_buffer() {
+        let mut builder = ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        let dir_a = builder.push("docs", 0, true);
+        let file_a = builder.push("report.pdf", 0, false);
+        let file_b = builder.push("notes.txt", 0, false);
+        builder.set_parent(dir_a, root);
+        builder.set_parent(file_a, dir_a);
+        builder.set_parent(file_b, root);
+        let (arena, _) = builder.build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reuse.rkyv");
+        save(&arena, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+
+        let a = archived.prefix_range("report.pdf").start;
+        let b = archived.prefix_range("notes.txt").start;
+
+        let mut buf = String::new();
+        archived.full_path_into(a, '\\', &mut buf);
+        assert_eq!(buf, archived.full_path(a, '\\'));
+        archived.full_path_into(b, '\\', &mut buf);
+        assert_eq!(buf, archived.full_path(b, '\\'));
     }
 
     #[test]

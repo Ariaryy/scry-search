@@ -800,7 +800,9 @@ impl IndexView {
 
     /// The full path of one hit's record.
     pub fn path_of(&self, record: u32) -> String {
-        path_of(self.base.archived(), &self.delta, record)
+        let mut buf = String::new();
+        path_of_into(self.base.archived(), &self.delta, record, &mut buf);
+        buf
     }
 
     /// Decode a record's leaf name into `output` without reconstructing its
@@ -865,7 +867,8 @@ impl IndexView {
 
     /// Reconstruct one result after selection has already bounded the set.
     pub fn materialize_one(&self, hit: &Hit) -> ResultEntry {
-        materialize(self.base.archived(), &self.delta, hit)
+        let mut buf = String::new();
+        materialize(self.base.archived(), &self.delta, hit, &mut buf)
     }
 
     /// As `search`, but abandons the scan (returning an empty result) once
@@ -1042,8 +1045,12 @@ pub fn materialize_hits(
     delta: &Delta,
     hits: &[Hit],
 ) -> Vec<ResultEntry> {
+    // Reused across the whole batch: `path_of_into` clears and refills it
+    // per hit, so its backing capacity only has to grow once instead of once
+    // per hit.
+    let mut buf = String::new();
     hits.iter()
-        .map(|hit| materialize(arena, delta, hit))
+        .map(|hit| materialize(arena, delta, hit, &mut buf))
         .collect()
 }
 
@@ -1381,20 +1388,31 @@ fn search_ranked_cancellable_with_spans(
 }
 
 /// Reconstruct the path of one hit. Separated from matching and ranking
-/// because it is the expensive part — see [`Hit`].
-fn materialize(arena: &crate::ArchivedArena, delta: &Delta, hit: &Hit) -> ResultEntry {
+/// because it is the expensive part — see [`Hit`]. `buf` is scratch space
+/// the caller may reuse across several hits; its contents on entry do not
+/// matter.
+fn materialize(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    hit: &Hit,
+    buf: &mut String,
+) -> ResultEntry {
+    path_of_into(arena, delta, hit.record, buf);
     ResultEntry {
-        path: path_of(arena, delta, hit.record),
+        path: buf.clone(),
         size: hit.size,
         mtime: hit.mtime,
         is_dir: hit.is_dir,
     }
 }
 
-fn path_of(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> String {
+fn path_of_into(arena: &crate::ArchivedArena, delta: &Delta, record: u32, buf: &mut String) {
     match record.checked_sub(arena.len() as u32) {
-        None => arena.full_path(record, '\\'),
-        Some(index) => delta_path(arena, delta, index),
+        None => arena.full_path_into(record, '\\', buf),
+        Some(index) => {
+            buf.clear();
+            buf.push_str(&delta_path(arena, delta, index));
+        }
     }
 }
 
