@@ -182,6 +182,47 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// Bitwise-AND `src` into `dst` (same length), 8 bytes at a time. Native-endian
+/// is correct here even though `to_ne_bytes`/`from_ne_bytes` normally deserve
+/// suspicion: the AND is bitwise, both operands are trigram-index bytes in the
+/// same in-memory representation, and the result is never persisted or sent
+/// across a byte-order boundary — it only ever feeds the bit-scan below.
+fn and_into(dst: &mut [u8], src: &[u8]) {
+    let mut dst_chunks = dst.chunks_exact_mut(8);
+    let mut src_chunks = src.chunks_exact(8);
+    for (d, s) in (&mut dst_chunks).zip(&mut src_chunks) {
+        let word = u64::from_ne_bytes(d[..8].try_into().unwrap())
+            & u64::from_ne_bytes(s[..8].try_into().unwrap());
+        d.copy_from_slice(&word.to_ne_bytes());
+    }
+    for (d, &s) in dst_chunks
+        .into_remainder()
+        .iter_mut()
+        .zip(src_chunks.remainder())
+    {
+        *d &= s;
+    }
+}
+
+/// Bitwise-OR `src` into `dst` (same length). See [`and_into`] for the
+/// native-endian rationale, which applies identically here.
+fn or_into(dst: &mut [u8], src: &[u8]) {
+    let mut dst_chunks = dst.chunks_exact_mut(8);
+    let mut src_chunks = src.chunks_exact(8);
+    for (d, s) in (&mut dst_chunks).zip(&mut src_chunks) {
+        let word = u64::from_ne_bytes(d[..8].try_into().unwrap())
+            | u64::from_ne_bytes(s[..8].try_into().unwrap());
+        d.copy_from_slice(&word.to_ne_bytes());
+    }
+    for (d, &s) in dst_chunks
+        .into_remainder()
+        .iter_mut()
+        .zip(src_chunks.remainder())
+    {
+        *d |= s;
+    }
+}
+
 impl ArchivedArena {
     pub fn len(&self) -> usize {
         self.parents.len()
@@ -452,9 +493,7 @@ impl ArchivedArena {
         hashes.dedup();
         for &hash in hashes.iter() {
             let row = &self.trigram_index.as_slice()[hash * bytes..(hash + 1) * bytes];
-            for (candidate, &value) in candidates.iter_mut().zip(row) {
-                *candidate &= value;
-            }
+            and_into(candidates, row);
         }
         output.extend(
             (0..blocks)
@@ -492,17 +531,11 @@ impl ArchivedArena {
                 hashes.dedup();
                 for &hash in &hashes {
                     let row = &self.trigram_index.as_slice()[hash * bytes..(hash + 1) * bytes];
-                    for (candidate, &value) in literal_bits.iter_mut().zip(row) {
-                        *candidate &= value;
-                    }
+                    and_into(&mut literal_bits, row);
                 }
-                for (combined, &value) in clause_bits.iter_mut().zip(&literal_bits) {
-                    *combined |= value;
-                }
+                or_into(&mut clause_bits, &literal_bits);
             }
-            for (candidate, &value) in candidates.iter_mut().zip(&clause_bits) {
-                *candidate &= value;
-            }
+            and_into(&mut candidates, &clause_bits);
         }
 
         Some(
@@ -952,6 +985,36 @@ mod tests {
             b.push(name, 0, false);
         }
         b.build().0
+    }
+
+    /// `and_into`/`or_into` chunk 8 bytes at a time and handle any remainder
+    /// byte-wise; an off-by-one there silently drops trigram candidate blocks
+    /// rather than panicking, so this compares the vectorized path against a
+    /// naive byte-at-a-time reference across every length that exercises a
+    /// non-empty remainder.
+    #[test]
+    fn and_or_into_match_a_naive_byte_at_a_time_reference() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        };
+        for len in 0..40usize {
+            let dst: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let src: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+
+            let mut got_and = dst.clone();
+            and_into(&mut got_and, &src);
+            let want_and: Vec<u8> = dst.iter().zip(&src).map(|(d, s)| d & s).collect();
+            assert_eq!(got_and, want_and, "and_into mismatch at len {len}");
+
+            let mut got_or = dst.clone();
+            or_into(&mut got_or, &src);
+            let want_or: Vec<u8> = dst.iter().zip(&src).map(|(d, s)| d | s).collect();
+            assert_eq!(got_or, want_or, "or_into mismatch at len {len}");
+        }
     }
 
     /// The two cold columns must stay index-parallel with the hot column.
