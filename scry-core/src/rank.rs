@@ -89,6 +89,27 @@ pub fn key_record(key: u64) -> u32 {
     key as u32
 }
 
+/// Retain `key` in a bounded top-`limit` max-heap if it beats the current
+/// worst retained candidate. Shared by every search loop that ranks while it
+/// scans — single-threaded, per-thread during a parallel scan, and the merge
+/// of several per-thread heaps — so a candidate is compared against the
+/// bound exactly once no matter which of those loops it came from.
+///
+/// The heap is a max-heap over keys that sort ascending-is-better, so its
+/// root is the worst retained candidate and eviction is a peek and a swap.
+#[inline]
+pub(crate) fn retain_hit(heap: &mut std::collections::BinaryHeap<u64>, key: u64, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(key);
+    } else if heap.peek().is_some_and(|worst| key < *worst) {
+        heap.pop();
+        heap.push(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

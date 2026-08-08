@@ -80,11 +80,11 @@ pub fn search_base_parallel_with_spans(
                 return search_base_impl(arena, query, usize::MAX, cancel, spans);
             }
             record_full_scan_blocks(arena, spans);
-            scan_full_parallel(arena, threads, cancel, move |name| {
-                let mut lower = Vec::with_capacity(name.len());
-                lower.extend(name.iter().map(u8::to_ascii_lowercase));
-                memchr::memmem::find(&lower, &needle_lower).is_some()
-            })
+            let finder = aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([needle.as_bytes()])
+                .expect("single-pattern Aho-Corasick automaton always builds");
+            scan_full_parallel(arena, threads, cancel, move |name| finder.is_match(name))
         }
         Query::Regex(pattern) => {
             let re = match Regex::builder()
@@ -106,6 +106,23 @@ pub fn search_base_parallel_with_spans(
     }
 }
 
+/// Splits `[0, arena.len())` into up to `threads` bucket-aligned ranges, the
+/// same shard unit `scan_full_parallel`/`scan_full_parallel_ranked` scan
+/// independently: a front-coded bucket decodes from nothing outside itself,
+/// so a shard boundary never needs synchronization with its neighbors.
+fn bucket_shards(n: usize, threads: usize) -> impl Iterator<Item = (u32, u32)> {
+    let num_buckets = n.div_ceil(crate::record::BUCKET_SIZE);
+    let shard_buckets = num_buckets.div_ceil(threads.max(1)).max(1);
+    (0..num_buckets)
+        .step_by(shard_buckets)
+        .map(move |start_bucket| {
+            let end_bucket = (start_bucket + shard_buckets).min(num_buckets);
+            let start = (start_bucket * crate::record::BUCKET_SIZE) as u32;
+            let end = (end_bucket * crate::record::BUCKET_SIZE).min(n) as u32;
+            (start, end)
+        })
+}
+
 /// Runs `matches` over every name in `arena`, sharded across `threads`
 /// bucket-aligned ranges. On cancellation the merged result is discarded
 /// entirely (returns empty), matching the single-threaded scan's contract
@@ -120,38 +137,97 @@ fn scan_full_parallel(
     if n == 0 {
         return Vec::new();
     }
-    let num_buckets = n.div_ceil(crate::record::BUCKET_SIZE);
-    let shard_buckets = num_buckets.div_ceil(threads).max(1);
-    let results = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        let mut start_bucket = 0;
-        while start_bucket < num_buckets {
-            let end_bucket = (start_bucket + shard_buckets).min(num_buckets);
-            let start = (start_bucket * crate::record::BUCKET_SIZE) as u32;
-            let end = (end_bucket * crate::record::BUCKET_SIZE).min(n) as u32;
-            let matches = &matches;
-            let results = &results;
-            scope.spawn(move || {
-                let mut local = Vec::new();
-                let mut checked: u32 = 0;
-                arena.for_each_name_in(start..end, |idx, name| {
-                    if is_cancelled_periodically(cancel, &mut checked) {
-                        return std::ops::ControlFlow::Break(());
-                    }
-                    if matches(name) {
-                        local.push(idx);
-                    }
-                    std::ops::ControlFlow::Continue(())
-                });
-                results.lock().unwrap().extend(local);
-            });
-            start_bucket = end_bucket;
-        }
+    let matches = &matches;
+    let shards: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        bucket_shards(n, threads)
+            .map(|(start, end)| {
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut checked: u32 = 0;
+                    arena.for_each_name_in(start..end, |idx, name| {
+                        if is_cancelled_periodically(cancel, &mut checked) {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        if matches(name) {
+                            local.push(idx);
+                        }
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    local
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
     });
     if cancel.is_some_and(|c| c.is_cancelled()) {
         return Vec::new();
     }
-    results.into_inner().unwrap()
+    shards.into_iter().flatten().collect()
+}
+
+/// As [`scan_full_parallel`], but ranks while it scans: each shard keeps only
+/// its own top-`limit` in a bounded heap via [`rank::retain_hit`], and the
+/// per-shard heaps are merged the same way. That merge is exact — any record
+/// in the global top-`limit` must also be in its own shard's top-`limit`,
+/// since a shard with `limit` or more strictly better matches would itself
+/// disqualify it — so nothing outside the per-shard heaps needs to be kept.
+/// Returns the merged heap and the total number of candidates seen (for
+/// instrumentation), or `(empty, 0)` on cancellation.
+fn scan_full_parallel_ranked(
+    arena: &ArchivedArena,
+    threads: usize,
+    cancel: Option<Cancellation>,
+    limit: usize,
+    is_match: impl Fn(&[u8]) -> bool + Sync,
+    key_for: impl Fn(u32, &[u8]) -> Option<u64> + Sync,
+) -> (std::collections::BinaryHeap<u64>, u64) {
+    let n = arena.len();
+    if n == 0 || limit == 0 {
+        return (std::collections::BinaryHeap::new(), 0);
+    }
+    let is_match = &is_match;
+    let key_for = &key_for;
+    let shards: Vec<(std::collections::BinaryHeap<u64>, u64)> = std::thread::scope(|scope| {
+        bucket_shards(n, threads)
+            .map(|(start, end)| {
+                scope.spawn(move || {
+                    let mut heap = std::collections::BinaryHeap::new();
+                    let mut seen: u64 = 0;
+                    let mut checked: u32 = 0;
+                    arena.for_each_name_in(start..end, |idx, name| {
+                        if is_cancelled_periodically(cancel, &mut checked) {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        if is_match(name) {
+                            if let Some(key) = key_for(idx, name) {
+                                seen += 1;
+                                crate::rank::retain_hit(&mut heap, key, limit);
+                            }
+                        }
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    (heap, seen)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    if cancel.is_some_and(|c| c.is_cancelled()) {
+        return (std::collections::BinaryHeap::new(), 0);
+    }
+    let mut merged = std::collections::BinaryHeap::with_capacity(limit.min(4096));
+    let mut total = 0u64;
+    for (heap, seen) in shards {
+        total += seen;
+        for key in heap {
+            crate::rank::retain_hit(&mut merged, key, limit);
+        }
+    }
+    (merged, total)
 }
 
 fn search_base_impl(
@@ -159,7 +235,7 @@ fn search_base_impl(
     query: &Query,
     limit: usize,
     cancel: Option<Cancellation>,
-    mut spans: Option<&mut QuerySpans>,
+    spans: Option<&mut QuerySpans>,
 ) -> Vec<u32> {
     match query {
         Query::Prefix(prefix) => {
@@ -167,112 +243,247 @@ fn search_base_impl(
             range.take(limit).collect()
         }
         Query::Substring(needle) => {
-            // `needle_lower` still drives the trigram block filter below (the
-            // trigram index is built lowercase), but per-name matching runs
-            // directly over the raw bytes via an ASCII-case-insensitive
-            // Aho-Corasick automaton, so no per-name lowercase copy is made.
-            let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            let finder = aho_corasick::AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .build([needle.as_bytes()])
-                .expect("single-pattern Aho-Corasick automaton always builds");
             let mut results = Vec::new();
-            let stopped = std::cell::Cell::new(false);
-            let cancelled = std::cell::Cell::new(false);
-            let mut checked: u32 = 0;
-            let mut visit = |idx, name: &[u8]| {
-                if is_cancelled_periodically(cancel, &mut checked) {
-                    cancelled.set(true);
-                    stopped.set(true);
-                    return std::ops::ControlFlow::Break(());
+            let cancelled = scan_substring_impl(arena, needle, cancel, spans, |idx, _name| {
+                results.push(idx);
+                if results.len() >= limit {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
                 }
-                if finder.is_match(name) {
-                    results.push(idx);
-                    if results.len() >= limit {
-                        stopped.set(true);
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            };
-            match arena.candidate_blocks(&needle_lower) {
-                None => {
-                    record_full_scan_blocks(arena, spans.as_deref_mut());
-                    arena.for_each_name(&mut visit)
-                }
-                Some(blocks) => {
-                    if let Some(spans) = spans.as_mut() {
-                        spans.blocks_total = spans.blocks_total.saturating_add(
-                            arena.len().div_ceil(crate::trigram::TRIGRAM_BLOCK) as u64,
-                        );
-                        spans.blocks_scanned =
-                            spans.blocks_scanned.saturating_add(blocks.len() as u64);
-                    }
-                    for block in blocks {
-                        let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
-                        let end =
-                            (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
-                        arena.for_each_name_in(start..end, &mut visit);
-                        if stopped.get() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if cancelled.get() {
+            });
+            if cancelled {
                 return Vec::new();
             }
             results
         }
         Query::Regex(pattern) => {
-            let re = match Regex::builder()
-                .syntax(syntax::Config::new().case_insensitive(true))
-                .build(pattern)
-            {
-                Ok(re) => re,
-                Err(_) => return Vec::new(),
-            };
             let mut results = Vec::new();
-            let stopped = std::cell::Cell::new(false);
-            let cancelled = std::cell::Cell::new(false);
-            let mut checked: u32 = 0;
-            let mut visit = |idx, name: &[u8]| {
-                if is_cancelled_periodically(cancel, &mut checked) {
-                    cancelled.set(true);
-                    stopped.set(true);
-                    return std::ops::ControlFlow::Break(());
+            let cancelled = scan_regex_impl(arena, pattern, cancel, spans, |idx, _name| {
+                results.push(idx);
+                if results.len() >= limit {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
                 }
-                if re.is_match(name) {
-                    results.push(idx);
-                    if results.len() >= limit {
-                        stopped.set(true);
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            };
-            match required_literals(pattern)
-                .and_then(|clauses| arena.candidate_blocks_for_clauses(&clauses))
-            {
-                None => arena.for_each_name(&mut visit),
-                Some(blocks) => {
-                    for block in blocks {
-                        let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
-                        let end =
-                            (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
-                        arena.for_each_name_in(start..end, &mut visit);
-                        if stopped.get() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if cancelled.get() {
+            });
+            if cancelled {
                 return Vec::new();
             }
             results
         }
         Query::PathTerms(_) => Vec::new(),
+    }
+}
+
+/// Runs `sink` over every name in `arena` matching `needle`
+/// (ASCII-case-insensitive substring), using the trigram block filter when
+/// the needle is long enough to have one and falling back to a full scan
+/// otherwise. `sink` decides whether to keep scanning by its return value —
+/// the count-limited caller in `search_base_impl` breaks once it has enough
+/// unordered matches, while a ranked caller keeps going forever since a
+/// later candidate can still outrank the current worst-in-heap. Shared so
+/// both callers see exactly the same set of candidates in exactly the same
+/// order. Returns whether the scan was cancelled (in which case the caller
+/// must discard whatever `sink` already saw).
+fn scan_substring_impl(
+    arena: &ArchivedArena,
+    needle: &str,
+    cancel: Option<Cancellation>,
+    mut spans: Option<&mut QuerySpans>,
+    mut sink: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+) -> bool {
+    // `needle_lower` drives the trigram block filter (the trigram index is
+    // built lowercase); per-name matching runs directly over the raw bytes
+    // via an ASCII-case-insensitive Aho-Corasick automaton, so no per-name
+    // lowercase copy is made.
+    let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let finder = aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build([needle.as_bytes()])
+        .expect("single-pattern Aho-Corasick automaton always builds");
+    let stopped = std::cell::Cell::new(false);
+    let cancelled = std::cell::Cell::new(false);
+    let mut checked: u32 = 0;
+    let mut visit = |idx, name: &[u8]| {
+        if is_cancelled_periodically(cancel, &mut checked) {
+            cancelled.set(true);
+            stopped.set(true);
+            return std::ops::ControlFlow::Break(());
+        }
+        if finder.is_match(name) && sink(idx, name).is_break() {
+            stopped.set(true);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    };
+    match arena.candidate_blocks(&needle_lower) {
+        None => {
+            record_full_scan_blocks(arena, spans.as_deref_mut());
+            arena.for_each_name(&mut visit)
+        }
+        Some(blocks) => {
+            if let Some(spans) = spans.as_mut() {
+                spans.blocks_total = spans
+                    .blocks_total
+                    .saturating_add(arena.len().div_ceil(crate::trigram::TRIGRAM_BLOCK) as u64);
+                spans.blocks_scanned = spans.blocks_scanned.saturating_add(blocks.len() as u64);
+            }
+            for block in blocks {
+                let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
+                let end = (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
+                arena.for_each_name_in(start..end, &mut visit);
+                if stopped.get() {
+                    break;
+                }
+            }
+        }
+    }
+    cancelled.get()
+}
+
+/// As [`scan_substring_impl`], for a compiled regex/wildcard pattern.
+fn scan_regex_impl(
+    arena: &ArchivedArena,
+    pattern: &str,
+    cancel: Option<Cancellation>,
+    spans: Option<&mut QuerySpans>,
+    mut sink: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+) -> bool {
+    let re = match Regex::builder()
+        .syntax(syntax::Config::new().case_insensitive(true))
+        .build(pattern)
+    {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    let stopped = std::cell::Cell::new(false);
+    let cancelled = std::cell::Cell::new(false);
+    let mut checked: u32 = 0;
+    let mut visit = |idx, name: &[u8]| {
+        if is_cancelled_periodically(cancel, &mut checked) {
+            cancelled.set(true);
+            stopped.set(true);
+            return std::ops::ControlFlow::Break(());
+        }
+        if re.is_match(name) && sink(idx, name).is_break() {
+            stopped.set(true);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    };
+    match required_literals(pattern)
+        .and_then(|clauses| arena.candidate_blocks_for_clauses(&clauses))
+    {
+        None => {
+            record_full_scan_blocks(arena, spans);
+            arena.for_each_name(&mut visit)
+        }
+        Some(blocks) => {
+            for block in blocks {
+                let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
+                let end = (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
+                arena.for_each_name_in(start..end, &mut visit);
+                if stopped.get() {
+                    break;
+                }
+            }
+        }
+    }
+    cancelled.get()
+}
+
+/// As [`search_base`], but ranks while it scans instead of collecting every
+/// match into a `Vec<u32>` first and ranking it afterward — the caller
+/// supplies `key_for` (built from the ordering, the arena, and the delta) and
+/// gets back the winners as a bounded max-heap of sort keys, never seeing an
+/// intermediate collection sized to the candidate count rather than `limit`.
+/// Only `Query::Substring` and `Query::Regex` reach this: those are the
+/// kinds whose scan is unbounded and worth ranking as it goes; `Prefix`
+/// already resolves through a tight binary-search range and `PathTerms` is
+/// handled elsewhere. Returns the merged heap and the number of candidates
+/// seen, for `QuerySpans::candidates`.
+pub(crate) fn search_ranked_streaming(
+    arena: &ArchivedArena,
+    query: &Query,
+    limit: usize,
+    threads: usize,
+    cancel: Option<Cancellation>,
+    mut spans: Option<&mut QuerySpans>,
+    key_for: impl Fn(u32, &[u8]) -> Option<u64> + Sync,
+) -> (std::collections::BinaryHeap<u64>, u64) {
+    if limit == 0 {
+        return (std::collections::BinaryHeap::new(), 0);
+    }
+    let filtered = match query {
+        Query::Substring(needle) => {
+            let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            arena.candidate_blocks(&needle_lower).is_some()
+        }
+        Query::Regex(pattern) => required_literals(pattern)
+            .and_then(|clauses| arena.candidate_blocks_for_clauses(&clauses))
+            .is_some(),
+        _ => unreachable!("search_ranked_streaming only handles Substring/Regex"),
+    };
+    if threads <= 1 || filtered {
+        let mut heap = std::collections::BinaryHeap::with_capacity(limit.min(4096));
+        let mut seen: u64 = 0;
+        let mut visit = |idx, name: &[u8]| {
+            if let Some(key) = key_for(idx, name) {
+                seen += 1;
+                crate::rank::retain_hit(&mut heap, key, limit);
+            }
+            std::ops::ControlFlow::Continue(())
+        };
+        let cancelled = match query {
+            Query::Substring(needle) => {
+                scan_substring_impl(arena, needle, cancel, spans.as_deref_mut(), &mut visit)
+            }
+            Query::Regex(pattern) => {
+                scan_regex_impl(arena, pattern, cancel, spans.as_deref_mut(), &mut visit)
+            }
+            _ => unreachable!(),
+        };
+        if cancelled {
+            return (std::collections::BinaryHeap::new(), 0);
+        }
+        (heap, seen)
+    } else {
+        record_full_scan_blocks(arena, spans);
+        match query {
+            Query::Substring(needle) => {
+                let finder = aho_corasick::AhoCorasick::builder()
+                    .ascii_case_insensitive(true)
+                    .build([needle.as_bytes()])
+                    .expect("single-pattern Aho-Corasick automaton always builds");
+                scan_full_parallel_ranked(
+                    arena,
+                    threads,
+                    cancel,
+                    limit,
+                    move |name| finder.is_match(name),
+                    key_for,
+                )
+            }
+            Query::Regex(pattern) => {
+                let re = match Regex::builder()
+                    .syntax(syntax::Config::new().case_insensitive(true))
+                    .build(pattern)
+                {
+                    Ok(re) => re,
+                    Err(_) => return (std::collections::BinaryHeap::new(), 0),
+                };
+                scan_full_parallel_ranked(
+                    arena,
+                    threads,
+                    cancel,
+                    limit,
+                    move |name| re.is_match(name),
+                    key_for,
+                )
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

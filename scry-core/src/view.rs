@@ -199,6 +199,186 @@ mod tests {
         );
     }
 
+    /// A corpus for the streaming top-k tests: varied mtimes/sizes (so
+    /// `Recent`/`Largest` have something to order on), a tombstoned base
+    /// record (so a streaming candidate must still be filtered out without
+    /// polluting the heap), and a live delta addition (so the merge with
+    /// delta-added records is exercised alongside the streamed base match).
+    fn streaming_corpus() -> (tempfile::TempDir, IndexView) {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        for i in 0..300u32 {
+            let mtime = 1_000 + i;
+            let size = ((i % 17) as u64 + 1) * 4_096;
+            let child = builder.push_bytes_with_metadata(
+                format!("needle_{i:04}.dat").as_bytes(),
+                mtime,
+                false,
+                None,
+                size,
+            );
+            builder.set_parent(child, root);
+        }
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let mut view = IndexView::new(base);
+        let tombstoned = view.base.archived().prefix_range("needle_0005").start;
+        let mut delta = Delta::new(view.base.archived().len());
+        delta.tombstones.set(tombstoned);
+        delta.added.push(DeltaRecord {
+            name: "needle_delta.dat".into(),
+            parent: ParentRef::Base(root),
+            mtime_secs: 5_000,
+            is_dir: false,
+            size_bytes: 999_999,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+        (dir, view)
+    }
+
+    /// An independent collect-everything-then-rank reference: match every
+    /// candidate with [`crate::query::search_base`] (never bounding the
+    /// intermediate set), then apply the exact same key and tombstone rules
+    /// the streaming path uses. If the streamed heap ever diverged from this
+    /// — an off-by-one in a shard boundary, a tombstone slipping through, a
+    /// delta-added record dropped from the merge — this catches it.
+    fn collect_then_rank(view: &IndexView, query: &Query, order: Order, limit: usize) -> Vec<Hit> {
+        let arena = view.base.archived();
+        let delta = &view.delta;
+        let mut heap = BinaryHeap::new();
+        let needs_name = !order.needs_metadata();
+        let mut name = Vec::new();
+        for index in crate::query::search_base(arena, query, usize::MAX) {
+            if delta.tombstones.get(index) {
+                continue;
+            }
+            let (quality, name_len) = if needs_name {
+                arena.name_into(index, &mut name);
+                (match_quality(query, &name), name.len() as u32)
+            } else {
+                (0, 0)
+            };
+            rank::retain_hit(
+                &mut heap,
+                sort_key(order, arena, delta, index, quality, name_len),
+                limit,
+            );
+        }
+        let regex = match query {
+            Query::Regex(pattern) => Regex::builder()
+                .syntax(syntax::Config::new().case_insensitive(true))
+                .build(pattern)
+                .ok(),
+            _ => None,
+        };
+        let substring_lower = match query {
+            Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
+            _ => None,
+        };
+        for (index, record) in delta.live_added() {
+            let matched = match query {
+                Query::Prefix(prefix) => {
+                    ascii::starts_with_ci(record.name.as_bytes(), prefix.as_bytes())
+                }
+                Query::Substring(_) => ascii::contains_ci(
+                    record.name.as_bytes(),
+                    substring_lower.as_ref().unwrap().as_bytes(),
+                ),
+                Query::Regex(_) => regex
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
+                Query::PathTerms(_) => unreachable!(),
+            };
+            if matched {
+                let combined = arena.len() as u32 + index;
+                rank::retain_hit(
+                    &mut heap,
+                    sort_key(
+                        order,
+                        arena,
+                        delta,
+                        combined,
+                        match_quality(query, record.name.as_bytes()),
+                        record.name.len() as u32,
+                    ),
+                    limit,
+                );
+            }
+        }
+        drain_heap(arena, delta, &mut heap)
+    }
+
+    /// The streamed per-thread-heap path (`search_ranked_streaming`) must
+    /// return exactly what collecting every match first and ranking
+    /// afterward would, for every ordering and both query shapes it handles.
+    #[test]
+    fn streaming_topk_matches_collect_then_rank() {
+        let (_dir, view) = streaming_corpus();
+        let queries = [
+            Query::Substring("needle".into()),
+            Query::Substring("0042".into()),
+            Query::Regex(r"^needle_00.*\.dat$".into()),
+        ];
+        for query in &queries {
+            for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                for limit in [1usize, 5, 1_000] {
+                    let options = SearchOptions::ordered(limit, order);
+                    let actual = view.search_hits(query, options);
+                    let expected = collect_then_rank(&view, query, order, limit);
+                    assert_eq!(
+                        actual, expected,
+                        "{query:?}, order={order:?}, limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A cancelled streamed search must come back empty, never a partial
+    /// heap from whichever shard happened to notice first.
+    #[test]
+    fn cancellation_yields_empty_not_partial() {
+        let (_dir, view) = streaming_corpus();
+        let generation = std::sync::atomic::AtomicU64::new(1);
+        let cancel = Cancellation::new(&generation, 0); // already stale
+        for threads in [1, 4] {
+            let hits = view.search_hits_cancellable(
+                &Query::Substring("needle".into()),
+                SearchOptions::ordered(50, Order::Relevance),
+                Some(cancel),
+                threads,
+            );
+            assert!(hits.is_empty(), "threads={threads}");
+        }
+    }
+
+    /// Splitting the unfiltered scan across threads must not change which
+    /// records win the ranking — only how the work of finding and ranking
+    /// them is divided. A single-character substring has no trigram filter,
+    /// so it always takes the full-scan path this exercises.
+    #[test]
+    fn parallel_and_single_threaded_agree() {
+        let (_dir, view) = streaming_corpus();
+        let query = Query::Substring("e".into());
+        for order in [Order::Relevance, Order::Recent, Order::Largest] {
+            for limit in [3usize, 50] {
+                let options = SearchOptions::ordered(limit, order);
+                let single = view.search_hits_cancellable(&query, options, None, 1);
+                for threads in [2, 4, 8] {
+                    let parallel = view.search_hits_cancellable(&query, options, None, threads);
+                    assert_eq!(
+                        single, parallel,
+                        "order={order:?}, limit={limit}, threads={threads}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn limit_is_applied_across_both_layers() {
         let (_dir, mut view) = base_view(50);
@@ -1156,23 +1336,6 @@ thread_local! {
         RefCell::new(PathSearchScratch::default());
 }
 
-/// Keep `key` if it belongs in the best `limit` seen so far.
-///
-/// The heap is a max-heap over keys that sort ascending-is-better, so its root
-/// is the worst retained candidate and eviction is a peek and a swap. See
-/// [`crate::rank`] for why a candidate is one integer and not a struct.
-fn retain_hit(heap: &mut BinaryHeap<u64>, key: u64, limit: usize) {
-    if limit == 0 {
-        return;
-    }
-    if heap.len() < limit {
-        heap.push(key);
-    } else if heap.peek().is_some_and(|worst| key < *worst) {
-        heap.pop();
-        heap.push(key);
-    }
-}
-
 /// Modification time of a record in the combined base-then-delta space.
 #[inline]
 fn record_mtime(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32 {
@@ -1299,42 +1462,76 @@ fn search_ranked_cancellable_with_spans(
     if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return Vec::new();
     }
-    let match_started = spans.as_ref().map(|_| std::time::Instant::now());
-    let base_hits = crate::query::search_base_parallel_with_spans(
-        arena,
-        query,
-        threads,
-        cancel,
-        spans.as_deref_mut(),
-    );
-    if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
-        spans.match_ns = spans
-            .match_ns
-            .saturating_add(started.elapsed().as_nanos() as u64);
-        spans.candidates = spans.candidates.saturating_add(base_hits.len() as u64);
-    }
-    let rank_started = spans.as_ref().map(|_| std::time::Instant::now());
-    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
-    let mut name = Vec::new();
     // `match_quality` needs the decoded name, and so does the length; neither
     // is needed by an ordering that ranks on a column, so skip the decode.
     let needs_name = !order.needs_metadata();
-    for index in base_hits {
-        if delta.tombstones.get(index) {
-            continue;
+    let mut heap = match query {
+        Query::Substring(_) | Query::Regex(_) => {
+            let match_started = spans.as_ref().map(|_| std::time::Instant::now());
+            let (heap, seen) = crate::query::search_ranked_streaming(
+                arena,
+                query,
+                limit,
+                threads,
+                cancel,
+                spans.as_deref_mut(),
+                |index, name| {
+                    if delta.tombstones.get(index) {
+                        return None;
+                    }
+                    let (quality, name_len) = if needs_name {
+                        (match_quality(query, name), name.len() as u32)
+                    } else {
+                        (0, 0)
+                    };
+                    Some(sort_key(order, arena, delta, index, quality, name_len))
+                },
+            );
+            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
+                spans.match_ns = spans
+                    .match_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+                spans.candidates = spans.candidates.saturating_add(seen);
+            }
+            heap
         }
-        let (quality, name_len) = if needs_name {
-            arena.name_into(index, &mut name);
-            (match_quality(query, &name), name.len() as u32)
-        } else {
-            (0, 0)
-        };
-        retain_hit(
-            &mut heap,
-            sort_key(order, arena, delta, index, quality, name_len),
-            limit,
-        );
-    }
+        _ => {
+            let match_started = spans.as_ref().map(|_| std::time::Instant::now());
+            let base_hits = crate::query::search_base_parallel_with_spans(
+                arena,
+                query,
+                threads,
+                cancel,
+                spans.as_deref_mut(),
+            );
+            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
+                spans.match_ns = spans
+                    .match_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+                spans.candidates = spans.candidates.saturating_add(base_hits.len() as u64);
+            }
+            let mut heap = BinaryHeap::with_capacity(limit.min(4096));
+            let mut name = Vec::new();
+            for index in base_hits {
+                if delta.tombstones.get(index) {
+                    continue;
+                }
+                let (quality, name_len) = if needs_name {
+                    arena.name_into(index, &mut name);
+                    (match_quality(query, &name), name.len() as u32)
+                } else {
+                    (0, 0)
+                };
+                rank::retain_hit(
+                    &mut heap,
+                    sort_key(order, arena, delta, index, quality, name_len),
+                    limit,
+                );
+            }
+            heap
+        }
+    };
+    let rank_started = spans.as_ref().map(|_| std::time::Instant::now());
 
     let regex = match query {
         Query::Regex(pattern) => Regex::builder()
@@ -1363,7 +1560,7 @@ fn search_ranked_cancellable_with_spans(
         };
         if matched {
             let combined = arena.len() as u32 + index;
-            retain_hit(
+            rank::retain_hit(
                 &mut heap,
                 sort_key(
                     order,
@@ -1632,7 +1829,7 @@ fn search_path_terms_with_scratch(
             } else {
                 0
             };
-            retain_hit(
+            rank::retain_hit(
                 &mut scratch.heap,
                 sort_key(
                     order,
