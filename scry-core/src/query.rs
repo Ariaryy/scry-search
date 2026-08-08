@@ -167,12 +167,18 @@ fn search_base_impl(
             range.take(limit).collect()
         }
         Query::Substring(needle) => {
+            // `needle_lower` still drives the trigram block filter below (the
+            // trigram index is built lowercase), but per-name matching runs
+            // directly over the raw bytes via an ASCII-case-insensitive
+            // Aho-Corasick automaton, so no per-name lowercase copy is made.
             let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            let finder = memchr::memmem::Finder::new(&needle_lower);
+            let finder = aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([needle.as_bytes()])
+                .expect("single-pattern Aho-Corasick automaton always builds");
             let mut results = Vec::new();
             let stopped = std::cell::Cell::new(false);
             let cancelled = std::cell::Cell::new(false);
-            let mut scratch = Vec::new();
             let mut checked: u32 = 0;
             let mut visit = |idx, name: &[u8]| {
                 if is_cancelled_periodically(cancel, &mut checked) {
@@ -180,9 +186,7 @@ fn search_base_impl(
                     stopped.set(true);
                     return std::ops::ControlFlow::Break(());
                 }
-                scratch.clear();
-                scratch.extend(name.iter().map(|b| b.to_ascii_lowercase()));
-                if finder.find(&scratch).is_some() {
+                if finder.is_match(name) {
                     results.push(idx);
                     if results.len() >= limit {
                         stopped.set(true);

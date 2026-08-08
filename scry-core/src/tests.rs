@@ -83,6 +83,27 @@ fn substring_query_is_case_insensitive() {
     assert_eq!(hits.len(), 1);
 }
 
+#[test]
+fn substring_query_matches_regardless_of_needle_or_name_casing() {
+    let mut b = Arena::builder();
+    let root = b.push("C:", 0, true);
+    let mixed = b.push("LeDgEr_Report.pdf", 0, false);
+    b.set_parent(mixed, root);
+    let arena = b.build().0;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.rkyv");
+    save(&arena, &path).unwrap();
+    let store = ArenaStore::open(&path).unwrap();
+    let archived = store.archived();
+
+    // Mixed-case needle against a mixed-case name, and the fully lowercase
+    // and fully uppercase forms of the same needle, all find the one record.
+    for needle in ["lEdGeR", "ledger", "LEDGER"] {
+        let hits = search_base(archived, &Query::Substring(needle.into()), 10);
+        assert_eq!(hits.len(), 1, "needle {needle:?} should match");
+    }
+}
+
 fn generated_arena(count: usize) -> Arena {
     let mut builder = Arena::builder();
     for i in 0..count {
