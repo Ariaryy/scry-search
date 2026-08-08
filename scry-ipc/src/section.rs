@@ -26,14 +26,22 @@ unsafe impl Sync for Section {}
 unsafe impl Send for SectionView {}
 unsafe impl Sync for SectionView {}
 
+/// `CreateFileMappingW`'s size parameters are `DWORD`s, so a length past
+/// `u32::MAX` cannot be expressed at all — this must be a clean error, not a
+/// silent truncation to the low 32 bits.
+fn validate_len(len: usize) -> io::Result<()> {
+    if len == 0 || len > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid section length",
+        ));
+    }
+    Ok(())
+}
+
 impl Section {
     pub fn create(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.is_empty() || bytes.len() > u32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid section length",
-            ));
-        }
+        validate_len(bytes.len())?;
         let handle = unsafe {
             ffi::CreateFileMappingW(
                 ffi::INVALID_HANDLE_VALUE,
@@ -195,6 +203,17 @@ mod tests {
         let handle = section.duplicate_for(std::process::id()).unwrap();
         let view = SectionView::map(handle, section.len()).unwrap();
         assert_eq!(view.as_bytes(), bytes);
+    }
+
+    #[test]
+    fn section_over_u32_max_is_a_clean_error_not_a_truncation() {
+        // `Section::create` takes a slice, so a real over-cap call would need
+        // to allocate and fill 4 GiB+ of memory; `validate_len` is exercised
+        // directly instead, on the exact length its Win32 `DWORD` parameters
+        // cannot express.
+        assert!(validate_len(u32::MAX as usize).is_ok());
+        assert!(validate_len(u32::MAX as usize + 1).is_err());
+        assert!(validate_len(0).is_err());
     }
 
     fn handle_count() -> u32 {
