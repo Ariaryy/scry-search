@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod delta;
 pub mod dfs;
 pub mod frnmap;
+pub mod intervals;
 mod literals;
 pub mod metrics;
 pub mod pathindex;
