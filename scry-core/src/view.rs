@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::BinaryHeap};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
+use crate::arena::StreamingArenaBuilder;
 use crate::ascii;
 use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
@@ -13,7 +14,7 @@ use crate::query::is_cancelled_periodically;
 use crate::query::Query;
 use crate::rank::{self, Order};
 use crate::store::ArenaStore;
-use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
+use crate::{Arena, FrnEntry, PARENT_NONE};
 
 /// Ceiling on any caller-supplied result limit. The bounded top-k heap is the
 /// only thing standing between a one-character query and an allocation
@@ -580,6 +581,181 @@ mod tests {
                     old - rank.rank1(old as usize) as u32,
                     old - bruteforce_before
                 );
+            }
+        }
+    }
+
+    /// `compact`'s streaming merge/patch rewrite must produce exactly the
+    /// same records — same paths, same metadata, no duplicates or drops —
+    /// as a brute-force reference built directly from base plus delta, at
+    /// delta ratios from 0% up through and past the 5% compaction threshold,
+    /// with tombstones scattered through base so the merge has to skip
+    /// holes on both sides at once rather than only ever appending delta at
+    /// the end.
+    #[test]
+    fn streaming_compaction_matches_buffered() {
+        const BASE: usize = 2_000;
+        for percent in [0u32, 1, 5, 20] {
+            let (_dir, mut view) = base_view(BASE);
+            let root = view.base.archived().prefix_range("C:").start;
+            let added = BASE * percent as usize / 100;
+
+            let mut delta = Delta::new(view.base.archived().len());
+            for i in (1..BASE as u32).step_by(3) {
+                delta.tombstones.set(i);
+            }
+            for i in 0..added {
+                delta.added.push(DeltaRecord {
+                    name: format!("delta_add_{i:04}.txt"),
+                    parent: ParentRef::Base(root),
+                    mtime_secs: 1_000 + i as u32,
+                    is_dir: false,
+                    size_bytes: (i as u64 + 1) * 4096,
+                    live: true,
+                });
+            }
+            view.delta = Arc::new(delta.clone());
+
+            let arena = view.base.archived();
+            let mut expected: Vec<(String, u32, u64, bool)> = (0..arena.len() as u32)
+                .filter(|&i| !delta.tombstones.get(i))
+                .map(|i| {
+                    (
+                        arena.full_path(i, '\\'),
+                        arena.mtime(i),
+                        arena.size_bytes(i),
+                        arena.is_dir(i),
+                    )
+                })
+                .collect();
+            for (_, record) in view.delta.live_added() {
+                let path = match record.parent {
+                    ParentRef::Base(p) => {
+                        format!("{}\\{}", arena.full_path(p, '\\'), record.name)
+                    }
+                    ParentRef::Delta(_) | ParentRef::None => record.name.clone(),
+                };
+                expected.push((path, record.mtime_secs, record.size_bytes, record.is_dir));
+            }
+            expected.sort();
+
+            let (_compacted_dir, compacted_view) = open_compacted(&view);
+            let compacted = compacted_view.base.archived();
+            let mut actual: Vec<(String, u32, u64, bool)> = (0..compacted.len() as u32)
+                .map(|i| {
+                    (
+                        compacted.full_path(i, '\\'),
+                        compacted.mtime(i),
+                        compacted.size_bytes(i),
+                        compacted.is_dir(i),
+                    )
+                })
+                .collect();
+            actual.sort();
+
+            assert_eq!(actual, expected, "diverged at delta ratio {percent}%");
+        }
+    }
+
+    /// Brute-force check of the two formulas `compact`'s second pass uses to
+    /// recompute a record's final post-merge index without ever storing an
+    /// `old -> new` map: a base record's final index is
+    /// `base_new_index(old) + delta_before_count(name)`, and a delta
+    /// record's is `base_before_count(name) + delta_rank`. Both must agree
+    /// with the position each record actually lands at when base survivors
+    /// and live delta additions are named-merged (base wins ties) by a
+    /// straightforward sort — the one piece of index arithmetic in the
+    /// streaming rewrite a passing end-to-end test could still miss.
+    #[test]
+    fn index_translation_formula_is_correct() {
+        let (_dir, view) = base_view(300);
+        let arena = view.base.archived();
+
+        let mut delta = Delta::new(arena.len());
+        for i in (1..300u32).step_by(4) {
+            delta.tombstones.set(i);
+        }
+        let root = arena.prefix_range("C:").start;
+        for i in 0..40 {
+            delta.added.push(DeltaRecord {
+                name: format!("zzz_delta_{i:04}.txt"),
+                parent: ParentRef::Base(root),
+                mtime_secs: 0,
+                is_dir: false,
+                size_bytes: 0,
+                live: true,
+            });
+        }
+
+        let tomb_superblocks = crate::bitvec::build_superblocks(delta.tombstones.as_bytes());
+        let tomb_rank =
+            crate::bitvec::RankSelect::new(delta.tombstones.as_bytes(), &tomb_superblocks);
+        let base_new_index = |old: u32| -> Option<u32> {
+            if delta.tombstones.get(old) {
+                None
+            } else {
+                Some(old - tomb_rank.rank1(old as usize) as u32)
+            }
+        };
+        let mut delta_sorted: Vec<u32> = (0..delta.added.len() as u32).collect();
+        delta_sorted.sort_unstable_by(|&a, &b| {
+            crate::ascii::cmp_ci(
+                delta.added[a as usize].name.as_bytes(),
+                delta.added[b as usize].name.as_bytes(),
+            )
+        });
+        let delta_before_count = |name: &[u8]| -> u32 {
+            delta_sorted.partition_point(|&idx| {
+                crate::ascii::cmp_ci(delta.added[idx as usize].name.as_bytes(), name)
+                    == std::cmp::Ordering::Less
+            }) as u32
+        };
+        let base_before_count = |name: &[u8]| -> u32 {
+            let boundary = arena.lower_bound_name(name);
+            boundary - tomb_rank.rank1(boundary as usize) as u32
+        };
+
+        // Brute-force reference: the merged (base survivors + live delta) name
+        // order, base first on ties, built by a plain sort rather than the
+        // formulas under test.
+        #[derive(Clone)]
+        enum Origin {
+            Base(u32),
+            Delta(u32),
+        }
+        let mut merged: Vec<(Vec<u8>, Origin)> = (0..arena.len() as u32)
+            .filter(|&i| !delta.tombstones.get(i))
+            .map(|i| {
+                let mut name = Vec::new();
+                arena.name_into(i, &mut name);
+                (name, Origin::Base(i))
+            })
+            .collect();
+        for &idx in &delta_sorted {
+            merged.push((
+                delta.added[idx as usize].name.as_bytes().to_vec(),
+                Origin::Delta(idx),
+            ));
+        }
+        merged.sort_by(|(name_a, origin_a), (name_b, origin_b)| {
+            crate::ascii::cmp_ci(name_a, name_b).then_with(|| match (origin_a, origin_b) {
+                (Origin::Base(_), Origin::Delta(_)) => std::cmp::Ordering::Less,
+                (Origin::Delta(_), Origin::Base(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+        });
+
+        for (final_index, (name, origin)) in merged.iter().enumerate() {
+            match origin {
+                Origin::Base(old) => {
+                    let formula = base_new_index(*old).unwrap() + delta_before_count(name);
+                    assert_eq!(formula, final_index as u32, "base old={old}");
+                }
+                Origin::Delta(idx) => {
+                    let rank = delta_sorted.iter().position(|&d| d == *idx).unwrap() as u32;
+                    let formula = base_before_count(name) + rank;
+                    assert_eq!(formula, final_index as u32, "delta idx={idx}");
+                }
             }
         }
     }
@@ -1439,6 +1615,31 @@ impl IndexView {
     }
 
     /// Merge the overlay into a new base without re-enumerating the volume.
+    ///
+    /// Streams records straight into final sorted order instead of staging
+    /// then sorting: base survivors are already name-sorted on disk, and the
+    /// (small) set of live delta additions is sorted once in memory, so a
+    /// two-way merge on name (ASCII case-insensitive, base wins ties — the
+    /// old `ArenaBuilder::build()` path always put base pushes ahead of
+    /// delta pushes for equal names) produces final order directly. This
+    /// avoids `ArenaBuilder::build()`'s `order`/`rank` permutation arrays and
+    /// its `staging_names` copy, both `O(total name bytes)`.
+    ///
+    /// Every record is pushed with a `PARENT_NONE` placeholder parent
+    /// (`StreamingArenaBuilder::push`'s own final index — the push count —
+    /// is already known, so nothing needs to round-trip through a raw
+    /// marker); a second pass then patches every live record's real parent.
+    /// A record's own final index and its parent's final index are each
+    /// recomputed by formula in that second pass rather than looked up in a
+    /// stored old-to-new map: a base index's final position is
+    /// `base_new_index` (the existing tombstone-rank formula) plus the
+    /// count of live delta names sorting before it (`delta_before_count`,
+    /// binary search into the small sorted delta list); a delta index's
+    /// final position is the count of live base names sorting before it
+    /// (`base_before_count`, `ArchivedArena::lower_bound_name` binary search
+    /// into the on-disk base, cheap because it runs once per delta addition,
+    /// not once per base record) plus its rank within the sorted delta list.
+    /// This costs a second `O(n)` walk over base but no `O(n)`-sized array.
     pub fn compact(&self) -> (Arena, Vec<FrnEntry>) {
         let arena = self.base.archived();
 
@@ -1465,88 +1666,153 @@ impl IndexView {
             frns_by_delta[index as usize] = Some(frn);
         }
 
+        // Live delta additions, sorted once by name (base wins ties, so this
+        // list only needs to be internally consistent, not tie-broken
+        // against base). Small — bounded by the compaction threshold, not by
+        // base's size — so an `O(d log d)` sort here is cheap.
+        let mut delta_sorted: Vec<u32> = self.delta.live_added().map(|(idx, _)| idx).collect();
+        delta_sorted.sort_unstable_by(|&a, &b| {
+            crate::ascii::cmp_ci(
+                self.delta.added[a as usize].name.as_bytes(),
+                self.delta.added[b as usize].name.as_bytes(),
+            )
+        });
+        // Rank of each live delta index within `delta_sorted` — the delta
+        // half of a final index, symmetric with `base_new_index` for base.
+        let mut delta_rank = vec![0u32; self.delta.added.len()];
+        for (rank, &idx) in delta_sorted.iter().enumerate() {
+            delta_rank[idx as usize] = rank as u32;
+        }
+        // Count of live delta names strictly less than `name` — the delta
+        // contribution to a base record's final index.
+        let delta_before_count = |name: &[u8]| -> u32 {
+            delta_sorted.partition_point(|&idx| {
+                crate::ascii::cmp_ci(self.delta.added[idx as usize].name.as_bytes(), name)
+                    == std::cmp::Ordering::Less
+            }) as u32
+        };
+        // Count of live base names strictly less than `name` — the base
+        // contribution to a delta record's final index.
+        let base_before_count = |name: &[u8]| -> u32 {
+            let boundary = arena.lower_bound_name(name);
+            boundary - tomb_rank.rank1(boundary as usize) as u32
+        };
+        let final_index_of_base = |old: u32, name_buf: &mut Vec<u8>| -> Option<u32> {
+            let new = base_new_index(old)?;
+            arena.name_into(old, name_buf);
+            Some(new + delta_before_count(name_buf))
+        };
+        let final_index_of_delta = |idx: u32| -> u32 {
+            base_before_count(self.delta.added[idx as usize].name.as_bytes())
+                + delta_rank[idx as usize]
+        };
+
         let live_base = arena.len() - self.delta.tombstones.count_ones() as usize;
-        let live_delta = self.delta.live_added().count();
-        let mut builder = ArenaBuilder::with_capacity(live_base + live_delta, arena.names.len());
-        let mut delta_indices = vec![None; self.delta.added.len()];
-        let mut name = Vec::new();
+        let live_delta = delta_sorted.len();
+        let mut builder = StreamingArenaBuilder::new(live_base + live_delta, arena.names.len());
 
         {
             // Sorted-by-index view of the FRN sidecar (stored FRN-sorted, for
             // `FrnMap::lookup`), consumed by one monotonic pass alongside the
-            // old-index push loop below. Scoped to this block so it drops
-            // once the loop finishes instead of surviving the rest of
-            // compaction, unlike the dense `old index -> Option<frn>` array
-            // it replaces.
+            // ascending old-index half of the merge below — `base_old` only
+            // ever advances forward across the whole merge, so the cursor
+            // stays monotonic even though delta pushes are interleaved.
             let mut by_index: Vec<FrnEntry> = match &self.base.frn_map {
                 Some(map) => map.iter().collect(),
                 None => Vec::new(),
             };
             by_index.sort_unstable_by_key(|entry| entry.index);
-            let mut cursor = 0usize;
+            let mut frn_cursor = 0usize;
 
-            for old in 0..arena.len() as u32 {
-                if self.delta.tombstones.get(old) {
-                    continue;
+            let mut base_old = 0u32;
+            while base_old < arena.len() as u32 && self.delta.tombstones.get(base_old) {
+                base_old += 1;
+            }
+            let mut delta_i = 0usize;
+            let mut base_name = Vec::new();
+
+            loop {
+                let base_has = base_old < arena.len() as u32;
+                let delta_has = delta_i < delta_sorted.len();
+                if !base_has && !delta_has {
+                    break;
                 }
-                while cursor < by_index.len() && by_index[cursor].index < old {
-                    cursor += 1;
+                if base_has {
+                    arena.name_into(base_old, &mut base_name);
                 }
-                let frn = (cursor < by_index.len() && by_index[cursor].index == old)
-                    .then(|| by_index[cursor].frn);
-                arena.name_into(old, &mut name);
-                builder.push_bytes_with_metadata(
-                    &name,
-                    arena.mtime(old),
-                    arena.is_dir(old),
-                    frn,
-                    arena.size_bytes(old),
-                );
+                let take_base = if base_has && delta_has {
+                    let delta_name = self.delta.added[delta_sorted[delta_i] as usize]
+                        .name
+                        .as_bytes();
+                    crate::ascii::cmp_ci(&base_name, delta_name) != std::cmp::Ordering::Greater
+                } else {
+                    base_has
+                };
+
+                if take_base {
+                    while frn_cursor < by_index.len() && by_index[frn_cursor].index < base_old {
+                        frn_cursor += 1;
+                    }
+                    let frn = (frn_cursor < by_index.len()
+                        && by_index[frn_cursor].index == base_old)
+                        .then(|| by_index[frn_cursor].frn);
+                    builder.push(
+                        &base_name,
+                        arena.mtime(base_old),
+                        arena.is_dir(base_old),
+                        arena.size_bytes(base_old),
+                        PARENT_NONE,
+                        frn,
+                    );
+                    base_old += 1;
+                    while base_old < arena.len() as u32 && self.delta.tombstones.get(base_old) {
+                        base_old += 1;
+                    }
+                } else {
+                    let delta_idx = delta_sorted[delta_i];
+                    let record = &self.delta.added[delta_idx as usize];
+                    builder.push(
+                        record.name.as_bytes(),
+                        record.mtime_secs,
+                        record.is_dir,
+                        record.size_bytes,
+                        PARENT_NONE,
+                        frns_by_delta[delta_idx as usize],
+                    );
+                    delta_i += 1;
+                }
             }
         }
-        for (old, record) in self.delta.live_added() {
-            let new = match frns_by_delta[old as usize] {
-                Some(frn) => builder.push_bytes_with_metadata(
-                    record.name.as_bytes(),
-                    record.mtime_secs,
-                    record.is_dir,
-                    Some(frn),
-                    record.size_bytes,
-                ),
-                None => builder.push_bytes_with_metadata(
-                    record.name.as_bytes(),
-                    record.mtime_secs,
-                    record.is_dir,
-                    None,
-                    record.size_bytes,
-                ),
-            };
-            delta_indices[old as usize] = Some(new);
-        }
 
+        let mut name_buf = Vec::new();
+        let mut parent_name_buf = Vec::new();
         for old in 0..arena.len() as u32 {
-            let Some(new) = base_new_index(old) else {
+            let Some(final_self) = final_index_of_base(old, &mut name_buf) else {
                 continue;
             };
             let parent = arena.parent(old);
-            if parent != PARENT_NONE {
-                if let Some(new_parent) = base_new_index(parent) {
-                    builder.set_parent(new, new_parent);
-                }
+            if parent == PARENT_NONE {
+                continue;
+            }
+            if let Some(final_parent) = final_index_of_base(parent, &mut parent_name_buf) {
+                builder.patch_parent(final_self, final_parent);
             }
         }
-        for (old, record) in self.delta.live_added() {
-            let new = delta_indices[old as usize].unwrap();
-            let parent = match record.parent {
-                ParentRef::Base(index) => base_new_index(index),
-                ParentRef::Delta(index) => delta_indices[index as usize],
+        for (idx, record) in self.delta.live_added() {
+            let final_self = final_index_of_delta(idx);
+            let final_parent = match record.parent {
+                ParentRef::Base(index) => final_index_of_base(index, &mut name_buf),
+                ParentRef::Delta(index) => self.delta.added[index as usize]
+                    .live
+                    .then(|| final_index_of_delta(index)),
                 ParentRef::None => None,
             };
-            if let Some(parent) = parent {
-                builder.set_parent(new, parent);
+            if let Some(final_parent) = final_parent {
+                builder.patch_parent(final_self, final_parent);
             }
         }
-        builder.build()
+
+        builder.finish()
     }
 }
 

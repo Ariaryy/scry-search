@@ -136,6 +136,64 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u32 {
 
 // ── front-coding encode / decode ─────────────────────────────────────────────
 
+/// Incremental front-coder: the same encoding `front_code` produces, but fed
+/// one name at a time instead of a full `&[&[u8]]` slice. This is what lets
+/// [`StreamingArenaBuilder`] emit the name blob as records are pushed rather
+/// than staging every name in a separate buffer first — the staging buffer
+/// (a full second copy of every name) was as large as the front-coded output
+/// itself, and eliminating it is the point of the streaming builder.
+///
+/// Bucket boundaries and the back-reference encoding are keyed purely on
+/// "how many names have been pushed so far", so this produces byte-identical
+/// output to `front_code` given the same names in the same order — proven by
+/// `front_code` itself being reimplemented on top of this type below.
+struct FrontCoder {
+    blob: Vec<u8>,
+    offsets: Vec<u32>,
+    prev: Vec<u8>,
+    pos_in_bucket: usize,
+    absolute_index: usize,
+}
+
+impl FrontCoder {
+    fn new(capacity_entries: usize, capacity_bytes: usize) -> Self {
+        FrontCoder {
+            blob: Vec::with_capacity(capacity_bytes),
+            offsets: Vec::with_capacity(capacity_entries.div_ceil(BUCKET_SIZE) + 1),
+            prev: Vec::new(),
+            pos_in_bucket: 0,
+            absolute_index: 0,
+        }
+    }
+
+    fn push(&mut self, name: &[u8], trigram_index: &mut [u8], row_len: usize) {
+        index_trigrams(self.absolute_index, name, trigram_index, row_len);
+        if self.pos_in_bucket == 0 {
+            self.offsets.push(self.blob.len() as u32);
+            write_varint(&mut self.blob, name.len() as u32);
+            self.blob.extend_from_slice(name);
+        } else {
+            let shared = common_prefix_len(&self.prev, name);
+            write_varint(&mut self.blob, shared as u32);
+            let suffix = &name[shared..];
+            write_varint(&mut self.blob, suffix.len() as u32);
+            self.blob.extend_from_slice(suffix);
+        }
+        self.prev.clear();
+        self.prev.extend_from_slice(name);
+        self.absolute_index += 1;
+        self.pos_in_bucket += 1;
+        if self.pos_in_bucket == BUCKET_SIZE {
+            self.pos_in_bucket = 0;
+        }
+    }
+
+    fn finish(mut self) -> (Vec<u8>, Vec<u32>) {
+        self.offsets.push(self.blob.len() as u32); // sentinel
+        (self.blob, self.offsets)
+    }
+}
+
 /// Encode `names_in_order` (already in sorted order) into `blob` and
 /// `offsets`. `offsets` will have `ceil(n/BUCKET_SIZE) + 1` entries,
 /// with `offsets[last] == blob.len()`.
@@ -146,34 +204,13 @@ fn front_code(
     trigram_index: &mut [u8],
     row_len: usize,
 ) {
-    let n = names_in_order.len();
-    let num_buckets = n.div_ceil(BUCKET_SIZE);
-    offsets.reserve(num_buckets + 1);
-
-    for b in 0..num_buckets {
-        offsets.push(blob.len() as u32);
-        let start = b * BUCKET_SIZE;
-        let end = (start + BUCKET_SIZE).min(n);
-
-        // First entry in bucket: just length + bytes (no back-reference).
-        let first = names_in_order[start];
-        index_trigrams(start, first, trigram_index, row_len);
-        write_varint(blob, first.len() as u32);
-        blob.extend_from_slice(first);
-        let mut prev = first;
-
-        // Remaining entries: shared prefix length + suffix.
-        for (index, cur) in names_in_order[(start + 1)..end].iter().enumerate() {
-            index_trigrams(start + 1 + index, cur, trigram_index, row_len);
-            let shared = common_prefix_len(prev, cur);
-            write_varint(blob, shared as u32);
-            let suffix = &cur[shared..];
-            write_varint(blob, suffix.len() as u32);
-            blob.extend_from_slice(suffix);
-            prev = cur;
-        }
+    let mut coder = FrontCoder::new(names_in_order.len(), 0);
+    for &name in names_in_order {
+        coder.push(name, trigram_index, row_len);
     }
-    offsets.push(blob.len() as u32); // sentinel
+    let (coded_blob, coded_offsets) = coder.finish();
+    *blob = coded_blob;
+    *offsets = coded_offsets;
 }
 
 fn index_trigrams(index: usize, name: &[u8], matrix: &mut [u8], row_len: usize) {
@@ -725,6 +762,71 @@ impl ArchivedArena {
         }
     }
 
+    /// Smallest record index `i` such that `name(i) >= target` (ASCII
+    /// case-insensitive), or `self.len()` if every name is smaller. Records
+    /// are name-sorted, so this is a lower-bound binary search over bucket
+    /// heads (mirroring `prefix_range`'s `find_bucket_lo`), followed by a
+    /// linear decode within the boundary bucket — a bucket's own head can be
+    /// `< target` while a later entry in the same bucket is `>= target`, so
+    /// only the head comparison can be binary-searched, not the exact
+    /// boundary. Used by `IndexView::compact` to place a small in-memory
+    /// delta addition against the (potentially huge) on-disk base sort order
+    /// without decoding every base name.
+    pub fn lower_bound_name(&self, target: &[u8]) -> u32 {
+        let n = self.parents.len() as u32;
+        let num_buckets = self.bucket_offsets.len().saturating_sub(1);
+        if num_buckets == 0 {
+            return n;
+        }
+
+        let mut lo = 0usize;
+        let mut hi = num_buckets;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let head = self.bucket_head(mid);
+            if ascii::cmp_ci(&head, target) == std::cmp::Ordering::Less {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let start_bucket = lo.saturating_sub(1);
+
+        let mut name_buf = Vec::new();
+        for b in start_bucket..num_buckets {
+            let bstart = (b * BUCKET_SIZE) as u32;
+            let bend = bstart + (BUCKET_SIZE as u32).min(n - bstart);
+            let start_offset = self.bucket_offsets[b] as usize;
+            let end_offset = self.bucket_offsets[b + 1] as usize;
+            let bucket_blob = &self.names.as_slice()[start_offset..end_offset];
+            if bucket_blob.is_empty() {
+                continue;
+            }
+
+            let mut p = 0usize;
+            let first_len = read_varint(bucket_blob, &mut p) as usize;
+            name_buf.clear();
+            name_buf.extend_from_slice(&bucket_blob[p..p + first_len]);
+            p += first_len;
+            if ascii::cmp_ci(&name_buf, target) != std::cmp::Ordering::Less {
+                return bstart;
+            }
+
+            for rel in 1..(bend - bstart) {
+                let shared = read_varint(bucket_blob, &mut p) as usize;
+                let suffix_len = read_varint(bucket_blob, &mut p) as usize;
+                let suffix_start = p;
+                p += suffix_len;
+                name_buf.truncate(shared);
+                name_buf.extend_from_slice(&bucket_blob[suffix_start..suffix_start + suffix_len]);
+                if ascii::cmp_ci(&name_buf, target) != std::cmp::Ordering::Less {
+                    return bstart + rel;
+                }
+            }
+        }
+        n
+    }
+
     /// Decode just the first name in bucket `b` (cheap — no back-reference needed).
     fn bucket_head(&self, b: usize) -> Vec<u8> {
         let start_offset = self.bucket_offsets[b] as usize;
@@ -982,6 +1084,142 @@ impl ArenaBuilder {
     }
 }
 
+/// Builds an `Arena` from records already known to be in final sorted
+/// (name-ascending, tie-broken however the caller's merge already resolved
+/// ties) order, streaming the front-coded name blob and trigram index as
+/// records arrive instead of staging names and sorting afterward.
+///
+/// This exists for `IndexView::compact`, which can produce records in final
+/// order cheaply (base survivors are already name-sorted on disk; delta
+/// additions are a small in-memory list, sorted once) via a merge of the two
+/// streams — so paying for `ArenaBuilder`'s full stage-then-sort pass would
+/// duplicate work the caller already did. It intentionally does not replace
+/// `ArenaBuilder`: callers that push records in arbitrary order (the MFT/USN
+/// enumerators) still need a real sort.
+///
+/// A record's parent may not have been pushed yet when the record itself is
+/// pushed (name order and tree order are unrelated), so `push` accepts a
+/// caller-defined *raw* parent marker instead of a final index, and
+/// `patch_parent` overwrites it once the parent's final index is known. This
+/// mirrors `ArenaBuilder::push_bytes_with_metadata` + `set_parent`, except
+/// here a record's own final index is known at push time (it is just the
+/// push count), so there is no separate order/rank permutation to build.
+pub struct StreamingArenaBuilder {
+    front_coder: FrontCoder,
+    parents: Vec<u32>,
+    mtimes: Vec<u32>,
+    sizes: Vec<u32>,
+    trigram_index: Vec<u8>,
+    row_len: usize,
+    frn_entries: Vec<FrnEntry>,
+    journal_id: u64,
+    next_usn: i64,
+    volume_serial: u64,
+}
+
+impl StreamingArenaBuilder {
+    /// `total_entries` must be the exact final record count — it sizes the
+    /// trigram block filter, which (like `ArenaBuilder::build`'s) is built
+    /// once for the whole archive rather than grown incrementally.
+    pub fn new(total_entries: usize, name_bytes_hint: usize) -> Self {
+        let blocks = num_blocks(total_entries);
+        let row_len = row_bytes(blocks);
+        let trigram_index = if total_entries < TRIGRAM_BLOCK {
+            Vec::new()
+        } else {
+            vec![0; TRIGRAM_ROWS * row_len]
+        };
+        StreamingArenaBuilder {
+            front_coder: FrontCoder::new(total_entries, name_bytes_hint),
+            parents: Vec::with_capacity(total_entries),
+            mtimes: Vec::with_capacity(total_entries),
+            sizes: Vec::with_capacity(total_entries),
+            trigram_index,
+            row_len,
+            frn_entries: Vec::new(),
+            journal_id: 0,
+            next_usn: 0,
+            volume_serial: 0,
+        }
+    }
+
+    pub fn set_snapshot_cursor(&mut self, journal_id: u64, next_usn: i64, volume_serial: u64) {
+        self.journal_id = journal_id;
+        self.next_usn = next_usn;
+        self.volume_serial = volume_serial;
+    }
+
+    /// Pushes the next record in final sorted order. `raw_parent` is an
+    /// opaque, caller-chosen placeholder (`PARENT_NONE` for no parent) —
+    /// this type never interprets it, it only round-trips it back through
+    /// `patch_parent`'s `idx` until the caller overwrites it with a real
+    /// final index. Returns this record's final index.
+    pub fn push(
+        &mut self,
+        name: &[u8],
+        mtime_secs: u32,
+        is_dir: bool,
+        size_bytes: u64,
+        raw_parent: u32,
+        frn: Option<u64>,
+    ) -> u32 {
+        let idx = self.parents.len() as u32;
+        self.front_coder
+            .push(name, &mut self.trigram_index, self.row_len);
+        self.parents.push(pack_parent(raw_parent, is_dir));
+        self.mtimes.push(mtime_secs);
+        self.sizes.push(bytes_to_size_kib(size_bytes));
+        if let Some(frn) = frn {
+            self.frn_entries.push(FrnEntry {
+                frn,
+                index: idx,
+                _pad: 0,
+            });
+        }
+        idx
+    }
+
+    /// Overwrites the parent index left at `idx` by `push` (its directory
+    /// flag is preserved) with a resolved final index, or `PARENT_NONE`.
+    pub fn patch_parent(&mut self, idx: u32, final_parent: u32) {
+        let is_dir = word_is_dir(self.parents[idx as usize]);
+        self.parents[idx as usize] = pack_parent(final_parent, is_dir);
+    }
+
+    /// The `dfs_*` columns can only be built once every `parents` entry has
+    /// its final value, so this is the second of the two passes over
+    /// records `compact` performs (push, then patch). The chosen approach
+    /// keeps just the finished `parents: Vec<u32>` in memory for this call
+    /// — 4 bytes/record, ~8 MB at 2M records — and calls the same
+    /// `dfs::build`/`prefix_sums_u64` a full rebuild would, rather than
+    /// re-reading a partially-written mmap or maintaining `dfs_*`
+    /// incrementally as parents are patched.
+    pub fn finish(self) -> (Arena, Vec<FrnEntry>) {
+        let (names, bucket_offsets) = self.front_coder.finish();
+        let dfs = crate::dfs::build(&self.parents);
+        let dfs_size_prefix = crate::dfs::prefix_sums_u64(&dfs.records, &self.sizes);
+        (
+            Arena {
+                format_version: crate::record::FORMAT_VERSION,
+                journal_id: self.journal_id,
+                next_usn: self.next_usn,
+                volume_serial: self.volume_serial,
+                names,
+                bucket_offsets,
+                parents: self.parents,
+                mtimes: self.mtimes,
+                sizes: self.sizes,
+                trigram_index: self.trigram_index,
+                dfs_positions: dfs.positions,
+                dfs_records: dfs.records,
+                dfs_ends: dfs.subtree_ends,
+                dfs_size_prefix,
+            },
+            self.frn_entries,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1231,84 @@ mod tests {
             b.push(name, 0, false);
         }
         b.build().0
+    }
+
+    /// `StreamingArenaBuilder` must produce a byte-identical archive to
+    /// `ArenaBuilder::build()` given the same records: push them into
+    /// `StreamingArenaBuilder` in final sorted order (mirroring what
+    /// `IndexView::compact`'s merge guarantees) with every parent left as a
+    /// placeholder, then patch every parent out of push order, then
+    /// `finish()`. `dfs::build`'s own handling of malformed parent columns
+    /// (cycles, self-parents, dangling indices) is exercised directly in
+    /// `dfs.rs`'s tests — `finish()` calls the same function unchanged — so
+    /// this test's job is narrower: prove `FrontCoder` matches the batch
+    /// `front_code` byte-for-byte, and that patching parents after the fact
+    /// (rather than knowing them at push time) still feeds `dfs::build` the
+    /// same column the regular builder would have.
+    #[test]
+    fn streaming_builder_matches_regular_builder_output() {
+        // (name, is_dir, mtime, size_bytes, raw parent by *input* index).
+        // Input order is deliberately not name order, so building the
+        // reference via `ArenaBuilder` (arbitrary push order) and the
+        // streaming builder (records pushed in the name-sorted order below)
+        // exercise genuinely different code paths.
+        let records: &[(&str, bool, u32, u64, Option<usize>)] = &[
+            ("C:", true, 0, 0, None),
+            ("bravo", false, 200, 4096, Some(0)),
+            ("alpha", true, 100, 0, Some(0)),
+            ("charlie", false, 300, 8192, Some(2)), // child of "alpha"
+            ("delta", false, 400, 0, Some(0)),
+            ("echo", false, 500, 0, Some(2)), // sibling of "charlie"
+        ];
+
+        let mut regular = ArenaBuilder::with_capacity(records.len(), 0);
+        let mut regular_indices = vec![0u32; records.len()];
+        for (i, &(name, is_dir, mtime, size, _)) in records.iter().enumerate() {
+            regular_indices[i] =
+                regular.push_bytes_with_metadata(name.as_bytes(), mtime, is_dir, None, size);
+        }
+        for (i, &(_, _, _, _, parent)) in records.iter().enumerate() {
+            if let Some(parent) = parent {
+                regular.set_parent(regular_indices[i], regular_indices[parent]);
+            }
+        }
+        let (regular_arena, _) = regular.build();
+
+        // Push into the streaming builder in name-sorted order (what the
+        // merge in `compact` guarantees), tracking each input index's final
+        // position so parents can be patched afterward.
+        let mut order: Vec<usize> = (0..records.len()).collect();
+        order.sort_by(|&a, &b| ascii::cmp_ci(records[a].0.as_bytes(), records[b].0.as_bytes()));
+        let mut streaming = StreamingArenaBuilder::new(records.len(), 0);
+        let mut streaming_indices = vec![0u32; records.len()];
+        for &i in &order {
+            let (name, is_dir, mtime, size, _) = records[i];
+            streaming_indices[i] =
+                streaming.push(name.as_bytes(), mtime, is_dir, size, PARENT_NONE, None);
+        }
+        // Patch in an order unrelated to push order, matching the "parent
+        // may not have been pushed yet" reality `compact`'s second pass
+        // handles.
+        for &i in order.iter().rev() {
+            if let Some(parent) = records[i].4 {
+                streaming.patch_parent(streaming_indices[i], streaming_indices[parent]);
+            }
+        }
+        let (streaming_arena, _) = streaming.finish();
+
+        assert_eq!(streaming_arena.names, regular_arena.names);
+        assert_eq!(streaming_arena.bucket_offsets, regular_arena.bucket_offsets);
+        assert_eq!(streaming_arena.parents, regular_arena.parents);
+        assert_eq!(streaming_arena.mtimes, regular_arena.mtimes);
+        assert_eq!(streaming_arena.sizes, regular_arena.sizes);
+        assert_eq!(streaming_arena.trigram_index, regular_arena.trigram_index);
+        assert_eq!(streaming_arena.dfs_positions, regular_arena.dfs_positions);
+        assert_eq!(streaming_arena.dfs_records, regular_arena.dfs_records);
+        assert_eq!(streaming_arena.dfs_ends, regular_arena.dfs_ends);
+        assert_eq!(
+            streaming_arena.dfs_size_prefix,
+            regular_arena.dfs_size_prefix
+        );
     }
 
     /// `and_into`/`or_into` chunk 8 bytes at a time and handle any remainder
