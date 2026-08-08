@@ -199,14 +199,18 @@ fn selectivity(c: &mut Criterion) {
 fn path_terms(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut group = c.benchmark_group("path_terms");
-    let cases: [(&str, Vec<&str>); 6] = [
+    let cases: [(&str, Vec<&str>); 7] = [
+        ("no_match", vec!["zzzznomatchqqqq"]),
         ("rare", vec![INFIX_RARE]),
         ("clustered", vec![PREFIX_CLUSTERED]),
         ("mid", vec![INFIX_MID]),
         ("common", vec![INFIX_COMMON]),
-        // The point of these two: a query costs what its *least* selective
-        // term costs, because candidate blocks are unioned across terms. If
-        // that ever stops being true, these two converge on `rare`.
+        // The point of these two: each term's interval set is built from an
+        // independent scan (never a unioned candidate-block set — see the
+        // CLAUDE.md rule about not intersecting trigram blocks across
+        // terms), but the final intersection is ordered smallest-set-first,
+        // so a query containing a rare term costs close to what the rare
+        // term alone costs, not what its least selective term costs.
         ("rare+common", vec![INFIX_RARE, INFIX_COMMON]),
         ("mid+clustered", vec![INFIX_MID, PREFIX_CLUSTERED]),
     ];

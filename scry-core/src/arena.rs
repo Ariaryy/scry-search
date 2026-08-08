@@ -17,8 +17,13 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// - `parents` is touched by `full_path` on every displayed result. Packing it
 ///   alone means a 64-byte cache line holds 16 useful hops instead of 5 (as
 ///   it would interleaved with mtime and size).
-/// - `mtimes` and `sizes` are read only during delta metadata lookup and
-///   compaction, never on the query path. Kept in their own arrays so the OS
+/// - `dfs_positions` and `dfs_records` are read on every path-term query (a
+///   directory match pushes `dfs_positions[r]..dfs_ends[r]` into that term's
+///   interval set; the final scan maps positions back to records through
+///   `dfs_records`) — hot for the same reason `parents` is.
+/// - `mtimes`, `sizes` and `dfs_ends` are read only during delta metadata
+///   lookup, compaction, and (for `dfs_ends`) once per matching directory
+///   rather than per candidate record. Kept in their own arrays so the OS
 ///   can evict those pages between compaction bursts.
 ///
 /// These arrays are index-parallel: `parents[i]`, `mtimes[i]`, `sizes[i]`,
@@ -59,14 +64,17 @@ pub struct Arena {
     /// Trigram row matrix; each row has one LSB-first bit per 1024 records.
     pub trigram_index: Vec<u8>,
     /// Depth-first position of each record, indexed by name-sorted record.
-    /// Cold: only a scope-restricted or aggregating query reads it.
+    /// Hot: every path-term query reads this to build each term's interval
+    /// set and to map matched positions back to records.
     /// See `crate::dfs` for what the three tree-order columns buy.
     pub dfs_positions: Vec<u32>,
     /// Inverse of `dfs_positions`: record index at each depth-first position.
+    /// Hot for the same reason as `dfs_positions`.
     pub dfs_records: Vec<u32>,
     /// Exclusive end, in depth-first positions, of each record's subtree.
     /// Indexed by name-sorted record, so `dfs_positions[r]..dfs_ends[r]` is
-    /// the span of `dfs_records` covering everything beneath `r`.
+    /// the span of `dfs_records` covering everything beneath `r`. Cold:
+    /// read once per *matching directory*, not per candidate record.
     pub dfs_ends: Vec<u32>,
     /// Prefix sums of `sizes`, laid out in depth-first order (see
     /// `crate::dfs::prefix_sums_u64`). `dfs_size_prefix.len() ==

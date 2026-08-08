@@ -10,14 +10,18 @@
   `parent()`, `mtime()`) needs an impl on each — the accessors on `ArchivedArena` read
   directly from the archived column vectors. `FileRecord` no longer exists; the dual-impl
   pattern now applies to functions on `ArchivedArena` vs the free functions in `record.rs`.
-- `Arena` uses a format v9 index (parallel 4-byte columns: `parents` hot,
-  `mtimes`/`sizes`/`dfs_positions`/`dfs_records`/`dfs_ends` cold, plus the 8-byte
-  `dfs_size_prefix` cold column; plus name-sorted front-coded names) rather than plain
-  `String` fields or a single interleaved struct. The hot/cold split is load-bearing:
-  `parents` alone in its column gives 16 parent hops per cache line; keeping the rest
-  separate lets them stay paged out between compaction bursts. A future change that
-  folds any cold field back into the hot column must update both this note and the doc
-  comments in `arena.rs`.
+- `Arena` uses a format v9 index (parallel 4-byte columns: `parents`/`dfs_positions`/
+  `dfs_records` hot, `mtimes`/`sizes`/`dfs_ends` cold, plus the 8-byte `dfs_size_prefix`
+  cold column; plus name-sorted front-coded names) rather than plain `String` fields
+  or a single interleaved struct. The hot/cold split is load-bearing: `parents` alone
+  in its column gives 16 parent hops per cache line; keeping the rest separate lets
+  them stay paged out between compaction bursts. `dfs_positions` and `dfs_records`
+  moved from cold to hot because path-term search now reads them on every query (see
+  the DFS-position-space bullet below), not just on the size-prefix build path;
+  `dfs_ends` stayed cold since it's only read once per matching directory to push a
+  `subtree()` span, not per candidate. A future change that folds any field between
+  the hot and cold groups must update both this note and the doc comments in
+  `arena.rs`.
 - Records are stored **name-sorted** — `prefix_range`'s binary search and front-coding
   both depend on it — so the `dfs_*` columns (`scry-core/src/dfs.rs`) carry tree order
   separately: `dfs_positions[r]..dfs_ends[r]` is the half-open span of `dfs_records`
@@ -77,11 +81,39 @@
   key it on `Arc::as_ptr(&view.base)` again, since a freed generation's address can
   be reused by a later one and that reintroduces an ABA bug where a client is handed
   a stale mapping under a key that looks fresh.
-- **Path-term queries publish their derived `PathIndex` atomically with base and
-  delta.** It densely numbers directories with rank over `dir_bits`, propagates
-  term masks parent-before-child, and is rebuilt for every delta publication.
-  Never intersect trigram candidate blocks across terms: different terms may
-  be satisfied by different ancestor records.
+- **Path-term queries work entirely in DFS-position space, over the columns
+  the snapshot already stores** (`arena.dfs_position`/`dfs_record`/`subtree`)
+  — there is no separate derived index to publish or rebuild. Each term gets
+  its own `IntervalSet` (`scry-core/src/intervals.rs`) from an independent
+  trigram-filtered scan: a directory match pushes its whole `subtree()` span,
+  a name match pushes a single point. The answer is the intersection of all
+  terms' interval sets, folded smallest-first; an empty set at any term short-
+  circuits the whole query before the intersection or the final scan runs.
+  Delta records have no DFS position, so they're handled by a separate,
+  unconditional linear walk up each addition's ancestor chain, testing base
+  containment via the same interval sets. Never intersect trigram candidate
+  blocks across terms: different terms may be satisfied by different ancestor
+  records — this algorithm intersects the *derived* per-term interval sets in
+  position space, never the raw candidate blocks themselves.
+- **A path-term candidate's own name is decoded twice under `Order::Relevance`**:
+  once per term while building that term's interval set (to test whether the
+  candidate's own name — not an ancestor's — satisfies that specific term),
+  and again during final enumeration (to compute the *combined* quality mask
+  against all terms at once, since a record can satisfy some terms through its
+  own name and others by inheriting an ancestor directory's match). The two
+  scans test different things — a per-term substring test vs. a multi-pattern
+  automaton over the whole term set — so the second decode isn't a redundant
+  copy of the first; caching it would mean tracking per-record match state
+  across independent per-term scans, which the design deliberately avoids.
+  This is worth the cost: on a 440k-record synthetic corpus (`cargo bench -p
+  scry-core --bench query -- path_terms`), rare/no-match/mixed-selectivity
+  queries improved 30–72% (a no-match query dropped from ~34 ms to ~37 µs
+  in-process) by dropping the old implementation's unconditional full-index
+  scan and directory-closure pass. The two cases where a *single* term matches
+  a large fraction of the corpus (`common`, an infix present in ~39% of
+  trigram blocks; `clustered`, a prefix matching 2,048 directories) regressed
+  16–31%, because those are exactly the cases where the double decode's
+  constant factor dominates instead of being hidden by avoided full scans.
 - **Substring search uses a trigram block filter** (16,384 rows × one bit per
   1024-record block, ~2 MB at a million entries). Candidate blocks are the AND
   of the needle's trigram rows; needles shorter than 3 bytes fall back to a full
@@ -107,9 +139,12 @@
   process startup/loader and teardown. A local two-volume, ~2.7M-record measurement found
   arguments at ~20–30 µs, pipe connection at ~55–65 µs, and printing at ~1–2 ms;
   the RPC query dominated at ~100–170 ms. Process wall time added ~20–25 ms outside
-  `main`. A no-match path-term query still took ~34 ms, consistent with its fixed
-  directory-closure pass. Treat these as diagnostic local measurements, not a regression
-  benchmark; do not try to remove that closure cost as a small CLI optimization.
+  `main`. A no-match path-term query now costs microseconds in-process (~37 µs,
+  measured via the `path_terms/no_match` criterion bench on a 440k-record corpus)
+  rather than a fixed per-query pass over every directory — the interval-algebra
+  rewrite's early exit means an empty term short-circuits the whole query before
+  any scan or intersection runs. Treat these as diagnostic local measurements, not
+  a regression benchmark.
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
