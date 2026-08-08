@@ -8,7 +8,7 @@ use crate::ascii;
 use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
 use crate::metrics::QuerySpans;
-use crate::pathindex::{PathClosureScratch, PathIndex};
+use crate::pathindex::PathIndex;
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
 use crate::query::Query;
@@ -918,7 +918,6 @@ mod tests {
         let filtered = search_path_terms_with_scratch(
             view.base.archived(),
             &view.delta,
-            &view.path_index,
             &terms,
             SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
@@ -928,7 +927,6 @@ mod tests {
         let full = search_path_terms_with_scratch(
             view.base.archived(),
             &view.delta,
-            &view.path_index,
             &terms,
             SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
@@ -952,7 +950,6 @@ mod tests {
         let absent = search_path_terms_with_scratch(
             large.base.archived(),
             &large.delta,
-            &large.path_index,
             &["match".to_owned()],
             SearchOptions::new(10),
             &mut scratch,
@@ -964,7 +961,6 @@ mod tests {
         let results = search_path_terms_with_scratch(
             small.base.archived(),
             &small.delta,
-            &small.path_index,
             &["definitely_absent_qzxv".to_owned()],
             SearchOptions::new(10),
             &mut scratch,
@@ -972,10 +968,11 @@ mod tests {
             None,
         );
         assert!(results.is_empty());
-        assert!(scratch
-            .touched_dirs
-            .iter()
-            .all(|&directory| directory < small.path_index.directory_count() as u32));
+        // A single-term query leaves exactly one term set behind, sized to
+        // the smaller index rather than any leftover capacity from the
+        // larger one.
+        assert_eq!(scratch.term_sets.len(), 1);
+        assert!(scratch.term_sets[0].is_empty());
     }
 
     #[test]
@@ -1033,7 +1030,6 @@ mod tests {
             let results = search_path_terms_with_scratch(
                 view.base.archived(),
                 &view.delta,
-                &view.path_index,
                 &terms,
                 SearchOptions::new(50),
                 scratch,
@@ -1139,7 +1135,6 @@ impl IndexView {
             let hits = search_path_terms_cancellable(
                 self.base.archived(),
                 &self.delta,
-                &self.path_index,
                 terms,
                 options,
                 cancel,
@@ -1406,8 +1401,7 @@ pub fn search_archived_with_delta(
     options: SearchOptions,
 ) -> Vec<ResultEntry> {
     let hits = if let Query::PathTerms(terms) = query {
-        let path_index = PathIndex::build(arena, delta);
-        search_path_terms(arena, delta, &path_index, terms, options)
+        search_path_terms(arena, delta, terms, options)
     } else {
         search_ranked(arena, delta, query, options)
     };
@@ -1433,15 +1427,14 @@ pub fn materialize_hits(
 
 #[derive(Default)]
 struct PathSearchScratch {
-    hits: Vec<(u32, u16)>,
-    dir_mask: Vec<u16>,
-    touched_dirs: Vec<u32>,
-    closure: PathClosureScratch,
-    parent_cache: ParentRankCache,
-    relevant_parents: Vec<u8>,
-    touched_parent_bytes: Vec<u32>,
+    /// One coalesced [`crate::intervals::IntervalSet`] of DFS positions per
+    /// term, built from independent per-term scans — never merged at the
+    /// trigram-block level, since different terms may be satisfied by
+    /// different ancestor records.
+    term_sets: Vec<crate::intervals::IntervalSet>,
+    fold_a: crate::intervals::IntervalSet,
+    fold_b: crate::intervals::IntervalSet,
     candidate_blocks: Vec<u32>,
-    term_blocks: Vec<u32>,
     candidate_bitmap: Vec<u8>,
     trigram_hashes: Vec<usize>,
     heap: BinaryHeap<u64>,
@@ -1449,82 +1442,22 @@ struct PathSearchScratch {
 }
 
 impl PathSearchScratch {
-    fn reset(&mut self, directories: usize, limit: usize) {
-        for directory in self.touched_dirs.drain(..) {
-            if let Some(mask) = self.dir_mask.get_mut(directory as usize) {
-                *mask = 0;
-            }
+    fn reset(&mut self, term_count: usize, limit: usize) {
+        self.term_sets.resize_with(term_count, Default::default);
+        for set in self.term_sets.iter_mut().take(term_count) {
+            set.clear();
         }
-        self.dir_mask.resize(directories, 0);
-        self.dir_mask.truncate(directories);
-        self.hits.clear();
+        self.fold_a.clear();
+        self.fold_b.clear();
         self.candidate_blocks.clear();
-        self.term_blocks.clear();
         self.candidate_bitmap.clear();
         self.trigram_hashes.clear();
         self.heap.clear();
         self.name.clear();
-        self.parent_cache.clear();
-        for byte in self.touched_parent_bytes.drain(..) {
-            if let Some(bits) = self.relevant_parents.get_mut(byte as usize) {
-                *bits = 0;
-            }
-        }
         let target = limit.min(4096);
         if self.heap.capacity() < target {
             self.heap.reserve(target);
         }
-    }
-
-    fn merge_directory_mask(&mut self, directory: u32, bits: u16) {
-        let mask = &mut self.dir_mask[directory as usize];
-        if *mask == 0 {
-            self.touched_dirs.push(directory);
-        }
-        *mask |= bits;
-    }
-
-    fn prepare_parent_filter(&mut self, records: usize) {
-        self.relevant_parents.resize(records.div_ceil(8), 0);
-        self.relevant_parents.truncate(records.div_ceil(8));
-    }
-
-    fn mark_relevant_parent(&mut self, record: u32) {
-        let byte = record as usize / 8;
-        let bit = 1 << (record % 8);
-        if self.relevant_parents[byte] == 0 {
-            self.touched_parent_bytes.push(byte as u32);
-        }
-        self.relevant_parents[byte] |= bit;
-    }
-
-    fn parent_is_relevant(&self, record: u32) -> bool {
-        self.relevant_parents[record as usize / 8] & (1 << (record % 8)) != 0
-    }
-}
-
-const PARENT_CACHE_SLOTS: usize = 4096;
-
-#[derive(Default)]
-struct ParentRankCache {
-    keys: Vec<u32>,
-    values: Vec<u32>,
-}
-
-impl ParentRankCache {
-    fn clear(&mut self) {
-        self.keys.resize(PARENT_CACHE_SLOTS, PARENT_NONE);
-        self.keys.fill(PARENT_NONE);
-        self.values.resize(PARENT_CACHE_SLOTS, PARENT_NONE);
-    }
-
-    fn dir_ord(&mut self, path_index: &PathIndex, parent: u32) -> Option<u32> {
-        let slot = parent.wrapping_mul(2_654_435_761) as usize & (PARENT_CACHE_SLOTS - 1);
-        if self.keys[slot] != parent {
-            self.keys[slot] = parent;
-            self.values[slot] = path_index.dir_ord(parent).unwrap_or(PARENT_NONE);
-        }
-        (self.values[slot] != PARENT_NONE).then_some(self.values[slot])
     }
 }
 
@@ -1813,17 +1746,15 @@ fn path_of_into(arena: &crate::ArchivedArena, delta: &Delta, record: u32, buf: &
 pub fn search_path_terms(
     arena: &crate::ArchivedArena,
     delta: &Delta,
-    path_index: &PathIndex,
     terms: &[String],
     options: SearchOptions,
 ) -> Vec<Hit> {
-    search_path_terms_cancellable(arena, delta, path_index, terms, options, None)
+    search_path_terms_cancellable(arena, delta, terms, options, None)
 }
 
 fn search_path_terms_cancellable(
     arena: &crate::ArchivedArena,
     delta: &Delta,
-    path_index: &PathIndex,
     terms: &[String],
     options: SearchOptions,
     cancel: Option<Cancellation>,
@@ -1832,7 +1763,6 @@ fn search_path_terms_cancellable(
         search_path_terms_with_scratch(
             arena,
             delta,
-            path_index,
             terms,
             options,
             &mut scratch.borrow_mut(),
@@ -1842,11 +1772,85 @@ fn search_path_terms_cancellable(
     })
 }
 
+/// Scan the base arena for every live record whose own name contains
+/// `term_lower`, folding its DFS interval into `set`: the whole subtree span
+/// for a directory match (so descendants inherit the term through plain
+/// interval containment), a single point for a file match. Returns `false`
+/// if the scan was cancelled partway through, in which case `set` must be
+/// discarded by the caller.
+#[allow(clippy::too_many_arguments)]
+fn build_term_interval_set(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    term_lower: &[u8],
+    use_filter: bool,
+    set: &mut crate::intervals::IntervalSet,
+    candidate_blocks: &mut Vec<u32>,
+    candidate_bitmap: &mut Vec<u8>,
+    trigram_hashes: &mut Vec<usize>,
+    cancel: Option<Cancellation>,
+    checked: &mut u32,
+) -> bool {
+    let filtered = use_filter
+        && arena.candidate_blocks_into(
+            term_lower,
+            candidate_blocks,
+            candidate_bitmap,
+            trigram_hashes,
+        );
+    if filtered {
+        candidate_blocks.sort_unstable();
+        candidate_blocks.dedup();
+        for &block in candidate_blocks.iter() {
+            let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
+            let end = start.saturating_add(crate::trigram::TRIGRAM_BLOCK as u32);
+            arena.for_each_name_in(start..end, |record, name| {
+                if is_cancelled_periodically(cancel, checked) {
+                    return std::ops::ControlFlow::Break(());
+                }
+                if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
+                    if arena.is_dir(record) {
+                        let span = arena.subtree(record);
+                        set.push_span(span.start, span.end);
+                    } else {
+                        set.push_point(arena.dfs_position(record));
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return false;
+            }
+        }
+    } else {
+        let mut cancelled = false;
+        arena.for_each_name(|record, name| {
+            if is_cancelled_periodically(cancel, checked) {
+                cancelled = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
+                if arena.is_dir(record) {
+                    let span = arena.subtree(record);
+                    set.push_span(span.start, span.end);
+                } else {
+                    set.push_point(arena.dfs_position(record));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        if cancelled || cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return false;
+        }
+    }
+    set.coalesce();
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_path_terms_with_scratch(
     arena: &crate::ArchivedArena,
     delta: &Delta,
-    path_index: &PathIndex,
     terms: &[String],
     options: SearchOptions,
     scratch: &mut PathSearchScratch,
@@ -1860,7 +1864,10 @@ fn search_path_terms_with_scratch(
     if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return Vec::new();
     }
-    scratch.reset(path_index.directory_count(), limit);
+    scratch.reset(terms.len(), limit);
+    // The name-decode-and-rank step below is skipped entirely for orderings
+    // that don't need it: `sort_key` only reads `quality`/`name_len` for
+    // `Order::Relevance`.
     let needs_name = !order.needs_metadata();
     let automaton = match aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
@@ -1876,100 +1883,36 @@ fn search_path_terms_with_scratch(
                 mask | (1u16 << found.pattern().as_usize())
             })
     };
+    // `contains_ci`/`candidate_blocks_into` only lowercase the haystack, so
+    // terms are lowered once up front.
+    let terms_lower: Vec<Vec<u8>> = terms
+        .iter()
+        .map(|term| term.as_bytes().to_ascii_lowercase())
+        .collect();
 
-    let mut filtered = use_filter;
-    if filtered {
-        for term in terms {
-            if !arena.candidate_blocks_into(
-                term.as_bytes(),
-                &mut scratch.term_blocks,
-                &mut scratch.candidate_bitmap,
-                &mut scratch.trigram_hashes,
-            ) {
-                filtered = false;
-                scratch.candidate_blocks.clear();
-                break;
-            }
-            scratch
-                .candidate_blocks
-                .extend_from_slice(&scratch.term_blocks);
-        }
-    }
+    let PathSearchScratch {
+        term_sets,
+        candidate_blocks,
+        candidate_bitmap,
+        trigram_hashes,
+        ..
+    } = &mut *scratch;
     let mut checked: u32 = 0;
-    let mut cancelled = false;
-    if filtered {
-        scratch.candidate_blocks.sort_unstable();
-        scratch.candidate_blocks.dedup();
-        'blocks: for block_index in 0..scratch.candidate_blocks.len() {
-            let block = scratch.candidate_blocks[block_index];
-            let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
-            let end = start.saturating_add(crate::trigram::TRIGRAM_BLOCK as u32);
-            arena.for_each_name_in(start..end, |record, name| {
-                if is_cancelled_periodically(cancel, &mut checked) {
-                    return std::ops::ControlFlow::Break(());
-                }
-                if !delta.tombstones.get(record) {
-                    let mask = mask_for(name);
-                    if mask != 0 {
-                        scratch.hits.push((record, mask));
-                        if let Some(directory) = path_index.dir_ord(record) {
-                            scratch.merge_directory_mask(directory, mask);
-                        }
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            });
-            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
-                cancelled = true;
-                break 'blocks;
-            }
-        }
-    } else {
-        arena.for_each_name(|record, name| {
-            if is_cancelled_periodically(cancel, &mut checked) {
-                return std::ops::ControlFlow::Break(());
-            }
-            if !delta.tombstones.get(record) {
-                let mask = mask_for(name);
-                if mask != 0 {
-                    scratch.hits.push((record, mask));
-                    if let Some(directory) = path_index.dir_ord(record) {
-                        scratch.merge_directory_mask(directory, mask);
-                    }
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        cancelled = cancel.is_some_and(|cancel| cancel.is_cancelled());
-    }
-    if cancelled {
-        return Vec::new();
-    }
-    for (index, record) in delta.added.iter().enumerate() {
-        if !record.live {
-            continue;
-        }
-        let combined = arena.len() as u32 + index as u32;
-        let mask = mask_for(record.name.as_bytes());
-        if mask != 0 {
-            scratch.hits.push((combined, mask));
-            if let Some(directory) = path_index.dir_ord(combined) {
-                scratch.merge_directory_mask(directory, mask);
-            }
-        }
-    }
-    path_index.closure_sparse(
-        &mut scratch.dir_mask,
-        &mut scratch.touched_dirs,
-        &mut scratch.closure,
-    );
-    let filter_parents = scratch.touched_dirs.len() < path_index.directory_count().div_ceil(4);
-    if filter_parents {
-        scratch.prepare_parent_filter(path_index.records());
-        for touched in 0..scratch.touched_dirs.len() {
-            if let Some(record) = path_index.dir_record(scratch.touched_dirs[touched]) {
-                scratch.mark_relevant_parent(record);
-            }
+    for (term_lower, term_set) in terms_lower.iter().zip(term_sets.iter_mut()) {
+        let completed = build_term_interval_set(
+            arena,
+            delta,
+            term_lower,
+            use_filter,
+            term_set,
+            candidate_blocks,
+            candidate_bitmap,
+            trigram_hashes,
+            cancel,
+            &mut checked,
+        );
+        if !completed {
+            return Vec::new();
         }
     }
 
@@ -1978,68 +1921,132 @@ fn search_path_terms_with_scratch(
     } else {
         (1u16 << terms.len()) - 1
     };
-    let mut hit_position = 0usize;
-    let mut checked: u32 = 0;
-    for record in 0..path_index.records() as u32 {
-        if is_cancelled_periodically(cancel, &mut checked) {
-            return Vec::new();
-        }
-        let live = if record < arena.len() as u32 {
-            !delta.tombstones.get(record)
-        } else {
-            delta
-                .added
-                .get(record as usize - arena.len())
-                .is_some_and(|record| record.live)
-        };
-        if !live {
-            continue;
-        }
-        while scratch
-            .hits
-            .get(hit_position)
-            .is_some_and(|hit| hit.0 < record)
-        {
-            hit_position += 1;
-        }
-        let own = scratch
-            .hits
-            .get(hit_position)
-            .filter(|hit| hit.0 == record)
-            .map_or(0, |hit| hit.1);
-        let inherited = path_index
-            .parent_record(arena, delta, record)
-            .filter(|&parent| !filter_parents || scratch.parent_is_relevant(parent))
-            .and_then(|parent| scratch.parent_cache.dir_ord(path_index, parent))
-            .map_or(0, |directory| scratch.dir_mask[directory as usize]);
-        if own | inherited == full_mask {
-            // As in `search_ranked_cancellable`: the name is read only for the
-            // ordering that ranks on it.
-            let name_len = if needs_name {
-                if record < arena.len() as u32 {
-                    arena.name_into(record, &mut scratch.name);
-                    scratch.name.len() as u32
-                } else {
-                    let index = record - arena.len() as u32;
-                    delta.added[index as usize].name.len() as u32
-                }
+
+    // Never intersect per-term trigram candidate blocks: different terms may
+    // be satisfied by different ancestor records. The per-term IntervalSets
+    // above are built from fully independent scans; only their *derived* DFS
+    // position sets are intersected here.
+    let any_term_empty = scratch.term_sets[..terms.len()]
+        .iter()
+        .any(|set| set.is_empty());
+    let mut final_runs: Vec<(u32, u32)> = Vec::new();
+    if !any_term_empty {
+        scratch.fold_a = scratch.term_sets[0].clone();
+        let mut current_in_a = true;
+        for term_index in 1..terms.len() {
+            if current_in_a {
+                scratch.term_sets[term_index].intersect_into(&scratch.fold_a, &mut scratch.fold_b);
+                current_in_a = false;
             } else {
-                0
+                scratch.term_sets[term_index].intersect_into(&scratch.fold_b, &mut scratch.fold_a);
+                current_in_a = true;
+            }
+            let now_empty = if current_in_a {
+                scratch.fold_a.is_empty()
+            } else {
+                scratch.fold_b.is_empty()
+            };
+            if now_empty {
+                break;
+            }
+        }
+        let final_set = if current_in_a {
+            &scratch.fold_a
+        } else {
+            &scratch.fold_b
+        };
+        final_runs.extend_from_slice(final_set.runs());
+    }
+
+    let mut checked: u32 = 0;
+    for &(start, end) in &final_runs {
+        for position in start..end {
+            if is_cancelled_periodically(cancel, &mut checked) {
+                return Vec::new();
+            }
+            let record = arena.dfs_record(position);
+            if delta.tombstones.get(record) {
+                continue;
+            }
+            let (quality, name_len) = if needs_name {
+                arena.name_into(record, &mut scratch.name);
+                let mask = mask_for(&scratch.name);
+                (
+                    (terms.len() as u32 - mask.count_ones()) as u8,
+                    scratch.name.len() as u32,
+                )
+            } else {
+                (0, 0)
             };
             rank::retain_hit(
                 &mut scratch.heap,
-                sort_key(
-                    order,
-                    arena,
-                    delta,
-                    record,
-                    (terms.len() as u32 - own.count_ones()) as u8,
-                    name_len,
-                ),
+                sort_key(order, arena, delta, record, quality, name_len),
                 limit,
             );
         }
     }
+
+    // The delta overlay is bounded and independent of the base pass above —
+    // it always runs, even when a base term set came up empty, since a
+    // delta-added directory can never have a base-record descendant (base
+    // parents are always base records) but can still satisfy every term
+    // through its own name plus its delta-and-base ancestor chain.
+    let base_len = arena.len() as u32;
+    let mut checked_delta: u32 = 0;
+    for (index, record) in delta.added.iter().enumerate() {
+        if !record.live {
+            continue;
+        }
+        if is_cancelled_periodically(cancel, &mut checked_delta) {
+            return Vec::new();
+        }
+        let combined = base_len + index as u32;
+        let own = mask_for(record.name.as_bytes());
+        let mut inherited = 0u16;
+        let mut current_parent = record.parent;
+        for _ in 0..512 {
+            match current_parent {
+                ParentRef::Base(parent) => {
+                    let position = arena.dfs_position(parent);
+                    for (term_index, term_set) in
+                        scratch.term_sets[..terms.len()].iter().enumerate()
+                    {
+                        if term_set.contains(position) {
+                            inherited |= 1 << term_index;
+                        }
+                    }
+                    break;
+                }
+                ParentRef::Delta(parent_index) => {
+                    let Some(ancestor) = delta.added.get(parent_index as usize) else {
+                        break;
+                    };
+                    if !ancestor.live || !ancestor.is_dir {
+                        break;
+                    }
+                    inherited |= mask_for(ancestor.name.as_bytes());
+                    current_parent = ancestor.parent;
+                }
+                ParentRef::None => break,
+            }
+        }
+        if own | inherited == full_mask {
+            let (quality, name_len) = if needs_name {
+                (
+                    (terms.len() as u32 - own.count_ones()) as u8,
+                    record.name.len() as u32,
+                )
+            } else {
+                (0, 0)
+            };
+            rank::retain_hit(
+                &mut scratch.heap,
+                sort_key(order, arena, delta, combined, quality, name_len),
+                limit,
+            );
+        }
+    }
+
     drain_heap(arena, delta, &mut scratch.heap)
 }
 

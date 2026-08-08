@@ -10,7 +10,6 @@ use scry_core::view::SearchOptions;
 struct LocalIndex {
     view: scry_ipc::SectionView,
     delta: scry_core::delta::Delta,
-    path_index: Option<scry_core::pathindex::PathIndex>,
     generation: u64,
 }
 
@@ -220,7 +219,6 @@ impl Client {
                     Ok(LocalIndex {
                         view: incoming,
                         delta,
-                        path_index: None,
                         generation: shared.generation,
                     })
                 })();
@@ -256,11 +254,7 @@ impl Client {
         };
         let options = SearchOptions::ordered(limit as usize, order);
         if let scry_core::Query::PathTerms(terms) = &query {
-            let path_index = local
-                .path_index
-                .get_or_insert_with(|| scry_core::pathindex::PathIndex::build(arena, &local.delta));
-            let hits =
-                scry_core::view::search_path_terms(arena, &local.delta, path_index, terms, options);
+            let hits = scry_core::view::search_path_terms(arena, &local.delta, terms, options);
             return Ok(scry_core::view::materialize_hits(
                 arena,
                 &local.delta,
