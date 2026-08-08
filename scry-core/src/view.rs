@@ -16,6 +16,12 @@ use crate::rank::{self, Order};
 use crate::store::ArenaStore;
 use crate::{Arena, ArenaBuilder, FrnEntry, PARENT_NONE};
 
+/// Ceiling on any caller-supplied result limit. The bounded top-k heap is the
+/// only thing standing between a one-character query and an allocation
+/// proportional to the whole index, so the limit is clamped at the API
+/// boundary rather than trusted.
+pub const MAX_LIMIT: usize = 100_000;
+
 /// What to return and in what order.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchOptions {
@@ -26,13 +32,16 @@ pub struct SearchOptions {
 impl SearchOptions {
     pub fn new(limit: usize) -> Self {
         Self {
-            limit,
+            limit: limit.min(MAX_LIMIT),
             order: Order::default(),
         }
     }
 
     pub fn ordered(limit: usize, order: Order) -> Self {
-        Self { limit, order }
+        Self {
+            limit: limit.min(MAX_LIMIT),
+            order,
+        }
     }
 }
 
@@ -68,6 +77,19 @@ pub struct IndexView {
 mod tests {
     use super::*;
     use crate::delta::{DeltaRecord, ParentRef};
+
+    /// The bounded top-k heap only bounds output; an unclamped caller-supplied
+    /// limit would still let a one-character query size its intermediate
+    /// state to the whole index.
+    #[test]
+    fn limit_is_clamped() {
+        assert_eq!(SearchOptions::new(usize::MAX).limit, MAX_LIMIT);
+        assert_eq!(
+            SearchOptions::ordered(usize::MAX, Order::Recent).limit,
+            MAX_LIMIT
+        );
+        assert_eq!(SearchOptions::new(50).limit, 50);
+    }
 
     #[test]
     fn view_keeps_the_snapshot_cursor() {
