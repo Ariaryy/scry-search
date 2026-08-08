@@ -184,3 +184,185 @@ fn bench_substring_filtered_vs_scan() {
         trigram_bytes as f64 * 100.0 / archive.len() as f64
     );
 }
+
+/// A synthetic volume at 10M records — an order of magnitude past any corpus
+/// used elsewhere in this suite — loads, queries, and its recursive
+/// directory sizes (a `u64` prefix sum over per-record `u32` KiB values, see
+/// `Arena::dfs_size_prefix`) don't overflow even when every file is given a
+/// near-`u32::MAX` size, which is the scenario that would overflow a `u32`
+/// running total well before 10M records are reached.
+#[test]
+#[ignore = "slow; run with --release --ignored"]
+fn ten_million_record_arena_loads_queries_and_recursive_sizes_dont_overflow() {
+    const COUNT: usize = 10_000_000;
+    let mut builder = Arena::builder();
+    let provisional_root = builder.push("V:", 0, true);
+    for i in 0..COUNT {
+        let name = format!("file_{i:08}.dat");
+        let node = builder.push_bytes_with_metadata(
+            name.as_bytes(),
+            1_700_000_000,
+            false,
+            None,
+            u32::MAX as u64,
+        );
+        builder.set_parent(node, provisional_root);
+    }
+    let arena = builder.build().0;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ten_million.rkyv");
+    save(&arena, &path).unwrap();
+    let store = ArenaStore::open(&path).unwrap();
+    let archived = store.archived();
+    assert_eq!(archived.len(), COUNT + 1);
+
+    let hits = search_base(archived, &Query::Substring("file_00099999".into()), 10);
+    assert_eq!(hits.len(), 1);
+
+    // `build()` reorders records into name-sorted order, so `provisional_root`
+    // is no longer a valid index into `archived` — look the root back up by
+    // name, the same way callers outside this builder always must.
+    let root = archived.prefix_range("V:").start;
+
+    // Every KiB-rounded per-file size saturates at `u32::MAX`, and there are
+    // 10M of them, so the true recursive total is far past `u32::MAX` —
+    // proving the result is the saturated `u32`, not a silently wrapped one.
+    assert_eq!(archived.recursive_size_kib(root), u32::MAX);
+}
+
+/// Selectivity distribution for realistic query prefixes: what fraction of
+/// records a needle matches, and what fraction of trigram blocks survive the
+/// filter. This is the number that gates whether a rank-ordered scan (a
+/// prospective format change) is worth its risk — that bet only pays off if
+/// most real needles are already highly selective, so a full scan is rare.
+///
+/// Not a deterministic-corpus criterion benchmark (see `benches/query.rs`):
+/// it samples names out of the corpus it builds, so its numbers describe a
+/// distribution rather than gate a regression. Run with
+/// `cargo test -p scry-core --release -- --ignored selectivity --nocapture`.
+#[test]
+#[ignore = "prints a distribution table; not a pass/fail gate"]
+fn selectivity_distribution_over_realistic_query_prefixes() {
+    use crate::query::search_base;
+
+    const RECORDS: usize = 500_000;
+    const SAMPLES: usize = 2_000;
+
+    let arena = generated_arena(RECORDS);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selectivity.rkyv");
+    save(&arena, &path).unwrap();
+    let store = ArenaStore::open(&path).unwrap();
+    let archived = store.archived();
+    let blocks = crate::trigram::num_blocks(archived.len());
+
+    // xorshift64*, deterministic so a failing run is reproducible.
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+
+    // Short prefixes repeat heavily across 2000 samples (there are only so
+    // many 1- and 2-byte prefixes in the corpus), and each distinct needle's
+    // scan cost dwarfs the sampling loop, so dedupe per length before scoring
+    // rather than rescoring the same needle hundreds of times.
+    let mut prefixes_by_len: [std::collections::BTreeSet<String>; 5] = Default::default();
+    for _ in 0..SAMPLES {
+        let record = (next_rand() as usize) % archived.len();
+        let name = archived.name(record as u32);
+        let bytes = name.as_bytes();
+        for len in 1..=5.min(bytes.len()) {
+            if let Ok(prefix) = std::str::from_utf8(&bytes[..len]) {
+                prefixes_by_len[len - 1].insert(prefix.to_string());
+            }
+        }
+    }
+
+    let hardcoded = [
+        ".pdf",
+        ".log",
+        "invoice",
+        "readme",
+        "node_modules",
+        ".dll",
+        ".exe",
+        "config",
+        "test",
+        "img",
+    ];
+
+    let selectivity_of = |needle: &str| -> (f64, f64) {
+        let matches = search_base(archived, &Query::Substring(needle.to_string()), usize::MAX);
+        let survived = archived
+            .candidate_blocks(needle.as_bytes())
+            .map_or(blocks, |b| b.len());
+        (
+            matches.len() as f64 / archived.len() as f64,
+            survived as f64 / blocks as f64,
+        )
+    };
+
+    let percentile = |values: &mut [f64], p: f64| -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values[((values.len() - 1) as f64 * p).round() as usize]
+    };
+
+    println!("\ncorpus: {} records, {blocks} blocks", archived.len());
+    let mut p50_3plus = Vec::new();
+    for (len, prefixes) in prefixes_by_len.iter().enumerate() {
+        let len = len + 1;
+        let mut selectivities: Vec<f64> = prefixes
+            .iter()
+            .map(|prefix| selectivity_of(prefix).0)
+            .collect();
+        if selectivities.is_empty() {
+            continue;
+        }
+        let p10 = percentile(&mut selectivities.clone(), 0.10);
+        let p50 = percentile(&mut selectivities.clone(), 0.50);
+        let p90 = percentile(&mut selectivities, 0.90);
+        println!(
+            "  prefix len {len}: n={:5} p10={:6.2}% p50={:6.2}% p90={:6.2}%",
+            prefixes.len(),
+            p10 * 100.0,
+            p50 * 100.0,
+            p90 * 100.0,
+        );
+        if len >= 3 {
+            p50_3plus.push(p50);
+        }
+    }
+
+    println!("  hardcoded realistic queries:");
+    for needle in hardcoded {
+        let (selectivity, block_survival) = selectivity_of(needle);
+        println!(
+            "    {needle:14} -> {:6.2}% of records, {:6.2}% of blocks survive filter",
+            selectivity * 100.0,
+            block_survival * 100.0,
+        );
+    }
+
+    let median_of_p50s = {
+        let mut v = p50_3plus;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    println!(
+        "\n  verdict input: median p50 selectivity across 3+ byte prefixes = {:.2}%",
+        median_of_p50s * 100.0
+    );
+    if median_of_p50s < 0.05 {
+        println!("  -> below 5%: a rank-ordered scan over 3+ byte needles looks worth building.");
+    } else if median_of_p50s > 0.20 {
+        println!(
+            "  -> above 20%: a rank-ordered scan's budget policy would fall back to a full \
+             scan most of the time on this corpus; the bet is weak here."
+        );
+    } else {
+        println!("  -> between 5% and 20%: inconclusive on this synthetic corpus.");
+    }
+}

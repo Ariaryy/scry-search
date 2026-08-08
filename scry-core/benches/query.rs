@@ -226,19 +226,51 @@ fn path_terms(c: &mut Criterion) {
 
 fn other_query_kinds(c: &mut Criterion) {
     let (view, _dir) = corpus();
-    let mut group = c.benchmark_group("query_kind");
-    let cases = [
-        ("prefix", Query::Prefix("budget".to_string())),
-        ("substring_mid", Query::Substring(INFIX_MID.to_string())),
-        ("substring_rare", Query::Substring(INFIX_RARE.to_string())),
-        ("wildcard", Query::wildcard("*.mkv")),
-    ];
-    for (label, query) in cases {
-        group.bench_function(label, |b| {
+    let mut prefix = c.benchmark_group("prefix");
+    for (label, query) in [
+        ("1", Query::Prefix("b".to_string())),
+        ("3", Query::Prefix("bud".to_string())),
+        ("8", Query::Prefix("budget_1".to_string())),
+    ] {
+        prefix.bench_function(label, |b| {
             b.iter(|| black_box(view.search(black_box(&query), 200)))
         });
     }
-    group.finish();
+    prefix.finish();
+    let mut substring = c.benchmark_group("substring");
+    for (label, query) in [
+        ("high", Query::Substring(INFIX_COMMON.to_string())),
+        ("medium", Query::Substring(INFIX_MID.to_string())),
+        ("low", Query::Substring(INFIX_RARE.to_string())),
+    ] {
+        substring.bench_function(label, |b| {
+            b.iter(|| black_box(view.search(black_box(&query), 200)))
+        });
+    }
+    substring.finish();
+    let mut wildcard = c.benchmark_group("wildcard");
+    for (label, query) in [
+        ("pdf", Query::wildcard("*.pdf")),
+        ("report", Query::wildcard("*report*")),
+    ] {
+        wildcard.bench_function(label, |b| {
+            b.iter(|| black_box(view.search(black_box(&query), 200)))
+        });
+    }
+    wildcard.finish();
+    let mut ordering = c.benchmark_group("order");
+    let query = Query::Substring(INFIX_MID.to_string());
+    for (label, order) in [
+        ("Relevance", scry_core::rank::Order::Relevance),
+        ("Recent", scry_core::rank::Order::Recent),
+        ("Largest", scry_core::rank::Order::Largest),
+    ] {
+        let options = scry_core::view::SearchOptions::ordered(200, order);
+        ordering.bench_function(label, |b| {
+            b.iter(|| black_box(view.search_with(black_box(&query), options)))
+        });
+    }
+    ordering.finish();
 }
 
 /// The per-query fixed cost that no amount of filtering avoids today: the
@@ -292,7 +324,7 @@ fn materialize(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let arena = view.base.archived();
     let mut group = c.benchmark_group("materialize");
-    for count in [200usize, 20_000] {
+    for count in [50usize, 1_000, 20_000] {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter(|| {
                 let mut total = 0usize;
