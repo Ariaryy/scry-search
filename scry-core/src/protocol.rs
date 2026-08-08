@@ -15,6 +15,8 @@ pub enum QueryKind {
     PathTerms = 3,
     /// Internal capability request; path terms retain discriminant 3.
     ShareIndex = 4,
+    /// Internal observability request returning a UTF-8 report.
+    QueryStats = 5,
 }
 
 impl QueryKind {
@@ -25,6 +27,7 @@ impl QueryKind {
             2 => Some(QueryKind::Wildcard),
             3 => Some(QueryKind::PathTerms),
             4 => Some(QueryKind::ShareIndex),
+            5 => Some(QueryKind::QueryStats),
             _ => None,
         }
     }

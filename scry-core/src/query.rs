@@ -1,6 +1,7 @@
 use crate::arena::ArchivedArena;
 use crate::cancel::{Cancellation, CHECK_INTERVAL};
 use crate::literals::required_literals;
+use crate::metrics::QuerySpans;
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
@@ -40,7 +41,7 @@ impl Query {
 /// lazily via `ArchivedArena::full_path`, and only for the slice they actually
 /// send over IPC (streaming, not materializing the whole result set).
 pub fn search_base(arena: &ArchivedArena, query: &Query, limit: usize) -> Vec<u32> {
-    search_base_impl(arena, query, limit, None)
+    search_base_impl(arena, query, limit, None, None)
 }
 
 /// As `search_base` with `limit = usize::MAX`, but for `Substring`
@@ -58,15 +59,27 @@ pub fn search_base_parallel(
     threads: usize,
     cancel: Option<Cancellation>,
 ) -> Vec<u32> {
+    search_base_parallel_with_spans(arena, query, threads, cancel, None)
+}
+
+/// As [`search_base_parallel`], while recording filter coverage when enabled.
+pub fn search_base_parallel_with_spans(
+    arena: &ArchivedArena,
+    query: &Query,
+    threads: usize,
+    cancel: Option<Cancellation>,
+    spans: Option<&mut QuerySpans>,
+) -> Vec<u32> {
     if threads <= 1 {
-        return search_base_impl(arena, query, usize::MAX, cancel);
+        return search_base_impl(arena, query, usize::MAX, cancel, spans);
     }
     match query {
         Query::Substring(needle) => {
             let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
             if arena.candidate_blocks(&needle_lower).is_some() {
-                return search_base_impl(arena, query, usize::MAX, cancel);
+                return search_base_impl(arena, query, usize::MAX, cancel, spans);
             }
+            record_full_scan_blocks(arena, spans);
             scan_full_parallel(arena, threads, cancel, move |name| {
                 let mut lower = Vec::with_capacity(name.len());
                 lower.extend(name.iter().map(u8::to_ascii_lowercase));
@@ -85,11 +98,11 @@ pub fn search_base_parallel(
                 .and_then(|clauses| arena.candidate_blocks_for_clauses(&clauses))
                 .is_some();
             if filtered {
-                return search_base_impl(arena, query, usize::MAX, cancel);
+                return search_base_impl(arena, query, usize::MAX, cancel, spans);
             }
             scan_full_parallel(arena, threads, cancel, move |name| re.is_match(name))
         }
-        _ => search_base_impl(arena, query, usize::MAX, cancel),
+        _ => search_base_impl(arena, query, usize::MAX, cancel, spans),
     }
 }
 
@@ -146,6 +159,7 @@ fn search_base_impl(
     query: &Query,
     limit: usize,
     cancel: Option<Cancellation>,
+    mut spans: Option<&mut QuerySpans>,
 ) -> Vec<u32> {
     match query {
         Query::Prefix(prefix) => {
@@ -178,8 +192,18 @@ fn search_base_impl(
                 std::ops::ControlFlow::Continue(())
             };
             match arena.candidate_blocks(&needle_lower) {
-                None => arena.for_each_name(&mut visit),
+                None => {
+                    record_full_scan_blocks(arena, spans.as_deref_mut());
+                    arena.for_each_name(&mut visit)
+                }
                 Some(blocks) => {
+                    if let Some(spans) = spans.as_mut() {
+                        spans.blocks_total = spans.blocks_total.saturating_add(
+                            arena.len().div_ceil(crate::trigram::TRIGRAM_BLOCK) as u64,
+                        );
+                        spans.blocks_scanned =
+                            spans.blocks_scanned.saturating_add(blocks.len() as u64);
+                    }
                     for block in blocks {
                         let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
                         let end =
@@ -245,6 +269,14 @@ fn search_base_impl(
             results
         }
         Query::PathTerms(_) => Vec::new(),
+    }
+}
+
+fn record_full_scan_blocks(arena: &ArchivedArena, spans: Option<&mut QuerySpans>) {
+    if let Some(spans) = spans {
+        let total = arena.len().div_ceil(crate::trigram::TRIGRAM_BLOCK) as u64;
+        spans.blocks_total = spans.blocks_total.saturating_add(total);
+        spans.blocks_scanned = spans.blocks_scanned.saturating_add(total);
     }
 }
 

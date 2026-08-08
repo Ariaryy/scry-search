@@ -7,6 +7,7 @@ use regex_automata::util::syntax;
 use crate::ascii;
 use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
+use crate::metrics::QuerySpans;
 use crate::pathindex::{PathClosureScratch, PathIndex};
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
@@ -278,6 +279,56 @@ mod tests {
         }
     }
 
+    /// A query over an uncompacted delta must return exactly what the
+    /// equivalent compacted arena returns, at every delta size this project
+    /// expects to see in practice — including well past the 5% threshold
+    /// that triggers compaction, so a regression there is caught before the
+    /// compactor ever runs. Also records per-ratio latency (`eprintln`, not
+    /// an assertion — delta-scan cost is quantified for plan 025, not gated
+    /// here).
+    #[test]
+    fn delta_ratio_equivalence_and_latency() {
+        const BASE: usize = 10_000;
+        for percent in [0u32, 1, 5, 20] {
+            let (_dir, mut view) = base_view(BASE);
+            let root = view.base.archived().prefix_range("C:").start;
+            let added = BASE * percent as usize / 100;
+            let mut delta = Delta::new(view.base.archived().len());
+            for i in 0..added {
+                delta.added.push(DeltaRecord {
+                    name: format!("match_delta_{i:04}.txt"),
+                    parent: ParentRef::Base(root),
+                    mtime_secs: 0,
+                    is_dir: false,
+                    size_bytes: 0,
+                    live: true,
+                });
+            }
+            view.delta = Arc::new(delta);
+
+            let query = Query::Substring("match".into());
+            let started = std::time::Instant::now();
+            let mut actual: Vec<_> = view
+                .search(&query, usize::MAX)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            let elapsed = started.elapsed();
+            eprintln!("delta {percent:>2}% ({added} added): {elapsed:?}");
+
+            let (_compacted_dir, compacted) = open_compacted(&view);
+            let mut expected: Vec<_> = compacted
+                .search(&query, usize::MAX)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "diverged at delta ratio {percent}%");
+            assert_eq!(actual.len(), BASE + added);
+        }
+    }
+
     #[test]
     fn compaction_removes_tombstones_and_empty_is_identity() {
         let (_dir, mut view) = base_view(20);
@@ -428,6 +479,27 @@ mod tests {
         let results = view.search(&Query::Substring("match".into()), 10);
         assert_eq!(results.len(), 10);
         assert!(crate::arena::full_path_calls() <= 10);
+    }
+
+    #[test]
+    fn query_spans_are_opt_in_and_capture_search_work() {
+        let (_dir, view) = base_view(100);
+        let query = Query::Substring("match".into());
+        let hits =
+            view.search_hits_cancellable_with_spans(&query, SearchOptions::new(10), None, 1, None);
+        assert_eq!(hits.len(), 10);
+
+        let mut spans = QuerySpans::default();
+        let hits = view.search_hits_cancellable_with_spans(
+            &query,
+            SearchOptions::new(10),
+            None,
+            1,
+            Some(&mut spans),
+        );
+        assert_eq!(hits.len(), 10);
+        assert_eq!(spans.candidates, 100);
+        assert_eq!(spans.blocks_scanned, spans.blocks_total);
     }
 
     #[test]
@@ -657,8 +729,22 @@ impl IndexView {
         cancel: Option<Cancellation>,
         threads: usize,
     ) -> Vec<Hit> {
+        self.search_hits_cancellable_with_spans(query, options, cancel, threads, None)
+    }
+
+    /// As [`Self::search_hits_cancellable`], collecting phase timings only
+    /// when `spans` is supplied.
+    pub fn search_hits_cancellable_with_spans(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+        cancel: Option<Cancellation>,
+        threads: usize,
+        spans: Option<&mut QuerySpans>,
+    ) -> Vec<Hit> {
         if let Query::PathTerms(terms) = query {
-            return search_path_terms_cancellable(
+            let started = spans.as_ref().map(|_| std::time::Instant::now());
+            let hits = search_path_terms_cancellable(
                 self.base.archived(),
                 &self.delta,
                 &self.path_index,
@@ -666,14 +752,22 @@ impl IndexView {
                 options,
                 cancel,
             );
+            if let (Some(spans), Some(started)) = (spans, started) {
+                spans.match_ns = spans
+                    .match_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+                spans.candidates = spans.candidates.saturating_add(hits.len() as u64);
+            }
+            return hits;
         }
-        search_ranked_cancellable(
+        search_ranked_cancellable_with_spans(
             self.base.archived(),
             &self.delta,
             query,
             options,
             cancel,
             threads,
+            spans,
         )
     }
 
@@ -687,10 +781,69 @@ impl IndexView {
         path_of(self.base.archived(), &self.delta, record)
     }
 
+    /// Decode a record's leaf name into `output` without reconstructing its
+    /// parent path.
+    pub fn name_into(&self, record: u32, output: &mut Vec<u8>) {
+        match record.checked_sub(self.base.archived().len() as u32) {
+            None => self.base.archived().name_into(record, output),
+            Some(index) => {
+                output.clear();
+                if let Some(record) = self.delta.added.get(index as usize) {
+                    output.extend_from_slice(record.name.as_bytes());
+                }
+            }
+        }
+    }
+
+    /// Test terms against a record and its ancestors without allocating a
+    /// full path. The hop cap matches [`ArchivedArena::full_path`].
+    pub fn matches_path_terms(&self, record: u32, terms: &[String], name: &mut Vec<u8>) -> bool {
+        if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS {
+            return false;
+        }
+        let expected = (1u16 << terms.len()) - 1;
+        let mut matched = 0u16;
+        let mut current = record;
+        for _ in 0..512 {
+            self.name_into(current, name);
+            for (index, term) in terms.iter().enumerate() {
+                if crate::ascii::contains_ci(name, term.as_bytes()) {
+                    matched |= 1 << index;
+                }
+            }
+            if matched == expected {
+                return true;
+            }
+            let base_len = self.base.archived().len() as u32;
+            if current < base_len {
+                let parent = self.base.archived().parent(current);
+                if parent == PARENT_NONE || parent >= base_len {
+                    return false;
+                }
+                current = parent;
+            } else {
+                let Some(delta) = self.delta.added.get((current - base_len) as usize) else {
+                    return false;
+                };
+                match delta.parent {
+                    ParentRef::Base(parent) => current = parent,
+                    ParentRef::Delta(parent) => current = base_len + parent,
+                    ParentRef::None => return false,
+                }
+            }
+        }
+        false
+    }
+
     /// Reconstruct the path of every hit. See [`Hit`] for why this is a
     /// separate step.
     pub fn materialize(&self, hits: &[Hit]) -> Vec<ResultEntry> {
         materialize_hits(self.base.archived(), &self.delta, hits)
+    }
+
+    /// Reconstruct one result after selection has already bounded the set.
+    pub fn materialize_one(&self, hit: &Hit) -> ResultEntry {
+        materialize(self.base.archived(), &self.delta, hit)
     }
 
     /// As `search`, but abandons the scan (returning an empty result) once
@@ -1098,6 +1251,18 @@ fn search_ranked_cancellable(
     cancel: Option<Cancellation>,
     threads: usize,
 ) -> Vec<Hit> {
+    search_ranked_cancellable_with_spans(arena, delta, query, options, cancel, threads, None)
+}
+
+fn search_ranked_cancellable_with_spans(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    query: &Query,
+    options: SearchOptions,
+    cancel: Option<Cancellation>,
+    threads: usize,
+    mut spans: Option<&mut QuerySpans>,
+) -> Vec<Hit> {
     let SearchOptions { limit, order } = options;
     if limit == 0 {
         return Vec::new();
@@ -1105,7 +1270,21 @@ fn search_ranked_cancellable(
     if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return Vec::new();
     }
-    let base_hits = crate::query::search_base_parallel(arena, query, threads, cancel);
+    let match_started = spans.as_ref().map(|_| std::time::Instant::now());
+    let base_hits = crate::query::search_base_parallel_with_spans(
+        arena,
+        query,
+        threads,
+        cancel,
+        spans.as_deref_mut(),
+    );
+    if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
+        spans.match_ns = spans
+            .match_ns
+            .saturating_add(started.elapsed().as_nanos() as u64);
+        spans.candidates = spans.candidates.saturating_add(base_hits.len() as u64);
+    }
+    let rank_started = spans.as_ref().map(|_| std::time::Instant::now());
     let mut heap = BinaryHeap::with_capacity(limit.min(4096));
     let mut name = Vec::new();
     // `match_quality` needs the decoded name, and so does the length; neither
@@ -1170,7 +1349,13 @@ fn search_ranked_cancellable(
         }
     }
 
-    drain_heap(arena, delta, &mut heap)
+    let hits = drain_heap(arena, delta, &mut heap);
+    if let (Some(spans), Some(started)) = (spans, rank_started) {
+        spans.rank_ns = spans
+            .rank_ns
+            .saturating_add(started.elapsed().as_nanos() as u64);
+    }
+    hits
 }
 
 /// Reconstruct the path of one hit. Separated from matching and ranking

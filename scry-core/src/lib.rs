@@ -6,6 +6,7 @@ pub mod delta;
 pub mod dfs;
 pub mod frnmap;
 mod literals;
+pub mod metrics;
 pub mod pathindex;
 pub mod protocol;
 pub mod query;
