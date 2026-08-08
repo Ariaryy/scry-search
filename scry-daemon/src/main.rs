@@ -1716,6 +1716,53 @@ mod tests {
         drop(client);
         thread.join().unwrap();
     }
+
+    #[test]
+    fn local_and_rpc_results_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_store_with_n_records(200, &dir);
+        let indexes = Arc::new(vec![VolumeIndex {
+            volume: "C:".to_string(),
+            store: Arc::new(arc_swap::ArcSwap::from(view)),
+            cursor: None,
+        }]);
+        let pipe_name = format!(
+            r"\\.\pipe\scry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let server_indexes = indexes.clone();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            handle_connection(pipe, &server_indexes).unwrap();
+        });
+        let mut client = (0..100)
+            .find_map(|_| {
+                scry_client::Client::connect_to(&pipe_name)
+                    .ok()
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        None
+                    })
+            })
+            .expect("test pipe did not become ready");
+
+        // Same query, both paths, over the same live connection: the RPC
+        // round trip and the in-process local mapping must agree exactly.
+        let rpc = client.query(QueryKind::Substring, "file", 50).unwrap();
+        let local = client
+            .search_local(QueryKind::Substring, "file", 50)
+            .unwrap();
+        assert_eq!(rpc, local);
+
+        drop(client);
+        thread.join().unwrap();
+    }
+
     #[test]
     fn shared_section_key_is_unique_per_generation() {
         // Two views sharing the exact same `base` allocation (as happens right
