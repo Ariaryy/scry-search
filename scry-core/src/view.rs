@@ -544,6 +544,165 @@ mod tests {
         assert_eq!(compacted.len(), original - 2);
     }
 
+    /// Direct, brute-force-checked test of the rank arithmetic `compact`
+    /// uses to translate a base record's old index into its post-compaction
+    /// index (`old - tombstones_before(old)`), independent of the rest of
+    /// compaction — this is the one piece of index math a full-index bug
+    /// would be easy to miss inside an otherwise-passing end-to-end test.
+    #[test]
+    fn tombstone_rank_formula_matches_bruteforce() {
+        let n = 500usize;
+        let mut tombstones = Delta::new(n).tombstones;
+        let mut state = 0x1234_5678u32;
+        for i in 0..n as u32 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if state.is_multiple_of(5) {
+                tombstones.set(i);
+            }
+        }
+        // Boundary cases: first and last position, and (via the modulus
+        // above) runs of consecutive tombstones.
+        tombstones.set(0);
+        tombstones.set(n as u32 - 1);
+
+        let superblocks = crate::bitvec::build_superblocks(tombstones.as_bytes());
+        let rank = crate::bitvec::RankSelect::new(tombstones.as_bytes(), &superblocks);
+
+        for old in 0..n as u32 {
+            let bruteforce_before = (0..old).filter(|&i| tombstones.get(i)).count() as u32;
+            assert_eq!(
+                rank.rank1(old as usize) as u32,
+                bruteforce_before,
+                "old={old}"
+            );
+            if !tombstones.get(old) {
+                assert_eq!(
+                    old - rank.rank1(old as usize) as u32,
+                    old - bruteforce_before
+                );
+            }
+        }
+    }
+
+    /// End-to-end check that FRNs survive compaction under tombstones: every
+    /// FRN belonging to a still-live record must resolve, via the compacted
+    /// `.frn` sidecar, to a record whose path is unchanged. This exercises
+    /// the sorted-by-index merge that replaced the old dense
+    /// `old index -> Option<frn>` array — a bug there would silently drop or
+    /// misattribute FRNs rather than fail to compile.
+    #[test]
+    fn compaction_preserves_frns_under_tombstones() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push_bytes_with_frn(b"C:", 0, true, 1);
+        let mut frn = 2u64;
+        // FRNs of leaf pushes, not their provisional builder indices — `build()`
+        // sorts by name and reassigns indices, so a provisional index doesn't
+        // identify the same record once the arena is saved and reopened.
+        let mut leaf_frns = Vec::new();
+        let mut dirs = vec![root];
+        for level in 0..2 {
+            let mut next_dirs = Vec::new();
+            for &parent in &dirs {
+                for i in 0..5 {
+                    let dir_name = format!("d{level}_{i}");
+                    let child = builder.push_bytes_with_frn(dir_name.as_bytes(), 0, true, frn);
+                    frn += 1;
+                    builder.set_parent(child, parent);
+                    next_dirs.push(child);
+
+                    let leaf_name = format!("f{level}_{i}.txt");
+                    let leaf_frn = frn;
+                    let leaf = builder.push_bytes_with_frn(leaf_name.as_bytes(), 0, false, frn);
+                    frn += 1;
+                    builder.set_parent(leaf, child);
+                    leaf_frns.push(leaf_frn);
+                }
+            }
+            dirs = next_dirs;
+        }
+        let (arena, mut frns) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("view.rkyv");
+        crate::store::save_with_sidecar(&arena, &mut frns, &path, |_| {}, |_| {}).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let mut view = IndexView::new(base);
+        let n = view.base.archived().len() as u32;
+        let base_frn_map = view.base.frn_map.as_ref().unwrap();
+
+        let mut delta = Delta::new(n as usize);
+        // Only tombstone leaves (no live descendants), so every surviving
+        // record's full path is unaffected by the tombstones.
+        for (i, &leaf_frn) in leaf_frns.iter().enumerate() {
+            if i % 3 == 0 {
+                let leaf = base_frn_map.lookup(leaf_frn).unwrap();
+                delta.tombstones.set(leaf);
+            }
+        }
+        delta.added.push(DeltaRecord {
+            name: "delta_root_child".into(),
+            parent: ParentRef::Base(root),
+            mtime_secs: 0,
+            is_dir: true,
+            size_bytes: 0,
+            live: true,
+        });
+        delta.added.push(DeltaRecord {
+            name: "delta_grandchild".into(),
+            parent: ParentRef::Delta(0),
+            mtime_secs: 0,
+            is_dir: false,
+            size_bytes: 0,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+
+        let archived = view.base.archived();
+        let by_index: std::collections::HashMap<u32, u64> = view
+            .base
+            .frn_map
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.index, entry.frn))
+            .collect();
+        let mut expected_paths_by_frn: Vec<(u64, String)> = Vec::new();
+        for old in 0..n {
+            if view.delta.tombstones.get(old) {
+                continue;
+            }
+            if let Some(&frn) = by_index.get(&old) {
+                expected_paths_by_frn.push((frn, archived.full_path(old, '\\')));
+            }
+        }
+
+        let (compacted_arena, mut compacted_frns) = view.compact();
+        let out_path = dir.path().join("compacted.rkyv");
+        crate::store::save_with_sidecar(
+            &compacted_arena,
+            &mut compacted_frns,
+            &out_path,
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let compacted_store = ArenaStore::open(&out_path).unwrap();
+        let compacted_archived = compacted_store.archived();
+        let compacted_frn_map = compacted_store.frn_map.as_ref().unwrap();
+
+        assert_eq!(
+            compacted_archived.len(),
+            expected_paths_by_frn.len() + 2,
+            "live base count + 2 delta additions"
+        );
+        for (frn, expected_path) in &expected_paths_by_frn {
+            let new_index = compacted_frn_map
+                .lookup(*frn)
+                .unwrap_or_else(|| panic!("frn {frn} missing after compaction"));
+            let actual_path = compacted_archived.full_path(new_index, '\\');
+            assert_eq!(&actual_path, expected_path);
+        }
+    }
+
     #[test]
     fn shared_overlay_search_matches_rpc_search() {
         let (_dir, mut view) = base_view(200);
@@ -1282,14 +1441,25 @@ impl IndexView {
     /// Merge the overlay into a new base without re-enumerating the volume.
     pub fn compact(&self) -> (Arena, Vec<FrnEntry>) {
         let arena = self.base.archived();
-        let mut frns_by_base = vec![None; arena.len()];
-        if let Some(map) = &self.base.frn_map {
-            for entry in map.iter() {
-                if let Some(slot) = frns_by_base.get_mut(entry.index as usize) {
-                    *slot = Some(entry.frn);
-                }
+
+        // Rank query over the tombstone bitset in place of a dense
+        // `old index -> new index` array: compaction only removes base
+        // records (it never reorders the survivors relative to each other),
+        // so a live base record's new index is just its old index minus the
+        // number of tombstones before it. `tomb_superblocks` costs ~4 bytes
+        // per 256 records (~31 KB at 2M records) versus the 16 MB a
+        // `Vec<Option<u32>>` over every base record cost.
+        let tomb_superblocks = crate::bitvec::build_superblocks(self.delta.tombstones.as_bytes());
+        let tomb_rank =
+            crate::bitvec::RankSelect::new(self.delta.tombstones.as_bytes(), &tomb_superblocks);
+        let base_new_index = |old: u32| -> Option<u32> {
+            if self.delta.tombstones.get(old) {
+                None
+            } else {
+                Some(old - tomb_rank.rank1(old as usize) as u32)
             }
-        }
+        };
+
         let mut frns_by_delta = vec![None; self.delta.added.len()];
         for (&frn, &index) in &self.delta.added_frns {
             frns_by_delta[index as usize] = Some(frn);
@@ -1298,32 +1468,41 @@ impl IndexView {
         let live_base = arena.len() - self.delta.tombstones.count_ones() as usize;
         let live_delta = self.delta.live_added().count();
         let mut builder = ArenaBuilder::with_capacity(live_base + live_delta, arena.names.len());
-        let mut base_indices = vec![None; arena.len()];
         let mut delta_indices = vec![None; self.delta.added.len()];
         let mut name = Vec::new();
 
-        for old in 0..arena.len() as u32 {
-            if self.delta.tombstones.get(old) {
-                continue;
-            }
-            arena.name_into(old, &mut name);
-            let new = match frns_by_base[old as usize] {
-                Some(frn) => builder.push_bytes_with_metadata(
-                    &name,
-                    arena.mtime(old),
-                    arena.is_dir(old),
-                    Some(frn),
-                    arena.size_bytes(old),
-                ),
-                None => builder.push_bytes_with_metadata(
-                    &name,
-                    arena.mtime(old),
-                    arena.is_dir(old),
-                    None,
-                    arena.size_bytes(old),
-                ),
+        {
+            // Sorted-by-index view of the FRN sidecar (stored FRN-sorted, for
+            // `FrnMap::lookup`), consumed by one monotonic pass alongside the
+            // old-index push loop below. Scoped to this block so it drops
+            // once the loop finishes instead of surviving the rest of
+            // compaction, unlike the dense `old index -> Option<frn>` array
+            // it replaces.
+            let mut by_index: Vec<FrnEntry> = match &self.base.frn_map {
+                Some(map) => map.iter().collect(),
+                None => Vec::new(),
             };
-            base_indices[old as usize] = Some(new);
+            by_index.sort_unstable_by_key(|entry| entry.index);
+            let mut cursor = 0usize;
+
+            for old in 0..arena.len() as u32 {
+                if self.delta.tombstones.get(old) {
+                    continue;
+                }
+                while cursor < by_index.len() && by_index[cursor].index < old {
+                    cursor += 1;
+                }
+                let frn = (cursor < by_index.len() && by_index[cursor].index == old)
+                    .then(|| by_index[cursor].frn);
+                arena.name_into(old, &mut name);
+                builder.push_bytes_with_metadata(
+                    &name,
+                    arena.mtime(old),
+                    arena.is_dir(old),
+                    frn,
+                    arena.size_bytes(old),
+                );
+            }
         }
         for (old, record) in self.delta.live_added() {
             let new = match frns_by_delta[old as usize] {
@@ -1346,12 +1525,12 @@ impl IndexView {
         }
 
         for old in 0..arena.len() as u32 {
-            let Some(new) = base_indices[old as usize] else {
+            let Some(new) = base_new_index(old) else {
                 continue;
             };
             let parent = arena.parent(old);
             if parent != PARENT_NONE {
-                if let Some(new_parent) = base_indices[parent as usize] {
+                if let Some(new_parent) = base_new_index(parent) {
                     builder.set_parent(new, new_parent);
                 }
             }
@@ -1359,7 +1538,7 @@ impl IndexView {
         for (old, record) in self.delta.live_added() {
             let new = delta_indices[old as usize].unwrap();
             let parent = match record.parent {
-                ParentRef::Base(index) => base_indices[index as usize],
+                ParentRef::Base(index) => base_new_index(index),
                 ParentRef::Delta(index) => delta_indices[index as usize],
                 ParentRef::None => None,
             };

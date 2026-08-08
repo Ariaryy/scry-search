@@ -40,6 +40,23 @@ impl Bitset {
     fn words(&self) -> &[u64] {
         &self.words
     }
+
+    /// LSB-first byte view of the underlying words, for building a
+    /// `crate::bitvec::RankSelect` index over this bitset without copying it.
+    /// Compaction uses this to turn a per-record "how many tombstones come
+    /// before me" query into an O(1) rank lookup instead of a dense
+    /// `old index -> new index` translation array.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: u64 has no padding and accepts every bit pattern, so a
+        // byte-wise reinterpretation of `words` is always valid; the
+        // returned slice borrows `self` and cannot outlive it.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.words.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(self.words.as_slice()),
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
