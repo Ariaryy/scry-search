@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use scry_core::pathindex::PathIndex;
 use scry_core::store::ArenaStore;
 use scry_core::view::{materialize_hits, Hit, IndexView};
 use scry_core::{Arena, Query};
@@ -149,15 +148,11 @@ fn selectivity(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let arena = view.base.archived();
     let blocks = arena.len().div_ceil(1024);
-    eprintln!(
-        "\ncorpus: {} records, {} directories, {} blocks",
-        arena.len(),
-        view.path_index.directory_count(),
-        blocks,
-    );
+    eprintln!("\ncorpus: {} records, {} blocks", arena.len(), blocks);
     // Both drivers, because they are independent and the slower one wins:
     // block selectivity bounds the name scan, while the number of matching
-    // *directories* bounds the ancestor-closure and inherited-mask work.
+    // *directories* bounds the total span pushed into each term's interval
+    // set.
     for term in [INFIX_COMMON, INFIX_MID, INFIX_RARE, PREFIX_CLUSTERED] {
         let selected = arena
             .candidate_blocks(term.as_bytes())
@@ -273,14 +268,13 @@ fn other_query_kinds(c: &mut Criterion) {
     ordering.finish();
 }
 
-/// The per-query fixed cost that no amount of filtering avoids today: the
-/// closure pass over every directory, and rebuilding the derived index.
+/// Costs paid once per snapshot (reindex/compaction) rather than per query —
+/// the `dfs_*` columns these build are what path-term search now walks
+/// directly, so a regression here shows up as indexing latency rather than
+/// query latency.
 fn fixed_costs(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut group = c.benchmark_group("fixed");
-    group.bench_function("path_index_build", |b| {
-        b.iter(|| black_box(PathIndex::build(view.base.archived(), &view.delta)))
-    });
     // Paid once per snapshot rather than once per query, but it sits on the
     // critical path of every reindex and compaction, so a regression here
     // shows up as indexing latency rather than query latency.
@@ -306,13 +300,6 @@ fn fixed_costs(c: &mut Criterion) {
                 black_box(&sizes),
             ))
             .len()
-        })
-    });
-    group.bench_function("closure_all_dirs", |b| {
-        let mut mask = vec![0u16; view.path_index.directory_count()];
-        b.iter(|| {
-            mask.fill(0);
-            view.path_index.closure(black_box(&mut mask));
         })
     });
     group.finish();

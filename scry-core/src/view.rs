@@ -8,7 +8,6 @@ use crate::ascii;
 use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
 use crate::metrics::QuerySpans;
-use crate::pathindex::PathIndex;
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
 use crate::query::Query;
@@ -66,7 +65,6 @@ pub struct IndexView {
     pub base: Arc<ArenaStore>,
     pub delta: Arc<Delta>,
     pub generation: u64,
-    pub path_index: Arc<PathIndex>,
     pub journal_id: u64,
     pub next_usn: i64,
     pub volume_serial: u64,
@@ -688,10 +686,10 @@ mod tests {
     /// additions (including one nested under another delta addition). This
     /// is the reference every future path-term matching implementation is
     /// checked against — it reconstructs each live record's path
-    /// independently of `search_path_terms`/`PathIndex` via
-    /// `IndexView::path_of`, which walks parent pointers directly and is
-    /// hop-capped, so it tolerates the cyclic/self parents below the same
-    /// way `full_path`/`delta_path` do. A genuinely out-of-range ("dangling")
+    /// independently of `search_path_terms` via `IndexView::path_of`, which
+    /// walks parent pointers directly and is hop-capped, so it tolerates the
+    /// cyclic/self parents below the same way `full_path`/`delta_path` do.
+    /// A genuinely out-of-range ("dangling")
     /// parent index cannot appear here: `ArenaBuilder::build` panics on one
     /// (it remaps parents through a rank table sized to the record count),
     /// so the on-disk format guarantees every parent is `< n` or
@@ -747,12 +745,6 @@ mod tests {
         let base = Arc::new(ArenaStore::open(&path).unwrap());
         let mut view = IndexView::new(base);
 
-        // Tombstone a plain file only — never a directory with live
-        // descendants, since the current PathIndex-based implementation
-        // blocks inheritance propagation through a tombstoned intermediate
-        // directory while a purely structural parent walk does not; scoping
-        // tombstones to leaves keeps this oracle from tripping over that
-        // pre-existing divergence.
         let tombstoned = view.base.archived().prefix_range("plainchild").start;
         // `ArenaBuilder::build` name-sorts records, so pre-build indices like
         // `root`/`level3` no longer identify the same record; look their
@@ -792,12 +784,6 @@ mod tests {
             live: true,
         });
         view.delta = Arc::new(delta);
-        // `path_index` must be rebuilt together with `delta` — the two are
-        // published atomically in production (`search_archived_with_delta`);
-        // leaving `path_index` at its construction-time (empty-delta) value
-        // here would silently exclude every delta record from
-        // `path_index.records()`.
-        view.path_index = Arc::new(PathIndex::build(view.base.archived(), &view.delta));
         (dir, view)
     }
 
@@ -1070,12 +1056,10 @@ impl IndexView {
         let next_usn = base.archived().next_usn;
         let volume_serial = base.archived().volume_serial;
         let delta = Arc::new(Delta::new(records));
-        let path_index = Arc::new(PathIndex::build(base.archived(), &delta));
         Self {
             base,
             delta,
             generation: fresh_generation(),
-            path_index,
             journal_id,
             next_usn,
             volume_serial,

@@ -8,7 +8,6 @@ pub mod frnmap;
 pub mod intervals;
 mod literals;
 pub mod metrics;
-pub mod pathindex;
 pub mod protocol;
 pub mod query;
 pub mod rank;

@@ -540,24 +540,6 @@ fn configure_background_thread_qos() {
     }
 }
 
-/// Builds a `PathIndex` and logs its size and build time — both feed
-/// directly into the reindex-transient peak-RSS measurement, so they need to
-/// be visible without attaching a profiler.
-fn build_path_index(
-    archived: &scry_core::ArchivedArena,
-    delta: &scry_core::delta::Delta,
-) -> Arc<scry_core::pathindex::PathIndex> {
-    let start = std::time::Instant::now();
-    let path_index = scry_core::pathindex::PathIndex::build(archived, delta);
-    eprintln!(
-        "scryd: path index built in {:?} ({} bytes, {} directories)",
-        start.elapsed(),
-        path_index.heap_bytes(),
-        path_index.directory_count()
-    );
-    Arc::new(path_index)
-}
-
 fn build_or_resume_view(
     volume: &str,
     all_volumes: &[String],
@@ -630,7 +612,6 @@ fn resume_view(
     Ok(Some(StartupView {
         view: Arc::new(IndexView {
             base: base.clone(),
-            path_index: build_path_index(archived, &delta),
             delta: Arc::new(delta),
             generation: scry_core::view::fresh_generation(),
             journal_id: cursor.journal_id,
@@ -934,7 +915,6 @@ fn reindex_on_changes(
         if !needs_full_reindex {
             let next = Arc::new(IndexView {
                 base: view.base.clone(),
-                path_index: build_path_index(view.base.archived(), &delta),
                 delta: Arc::new(delta),
                 generation: scry_core::view::fresh_generation(),
                 journal_id: view.journal_id,
@@ -1775,7 +1755,6 @@ mod tests {
             base: view1.base.clone(),
             delta: view1.delta.clone(),
             generation: view1.generation + 1,
-            path_index: view1.path_index.clone(),
             journal_id: view1.journal_id,
             next_usn: view1.next_usn,
             volume_serial: view1.volume_serial,
