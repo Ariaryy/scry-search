@@ -71,7 +71,12 @@
   duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients
   receive only `FILE_MAP_READ | SECTION_QUERY`, validate every fresh mapping,
   and fall back to RPC when sharing is unavailable. Path-term discriminant 3 is
-  reserved; the internal share request uses 4.
+  reserved; the internal share request uses 4. The daemon's shared-section cache
+  (`shared_section` in `scry-daemon/src/main.rs`) is keyed on `IndexView::generation`
+  and holds the keyed `Arc<ArenaStore>` alongside the cached `Arc<Section>` — do not
+  key it on `Arc::as_ptr(&view.base)` again, since a freed generation's address can
+  be reused by a later one and that reintroduces an ABA bug where a client is handed
+  a stale mapping under a key that looks fresh.
 - **Path-term queries publish their derived `PathIndex` atomically with base and
   delta.** It densely numbers directories with rank over `dir_bits`, propagates
   term masks parent-before-child, and is rebuilt for every delta publication.
