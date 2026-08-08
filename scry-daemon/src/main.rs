@@ -1135,7 +1135,7 @@ fn matches_refined(
         }
         QueryKind::Substring => {
             view.name_into(hit.record, name);
-            scry_core::ascii::contains_ci(name, terms[0].as_bytes())
+            scry_core::ascii::contains_ci(name, &terms[0].as_bytes().to_ascii_lowercase())
         }
         QueryKind::PathTerms => view.matches_path_terms(hit.record, terms, name),
         QueryKind::Wildcard | QueryKind::ShareIndex | QueryKind::QueryStats => false,
@@ -1937,6 +1937,26 @@ mod tests {
             store: Arc::new(arc_swap::ArcSwap::from(view)),
             cursor: None,
         }])
+    }
+
+    /// `contains_ci` only lowercases the haystack, not the needle, so the
+    /// refinement filter must lowercase the term itself before calling it —
+    /// otherwise an uppercase search term would silently fail to match a
+    /// lowercase name even though a fresh rescan (which case-folds via
+    /// `aho_corasick`/case-insensitive matching) would find it.
+    #[test]
+    fn matches_refined_substring_is_case_insensitive_regardless_of_which_side_carries_the_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_refinement_store(&dir);
+        let hit = view.search_hits(&Query::Substring("ledger".into()), SearchOptions::new(1))[0];
+        let mut name = Vec::new();
+        assert!(matches_refined(
+            &view,
+            hit,
+            QueryKind::Substring,
+            &["LEDGER".to_string()],
+            &mut name,
+        ));
     }
 
     /// Filtering a cached candidate set must always agree with rescanning the

@@ -603,6 +603,14 @@ mod tests {
     }
 
     #[test]
+    fn matches_path_terms_is_case_insensitive_regardless_of_which_side_carries_the_case() {
+        let (_dir, view) = nested_view();
+        let mut name = Vec::new();
+        let file = view.base.archived().len() as u32 - 2; // quarterly.pdf, per nested_view's push order
+        assert!(view.matches_path_terms(file, &["REPORTS".into(), "QUARTERLY".into()], &mut name));
+    }
+
+    #[test]
     fn path_terms_finds_ancestor_only_matches() {
         let (_dir, view) = nested_view();
         let results = view.search(
@@ -1006,12 +1014,19 @@ impl IndexView {
             return false;
         }
         let expected = (1u16 << terms.len()) - 1;
+        // `contains_ci` only lowercases the haystack; the needle must already
+        // be lowercase, so terms are lowered once up front rather than per
+        // ancestor hop.
+        let terms_lower: Vec<Vec<u8>> = terms
+            .iter()
+            .map(|term| term.as_bytes().to_ascii_lowercase())
+            .collect();
         let mut matched = 0u16;
         let mut current = record;
         for _ in 0..512 {
             self.name_into(current, name);
-            for (index, term) in terms.iter().enumerate() {
-                if crate::ascii::contains_ci(name, term.as_bytes()) {
+            for (index, term_lower) in terms_lower.iter().enumerate() {
+                if crate::ascii::contains_ci(name, term_lower) {
                     matched |= 1 << index;
                 }
             }
