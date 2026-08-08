@@ -682,6 +682,188 @@ mod tests {
         }
     }
 
+    /// A wider, adversarial corpus for the same full-path-scan oracle:
+    /// directories 6+ levels deep, a cyclic parent pair, a self-parented
+    /// record, and a delta overlay with both a tombstoned base file and live
+    /// additions (including one nested under another delta addition). This
+    /// is the reference every future path-term matching implementation is
+    /// checked against — it reconstructs each live record's path
+    /// independently of `search_path_terms`/`PathIndex` via
+    /// `IndexView::path_of`, which walks parent pointers directly and is
+    /// hop-capped, so it tolerates the cyclic/self parents below the same
+    /// way `full_path`/`delta_path` do. A genuinely out-of-range ("dangling")
+    /// parent index cannot appear here: `ArenaBuilder::build` panics on one
+    /// (it remaps parents through a rank table sized to the record count),
+    /// so the on-disk format guarantees every parent is `< n` or
+    /// `PARENT_NONE` by construction. `dfs::build`'s own tests cover
+    /// genuinely dangling parents at the raw-column level, below
+    /// `ArenaBuilder`.
+    fn adversarial_path_term_view() -> (tempfile::TempDir, IndexView) {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        let level1 = builder.push("Alpha", 0, true);
+        builder.set_parent(level1, root);
+        let level2 = builder.push("Bravo", 0, true);
+        builder.set_parent(level2, level1);
+        let level3 = builder.push("Charlie", 0, true);
+        builder.set_parent(level3, level2);
+        let level4 = builder.push("Delta", 0, true);
+        builder.set_parent(level4, level3);
+        let level5 = builder.push("Echo", 0, true);
+        builder.set_parent(level5, level4);
+        let level6 = builder.push("Foxtrot", 0, true);
+        builder.set_parent(level6, level5);
+        let leaf = builder.push("deepfile.txt", 0, false);
+        builder.set_parent(leaf, level6);
+
+        // A directory-only match: nothing under it has a distinguishing name.
+        let dir_only = builder.push("dironlyzqxv", 0, true);
+        builder.set_parent(dir_only, root);
+        let dir_only_child = builder.push("plainchild.bin", 0, false);
+        builder.set_parent(dir_only_child, dir_only);
+
+        // A leaf-only match: the distinguishing name is only on the file.
+        let leaf_only_dir = builder.push("plaindir", 0, true);
+        builder.set_parent(leaf_only_dir, root);
+        let leaf_only = builder.push("leafonlywkyp.bin", 0, false);
+        builder.set_parent(leaf_only, leaf_only_dir);
+
+        // A cyclic parent pair, structurally independent of the rest.
+        let cycle_a = builder.push("CycleA", 0, true);
+        let cycle_b = builder.push("CycleB", 0, true);
+        builder.set_parent(cycle_a, cycle_b);
+        builder.set_parent(cycle_b, cycle_a);
+        let cycle_child = builder.push("cyclechild.txt", 0, false);
+        builder.set_parent(cycle_child, cycle_a);
+
+        // A self-parented record.
+        let self_parented = builder.push("SelfParented", 0, true);
+        builder.set_parent(self_parented, self_parented);
+
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adversarial-path-terms.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let mut view = IndexView::new(base);
+
+        // Tombstone a plain file only — never a directory with live
+        // descendants, since the current PathIndex-based implementation
+        // blocks inheritance propagation through a tombstoned intermediate
+        // directory while a purely structural parent walk does not; scoping
+        // tombstones to leaves keeps this oracle from tripping over that
+        // pre-existing divergence.
+        let tombstoned = view.base.archived().prefix_range("plainchild").start;
+        // `ArenaBuilder::build` name-sorts records, so pre-build indices like
+        // `root`/`level3` no longer identify the same record; look their
+        // post-build positions up by name instead (both names are unique in
+        // this corpus).
+        let root_post_build = view.base.archived().prefix_range("c:").start;
+        let level3_post_build = view.base.archived().prefix_range("charlie").start;
+        let base_len = view.base.archived().len();
+        let mut delta = Delta::new(base_len);
+        delta.tombstones.set(tombstoned);
+        delta.added.push(DeltaRecord {
+            name: "deltadirqzxv".into(),
+            parent: ParentRef::Base(root_post_build),
+            mtime_secs: 0,
+            is_dir: true,
+            size_bytes: 0,
+            live: true,
+        });
+        let delta_dir_index = (delta.added.len() - 1) as u32;
+        delta.added.push(DeltaRecord {
+            name: "deltaleafwkyp.txt".into(),
+            parent: ParentRef::Delta(delta_dir_index),
+            mtime_secs: 0,
+            is_dir: false,
+            size_bytes: 0,
+            live: true,
+        });
+        // A live delta addition parented directly under an existing base
+        // directory, exercising the `ParentRef::Base` termination case
+        // independently of the nested-under-delta case above.
+        delta.added.push(DeltaRecord {
+            name: "deltaunderbasewkyp.txt".into(),
+            parent: ParentRef::Base(level3_post_build),
+            mtime_secs: 0,
+            is_dir: false,
+            size_bytes: 0,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+        // `path_index` must be rebuilt together with `delta` — the two are
+        // published atomically in production (`search_archived_with_delta`);
+        // leaving `path_index` at its construction-time (empty-delta) value
+        // here would silently exclude every delta record from
+        // `path_index.records()`.
+        view.path_index = Arc::new(PathIndex::build(view.base.archived(), &view.delta));
+        (dir, view)
+    }
+
+    #[test]
+    fn path_terms_match_bruteforce_oracle() {
+        let (_dir, view) = adversarial_path_term_view();
+        let base_len = view.base.archived().len() as u32;
+        let total = base_len + view.delta.added.len() as u32;
+
+        let sixteen_terms: Vec<String> = (0..16).map(|i| format!("t{i}zqxv")).collect();
+        let cases: Vec<Vec<String>> = vec![
+            vec!["alpha".to_string()],
+            vec!["foxtrot".to_string(), "deepfile".to_string()],
+            vec!["dironlyzqxv".to_string()],
+            vec!["leafonlywkyp".to_string()],
+            vec!["plaindir".to_string(), "leafonlywkyp".to_string()],
+            vec!["nothing_matches_this_zqxv".to_string()],
+            vec!["cyclea".to_string(), "cyclechild".to_string()],
+            vec!["selfparented".to_string()],
+            vec!["deltadirqzxv".to_string(), "deltaleafwkyp".to_string()],
+            vec!["deltaunderbasewkyp".to_string()],
+            vec!["c:".to_string(), "plainchild".to_string()], // tombstoned leaf, must not match
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string(),
+                "delta".to_string(),
+                "echo".to_string(),
+                "foxtrot".to_string(),
+                "deepfile".to_string(),
+                "c:".to_string(),
+            ],
+            sixteen_terms,
+        ];
+
+        for terms in cases {
+            let mut expected = Vec::new();
+            for record in 0..total {
+                let live = if record < base_len {
+                    !view.delta.tombstones.get(record)
+                } else {
+                    view.delta.added[(record - base_len) as usize].live
+                };
+                if !live {
+                    continue;
+                }
+                let path = view.path_of(record);
+                let lower = path.to_ascii_lowercase();
+                if terms
+                    .iter()
+                    .all(|term| lower.contains(&term.to_ascii_lowercase()))
+                {
+                    expected.push(path);
+                }
+            }
+            let mut actual: Vec<_> = view
+                .search(&Query::PathTerms(terms.clone()), usize::MAX)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "{terms:?}");
+        }
+    }
+
     #[test]
     fn search_allocates_no_path_for_a_non_result() {
         let (_dir, view) = base_view(20_000);
