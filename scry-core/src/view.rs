@@ -538,6 +538,87 @@ mod tests {
         }
     }
 
+    /// Decision harness for the delta compaction threshold. Unlike
+    /// `delta_ratio_equivalence_and_latency`, this times selection only with
+    /// the production-sized result limit, so path materialization cannot hide
+    /// the linear overlay scan. It also times the base-sized compaction at the
+    /// three candidate thresholds. The output is diagnostic rather than a
+    /// machine-independent assertion.
+    #[test]
+    #[ignore = "release-mode delta threshold decision harness"]
+    fn delta_threshold_decision_gate() {
+        const BASE: usize = 100_000;
+        const SAMPLES: usize = 31;
+
+        fn median_ns(mut run: impl FnMut()) -> u128 {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = std::time::Instant::now();
+                run();
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            samples[SAMPLES / 2]
+        }
+
+        let (_base_dir, base) = base_view(BASE);
+        let root = base.base.archived().prefix_range("C:").start;
+        let substring = Query::Substring("zzq_never_present".into());
+        let path_terms = Query::PathTerms(vec!["zzq_never_present".into()]);
+
+        for basis_points in [0usize, 50, 100, 500, 1_000, 2_000] {
+            let added = BASE * basis_points / 10_000;
+            let mut delta = Delta::new(base.base.archived().len());
+            delta.added.reserve(added);
+            for index in 0..added {
+                delta.added.push(DeltaRecord {
+                    name: format!("overlay_{index:06}.bin"),
+                    parent: ParentRef::Base(root),
+                    mtime_secs: 0,
+                    is_dir: false,
+                    size_bytes: 0,
+                    live: true,
+                });
+            }
+            let view = IndexView {
+                base: Arc::clone(&base.base),
+                delta: Arc::new(delta),
+                generation: base.generation,
+                journal_id: base.journal_id,
+                next_usn: base.next_usn,
+                volume_serial: base.volume_serial,
+            };
+            let options = SearchOptions::new(50);
+
+            // Warm thread-local scratch and mapped pages before sampling.
+            std::hint::black_box(view.search_hits(&substring, options));
+            std::hint::black_box(view.search_hits(&path_terms, options));
+            let substring_ns = median_ns(|| {
+                std::hint::black_box(view.search_hits(&substring, options));
+            });
+            let path_terms_ns = median_ns(|| {
+                std::hint::black_box(view.search_hits(&path_terms, options));
+            });
+            eprintln!(
+                "delta {:>4.1}% ({added:>6} added): substring {:>8.1} us, path_terms {:>8.1} us",
+                basis_points as f64 / 100.0,
+                substring_ns as f64 / 1_000.0,
+                path_terms_ns as f64 / 1_000.0,
+            );
+
+            if [50, 100, 500].contains(&basis_points) {
+                let started = std::time::Instant::now();
+                let (_dir, compacted) = open_compacted(&view);
+                let elapsed = started.elapsed();
+                std::hint::black_box(compacted.len());
+                eprintln!(
+                    "delta {:>4.1}% compaction: {elapsed:?}",
+                    basis_points as f64 / 100.0,
+                );
+            }
+        }
+    }
+
     #[test]
     fn compaction_removes_tombstones_and_empty_is_identity() {
         let (_dir, mut view) = base_view(20);

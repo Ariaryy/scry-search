@@ -125,6 +125,16 @@
   change, cursor-only progress checkpoints at most hourly, and failed writes
   back off for five minutes. The worker still polls every 30 seconds (no disk
   I/O), while 5% compaction and clean shutdown remain immediate write points.
+- **The 5% delta compaction threshold is measured, not inherited.** A maintained
+  release decision harness over a 100k-record base found that a 5k-record (5%)
+  overlay added about 28 us to an absent substring query and 21 us to an absent
+  path-term query, while compaction took 83-103 ms at 0.5%, 1%, and 5% because
+  it rewrites the full base. The scan slope was about 5 ns per live addition,
+  or roughly 0.5 ms at the real 2M-record/5% boundary. Lowering the threshold
+  to 0.5% would therefore buy less than a millisecond at the boundary while
+  causing roughly ten times as many full-base rewrites. Keep 5% unless a new
+  real trace contradicts that cost model; rerun `delta_threshold_decision_gate`
+  after changing either the delta scan or snapshot layout.
 - **Client-local queries use an anonymous read-only section** for the immutable
   base plus a serialized delta overlay in the same generation response. Handle
   duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients

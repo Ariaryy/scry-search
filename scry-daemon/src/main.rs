@@ -563,9 +563,15 @@ fn build_or_resume_view(
 
 /// Shared by warm-launch replay and by the live reindex loop: once accrued
 /// change events exceed 5% of the base, a streaming compaction is cheaper
-/// than the delta staying live indefinitely. At startup, exceeding it also
-/// means the gap since the snapshot was written is wide enough that a fresh
-/// enumeration is more trustworthy than a long replay.
+/// than the delta staying live indefinitely. The threshold is intentionally
+/// not lower: on a 100k-record release corpus, growing the delta from 0% to 5%
+/// added only 28 us to a no-match substring query and 21 us to a path-term
+/// query, while compaction cost 83-103 ms at 0.5%, 1%, and 5% because it
+/// rewrites the whole base. A 0.5% threshold would therefore trade a
+/// sub-millisecond worst-case query saving on a 2M-record base for roughly
+/// ten times as many base rewrites. At startup, exceeding 5% also means the
+/// gap since the snapshot was written is wide enough that a fresh enumeration
+/// is more trustworthy than a long replay.
 fn replay_exceeds_compaction_threshold(event_count: usize, base_len: usize) -> bool {
     event_count.saturating_mul(20) > base_len
 }
