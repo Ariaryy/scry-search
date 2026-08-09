@@ -230,7 +230,7 @@ extern "system" fn handle_console_ctrl(ctrl_type: ffi::Dword) -> ffi::Bool {
     }
     if let Some((indexes, auxiliary_marking_enabled)) = SHUTDOWN_STATE.get() {
         for index in indexes.iter() {
-            persist_idle_view(&index.store, &index.volume, *auxiliary_marking_enabled);
+            let _ = persist_idle_view(&index.store, &index.volume, *auxiliary_marking_enabled);
         }
     }
     std::process::exit(0);
@@ -914,6 +914,68 @@ fn collect_change(
     }
 }
 
+/// Polling is cheap; persisting is not. A cursor-only advance used to rewrite
+/// the full snapshot after every 30-second quiet gap, turning ordinary file
+/// activity into repeated index-sized bursts. Structural changes get a much
+/// shorter durability bound than cursor-only progress, while clean shutdown
+/// and the 5% compaction threshold remain immediate write points.
+const IDLE_PERSIST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const STRUCTURAL_PERSIST_QUIET_PERIOD: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+const CURSOR_CHECKPOINT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const IDLE_PERSIST_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct IdlePersistSchedule {
+    dirty_since: Option<std::time::Instant>,
+    last_structural_change: Option<std::time::Instant>,
+    last_attempt: Option<std::time::Instant>,
+}
+
+impl IdlePersistSchedule {
+    fn observe(&mut self, now: std::time::Instant, structural_change: bool, cursor_advanced: bool) {
+        if structural_change || cursor_advanced {
+            self.dirty_since.get_or_insert(now);
+        }
+        if structural_change {
+            self.last_structural_change = Some(now);
+        }
+    }
+
+    fn should_attempt(&self, now: std::time::Instant) -> bool {
+        let due = if let Some(changed) = self.last_structural_change {
+            now.duration_since(changed) >= STRUCTURAL_PERSIST_QUIET_PERIOD
+        } else if let Some(dirty) = self.dirty_since {
+            now.duration_since(dirty) >= CURSOR_CHECKPOINT_MAX_AGE
+        } else {
+            false
+        };
+        due && self
+            .last_attempt
+            .is_none_or(|attempt| now.duration_since(attempt) >= IDLE_PERSIST_RETRY_INTERVAL)
+    }
+
+    fn attempted(&mut self, now: std::time::Instant) {
+        self.last_attempt = Some(now);
+    }
+
+    fn persisted(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn view_has_structural_delta(view: &IndexView) -> bool {
+    view.delta.tombstones.count_ones() != 0 || !view.delta.added.is_empty()
+}
+
+fn view_needs_persist(view: &IndexView) -> bool {
+    let archived = view.base.archived();
+    view_has_structural_delta(view)
+        || view.journal_id != archived.journal_id
+        || view.next_usn != archived.next_usn
+        || view.volume_serial != archived.volume_serial
+}
+
 fn reindex_on_changes(
     volume: String,
     all_volumes: &[String],
@@ -923,13 +985,28 @@ fn reindex_on_changes(
     watcher: &scry_fsevents::JournalHandle,
 ) {
     let mut filter = SelfWriteFilter::new(&volume, all_volumes, auxiliary_marking_enabled);
+    let mut persist_schedule = IdlePersistSchedule::default();
+    {
+        let view = store.load_full();
+        persist_schedule.observe(
+            std::time::Instant::now(),
+            view_has_structural_delta(&view),
+            view_needs_persist(&view),
+        );
+    }
 
     loop {
         // Block until something changes...
-        let first = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        let first = match rx.recv_timeout(IDLE_PERSIST_POLL_INTERVAL) {
             Ok(event) => event,
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                persist_idle_view(&store, &volume, auxiliary_marking_enabled);
+                let now = std::time::Instant::now();
+                if persist_schedule.should_attempt(now) {
+                    persist_schedule.attempted(now);
+                    if persist_idle_view(&store, &volume, auxiliary_marking_enabled) {
+                        persist_schedule.persisted();
+                    }
+                }
                 continue;
             }
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -972,6 +1049,7 @@ fn reindex_on_changes(
         // the burst alongside it through compaction pointlessly doubles the
         // live event payload at exactly the phase whose private-memory budget
         // is strictest.
+        let had_structural_changes = !batch.is_empty();
         drop(batch);
 
         if !needs_full_reindex {
@@ -991,14 +1069,25 @@ fn reindex_on_changes(
                         store.store(compacted);
                         trim_working_set();
                         eprintln!("scryd: compacted {volume} ({len} entries)");
+                        persist_schedule.persisted();
                     }
                     Err(error) => {
                         store.store(next);
+                        persist_schedule.observe(
+                            std::time::Instant::now(),
+                            had_structural_changes,
+                            replay_next_usn.is_some(),
+                        );
                         eprintln!("scryd: compaction failed: {error}");
                     }
                 }
             } else {
                 store.store(next);
+                persist_schedule.observe(
+                    std::time::Instant::now(),
+                    had_structural_changes,
+                    replay_next_usn.is_some(),
+                );
             }
             continue;
         }
@@ -1007,6 +1096,7 @@ fn reindex_on_changes(
             Ok(new_view) => {
                 let len = new_view.view.len();
                 store.store(new_view.view);
+                persist_schedule.persisted();
                 trim_working_set();
                 eprintln!("scryd: reindexed {volume} ({len} entries)");
             }
@@ -1015,24 +1105,24 @@ fn reindex_on_changes(
     }
 }
 
-fn persist_idle_view(store: &SharedStore, volume: &str, auxiliary_marking_enabled: bool) {
+/// Returns true when the view was already durable or was persisted
+/// successfully. A failure leaves the caller's schedule dirty for retry.
+fn persist_idle_view(store: &SharedStore, volume: &str, auxiliary_marking_enabled: bool) -> bool {
     let view = store.load_full();
-    let archived = view.base.archived();
-    if view.delta.tombstones.count_ones() == 0
-        && view.delta.added.is_empty()
-        && view.journal_id == archived.journal_id
-        && view.next_usn == archived.next_usn
-        && view.volume_serial == archived.volume_serial
-    {
-        return;
+    if !view_needs_persist(&view) {
+        return true;
     }
     match compact_view(&view, volume, auxiliary_marking_enabled) {
         Ok(compacted) => {
             store.store(compacted);
             trim_working_set();
             eprintln!("scryd: persisted idle snapshot for {volume}");
+            true
         }
-        Err(error) => eprintln!("scryd: idle snapshot persistence failed: {error}"),
+        Err(error) => {
+            eprintln!("scryd: idle snapshot persistence failed: {error}");
+            false
+        }
     }
 }
 
@@ -2465,6 +2555,54 @@ eport.txt"
         );
         assert!(batch.is_empty());
         assert_eq!(next_usn, Some(42));
+    }
+
+    #[test]
+    fn cursor_only_progress_waits_for_the_hourly_checkpoint() {
+        let start = std::time::Instant::now();
+        let mut schedule = IdlePersistSchedule::default();
+        schedule.observe(start, false, true);
+        // Later cursor advances must not slide the deadline forever on a
+        // continuously active volume; this is a maximum checkpoint age.
+        schedule.observe(
+            start + CURSOR_CHECKPOINT_MAX_AGE - std::time::Duration::from_secs(1),
+            false,
+            true,
+        );
+
+        assert!(!schedule
+            .should_attempt(start + CURSOR_CHECKPOINT_MAX_AGE - std::time::Duration::from_secs(1)));
+        assert!(schedule.should_attempt(start + CURSOR_CHECKPOINT_MAX_AGE));
+    }
+
+    #[test]
+    fn structural_progress_waits_for_a_real_quiet_period() {
+        let start = std::time::Instant::now();
+        let mut schedule = IdlePersistSchedule::default();
+        schedule.observe(start, true, true);
+        schedule.observe(start + std::time::Duration::from_secs(9 * 60), true, true);
+
+        assert!(!schedule.should_attempt(
+            start + std::time::Duration::from_secs(19 * 60) - std::time::Duration::from_secs(1)
+        ));
+        assert!(schedule.should_attempt(start + std::time::Duration::from_secs(19 * 60)));
+    }
+
+    #[test]
+    fn failed_idle_persist_retries_with_backoff_and_success_clears_it() {
+        let start = std::time::Instant::now();
+        let due = start + STRUCTURAL_PERSIST_QUIET_PERIOD;
+        let mut schedule = IdlePersistSchedule::default();
+        schedule.observe(start, true, true);
+        assert!(schedule.should_attempt(due));
+
+        schedule.attempted(due);
+        assert!(!schedule
+            .should_attempt(due + IDLE_PERSIST_RETRY_INTERVAL - std::time::Duration::from_secs(1)));
+        assert!(schedule.should_attempt(due + IDLE_PERSIST_RETRY_INTERVAL));
+
+        schedule.persisted();
+        assert!(!schedule.should_attempt(due + IDLE_PERSIST_RETRY_INTERVAL));
     }
 
     #[test]
