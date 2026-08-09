@@ -123,7 +123,10 @@
   base plus a serialized delta overlay in the same generation response. Handle
   duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients
   receive only `FILE_MAP_READ | SECTION_QUERY`, validate every fresh mapping,
-  and fall back to RPC when sharing is unavailable. Path-term discriminant 3 is
+  and fall back to RPC when sharing is unavailable. If an announced replacement
+  mapping fails validation, the client discards its older local generation and
+  leaves the handshake retry immediately due; only the RPC fallback may answer
+  until a current mapping installs successfully. Path-term discriminant 3 is
   reserved; the internal share request uses 4. The daemon's shared-section cache
   (`shared_section` in `scry-daemon/src/main.rs`) is keyed on `IndexView::generation`
   and holds the keyed `Arc<ArenaStore>` alongside the cached `Arc<Section>` — do not
@@ -184,6 +187,13 @@
   aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
   (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
   record indices from different volumes are not comparable.
+- **Daemon query spans reflect the fused top-k implementation.** `select_ns`
+  covers base matching plus bounded-heap retention because substring and regex
+  perform those operations in one streaming pass; calling it only "matching"
+  would be misleading. `finalize_ns` covers the independently measurable live-
+  delta merge and final heap drain. Path-term search reports its complete hit
+  selection in `select_ns` and leaves `finalize_ns` at zero because that pipeline
+  is not split at the same boundary. Materialization and encoding remain separate.
 - **`scry --verbose` prints in-process CLI phase timings** for argument parsing,
   connection, query round trip, and result printing. They begin in `main`, so exclude
   process startup/loader and teardown. A local two-volume, ~2.7M-record measurement found
@@ -202,7 +212,9 @@
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
-  different records.
+  different records. Refinement terms are ASCII-normalized once per request and
+  borrowed by every cached-hit predicate; do not move case folding back inside
+  the up-to-20,000-hit filter loop.
 - **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
   saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
   it 0 because USN records do not carry size, so 0 means unknown rather than

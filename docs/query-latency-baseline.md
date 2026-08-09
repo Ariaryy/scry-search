@@ -1,5 +1,9 @@
 # Query latency baseline
 
+> Historical note: this capture predates the truthful span rename. Its
+> `match_ns` column corresponds to today's fused `select_ns`, and `rank_ns`
+> corresponds to today's delta-merge-and-drain `finalize_ns`.
+
 Reference numbers for the query instrumentation and bounded-materialization
 work, captured at commit `57d2486` on a single dev machine. These are
 diagnostic snapshots from synthetic corpora, not a regression gate — re-run
