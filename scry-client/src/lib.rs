@@ -207,8 +207,6 @@ impl Client {
                     return self.query_ordered(kind, pattern, limit, order);
                 }
             };
-            self.last_handshake = Some(std::time::Instant::now());
-
             if shared.handle != 0 {
                 let mapped = (|| -> anyhow::Result<LocalIndex> {
                     let incoming = scry_ipc::SectionView::map(shared.handle, shared.len as usize)?;
@@ -224,15 +222,24 @@ impl Client {
                 })();
                 match mapped {
                     Ok(local) => self.local = Some(local),
-                    Err(_) => return self.query_ordered(kind, pattern, limit, order),
+                    Err(_) => {
+                        // The daemon announced a newer generation that this
+                        // client could not validate. Do not knowingly serve
+                        // the previously cached generation during the retry
+                        // window; fall back and retry sharing next call.
+                        self.local = None;
+                        return self.query_ordered(kind, pattern, limit, order);
+                    }
                 }
             } else if self
                 .local
                 .as_ref()
                 .is_none_or(|local| local.generation != shared.generation)
             {
+                self.local = None;
                 return self.query_ordered(kind, pattern, limit, order);
             }
+            self.last_handshake = Some(std::time::Instant::now());
         }
 
         let local = self
@@ -462,6 +469,59 @@ mod tests {
             .search_local(QueryKind::Substring, "file", 50)
             .unwrap();
         assert_eq!(result, vec![entry("file.txt")]);
+
+        drop(client);
+        thread.join().unwrap();
+    }
+
+    /// A rejected replacement is evidence that the cached generation is no
+    /// longer current. The fallback answer is safe, but retaining the old
+    /// mapping or refreshing the handshake timer would make subsequent calls
+    /// knowingly serve that stale generation.
+    #[test]
+    fn failed_replacement_mapping_discards_old_generation_and_keeps_retry_due() {
+        let pipe_name = unique_pipe_name();
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+
+            let request = decode_request(&pipe.read_frame().unwrap()).unwrap();
+            assert_eq!(request.kind, QueryKind::ShareIndex);
+            pipe.write_frame(&encode_shared_index(&shared_index_response(1)))
+                .unwrap();
+
+            let request = decode_request(&pipe.read_frame().unwrap()).unwrap();
+            assert_eq!(request.kind, QueryKind::ShareIndex);
+            pipe.write_frame(&encode_shared_index(&SharedIndexResponse {
+                handle: u64::MAX,
+                len: 4096,
+                generation: 2,
+                overlay: Vec::new(),
+            }))
+            .unwrap();
+
+            let request = decode_request(&pipe.read_frame().unwrap()).unwrap();
+            assert_eq!(request.kind, QueryKind::Substring);
+            pipe.write_frame(&encode_results(&[entry("rpc-result")]))
+                .unwrap();
+        });
+
+        let mut client = connect(&pipe_name);
+        assert_eq!(
+            client
+                .search_local(QueryKind::Substring, "file", 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        client.last_handshake = Some(std::time::Instant::now() - LOCAL_HANDSHAKE_STALENESS_WINDOW);
+
+        let result = client
+            .search_local(QueryKind::Substring, "file", 50)
+            .unwrap();
+        assert_eq!(result, vec![entry("rpc-result")]);
+        assert!(client.local.is_none());
+        assert!(client.last_handshake.unwrap().elapsed() >= LOCAL_HANDSHAKE_STALENESS_WINDOW);
 
         drop(client);
         thread.join().unwrap();
