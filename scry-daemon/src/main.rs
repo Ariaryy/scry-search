@@ -706,21 +706,31 @@ fn compaction_scratch_dir(volume: &str) -> std::path::PathBuf {
         .join(format!("compact-{safe}"))
 }
 
-struct BackgroundModeGuard;
+struct BackgroundModeGuard {
+    entered: bool,
+}
 
 impl BackgroundModeGuard {
     fn enter() -> Self {
-        unsafe {
-            ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_BEGIN);
+        let entered = unsafe {
+            ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_BEGIN) != 0
+        };
+        if !entered {
+            eprintln!(
+                "scryd: thread background mode unavailable (win32 error {}); continuing",
+                unsafe { ffi::GetLastError() }
+            );
         }
-        Self
+        Self { entered }
     }
 }
 
 impl Drop for BackgroundModeGuard {
     fn drop(&mut self) {
-        unsafe {
-            ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_END);
+        if self.entered {
+            unsafe {
+                ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_MODE_BACKGROUND_END);
+            }
         }
     }
 }
@@ -2706,6 +2716,91 @@ eport.txt"
     #[test]
     fn configure_background_qos_does_not_panic() {
         configure_background_qos();
+    }
+
+    /// Real-volume diagnostic for Part E's STOP gate. Run elevated with
+    /// `cargo test -p scry-daemon --release -- --ignored --nocapture
+    /// query_p99_during_full_index_with_and_without_background_mode`.
+    /// Generic vocabulary keeps the output safe to retain in measurement
+    /// notes. This is ignored because it enumerates C: twice.
+    #[test]
+    #[ignore = "elevated real-volume contention benchmark"]
+    fn query_p99_during_full_index_with_and_without_background_mode() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct Sample {
+            p50: std::time::Duration,
+            p99: std::time::Duration,
+            queries: usize,
+            reindex_wall: std::time::Duration,
+            records: usize,
+        }
+
+        fn run(view: &Arc<IndexView>, background: bool) -> Sample {
+            trim_working_set();
+            let query = Query::Substring("a".to_string());
+            // Give both halves the same warm mapped-index starting point, so
+            // the second run cannot win merely because the first faulted the
+            // query columns into the system cache.
+            for _ in 0..3 {
+                let _ = view.search_hits(&query, SearchOptions::new(50));
+            }
+            let started = Arc::new(std::sync::Barrier::new(2));
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_started = started.clone();
+            let worker_done = done.clone();
+            let worker = std::thread::spawn(move || {
+                let _background = background.then(BackgroundModeGuard::enter);
+                worker_started.wait();
+                let began = std::time::Instant::now();
+                let (arena, _) = scry_fsevents::WindowsBackend::bulk_index_volume("C:")
+                    .expect("elevated C: enumeration failed");
+                let result = (began.elapsed(), arena.len());
+                drop(arena);
+                worker_done.store(true, AtomicOrdering::Release);
+                result
+            });
+
+            started.wait();
+            let mut latencies = Vec::new();
+            while !done.load(AtomicOrdering::Acquire) {
+                let began = std::time::Instant::now();
+                let _ = view.search_hits(&query, SearchOptions::new(50));
+                latencies.push(began.elapsed());
+            }
+            let (reindex_wall, records) = worker.join().unwrap();
+            assert!(
+                latencies.len() >= 20,
+                "reindex ended before a useful sample"
+            );
+            latencies.sort_unstable();
+            Sample {
+                p50: latencies[latencies.len() / 2],
+                p99: latencies[latencies.len() * 99 / 100],
+                queries: latencies.len(),
+                reindex_wall,
+                records,
+            }
+        }
+
+        scry_fsevents::configure_index_read_cap(128 * 1024 * 1024);
+        let view = Arc::new(IndexView::new(Arc::new(
+            ArenaStore::open(&snapshot_path("C:")).expect("C: snapshot is required"),
+        )));
+        let normal = run(&view, false);
+        let background = run(&view, true);
+        println!(
+            "foreground-priority reindex: p50={:?} p99={:?} queries={} wall={:?} records={}",
+            normal.p50, normal.p99, normal.queries, normal.reindex_wall, normal.records
+        );
+        println!(
+            "background-priority reindex: p50={:?} p99={:?} queries={} wall={:?} records={}",
+            background.p50,
+            background.p99,
+            background.queries,
+            background.reindex_wall,
+            background.records
+        );
     }
 
     /// Four reader threads each observe `archived().len()` is either 2 or 3
