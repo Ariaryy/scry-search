@@ -2282,6 +2282,52 @@ mod tests {
         );
     }
 
+    /// Attributable plan-017 wall-time probe. The first keystroke primes the
+    /// per-connection state; only the second, 20,000-candidate overscan is
+    /// timed. The same function can be applied to the pre-change parent for a
+    /// direct before/after comparison.
+    #[test]
+    #[ignore = "release-mode bounded-refinement benchmark"]
+    fn benchmark_bounded_refinement_wall() {
+        const ITERATIONS: usize = 60;
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_store_with_n_records(30_000, &dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let mut samples = Vec::with_capacity(ITERATIONS);
+
+        for _ in 0..ITERATIONS {
+            let mut cache = RefinementCache::default();
+            let _ = search_indexes_with_cache(
+                &indexes,
+                QueryKind::Substring,
+                &Query::Substring("f".to_string()),
+                SearchOptions::new(50),
+                scry_core::Cancellation::new(&generation, 0),
+                &mut cache,
+            );
+            let started = std::time::Instant::now();
+            let results = search_indexes_with_cache(
+                &indexes,
+                QueryKind::Substring,
+                &Query::Substring("fi".to_string()),
+                SearchOptions::new(50),
+                scry_core::Cancellation::new(&generation, 0),
+                &mut cache,
+            );
+            samples.push(started.elapsed());
+            assert_eq!(results.len(), 50);
+        }
+
+        samples.sort_unstable();
+        println!(
+            "bounded refinement: n={} p50={:?} p99={:?}",
+            samples.len(),
+            samples[samples.len() / 2],
+            samples[samples.len() * 99 / 100]
+        );
+    }
+
     /// Not a pass/fail test: exercises the daemon's real query path (cache,
     /// span accumulation, memory sampling) end to end over a synthetic
     /// corpus and prints a report, so the numbers in
