@@ -1155,6 +1155,7 @@ mod tests {
             vec!["plaindir".to_string(), "leafonlywkyp".to_string()],
             vec!["nothing_matches_this_zqxv".to_string()],
             vec!["cyclea".to_string(), "cyclechild".to_string()],
+            vec!["cycleb".to_string(), "cyclechild".to_string()],
             vec!["selfparented".to_string()],
             vec!["deltadirqzxv".to_string(), "deltaleafwkyp".to_string()],
             vec!["deltaunderbasewkyp".to_string()],
@@ -1200,6 +1201,68 @@ mod tests {
             expected.sort();
             actual.sort();
             assert_eq!(actual, expected, "{terms:?}");
+        }
+    }
+
+    #[test]
+    fn path_term_hit_order_matches_bruteforce_for_every_order() {
+        let (_dir, view) = adversarial_path_term_view();
+        let arena = view.base.archived();
+        let base_len = arena.len() as u32;
+        let total = base_len + view.delta.added.len() as u32;
+
+        for terms in [
+            vec!["alpha".to_owned()],
+            vec!["cycleb".to_owned(), "cyclechild".to_owned()],
+            vec!["deltadirqzxv".to_owned(), "deltaleafwkyp".to_owned()],
+        ] {
+            let terms_lower: Vec<_> = terms
+                .iter()
+                .map(|term| term.as_bytes().to_ascii_lowercase())
+                .collect();
+            for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                let mut expected = Vec::new();
+                let mut name = Vec::new();
+                for record in 0..total {
+                    let live = if record < base_len {
+                        !view.delta.tombstones.get(record)
+                    } else {
+                        view.delta.added[(record - base_len) as usize].live
+                    };
+                    if !live {
+                        continue;
+                    }
+                    let path_lower = view.path_of(record).to_ascii_lowercase();
+                    if !terms.iter().all(|term| path_lower.contains(term)) {
+                        continue;
+                    }
+                    view.name_into(record, &mut name);
+                    let own = terms_lower
+                        .iter()
+                        .filter(|term| crate::ascii::contains_ci(&name, term))
+                        .count();
+                    let quality = (terms.len() - own) as u8;
+                    expected.push(sort_key(
+                        order,
+                        arena,
+                        &view.delta,
+                        record,
+                        quality,
+                        name.len() as u32,
+                    ));
+                }
+                expected.sort_unstable();
+                let expected: Vec<_> = expected.into_iter().map(rank::key_record).collect();
+                let actual: Vec<_> = view
+                    .search_hits(
+                        &Query::PathTerms(terms.clone()),
+                        SearchOptions::ordered(usize::MAX, order),
+                    )
+                    .into_iter()
+                    .map(|hit| hit.record)
+                    .collect();
+                assert_eq!(actual, expected, "terms={terms:?}, order={order:?}");
+            }
         }
     }
 
@@ -1312,6 +1375,20 @@ mod tests {
         // larger one.
         assert_eq!(scratch.term_sets.len(), 1);
         assert!(scratch.term_sets[0].is_empty());
+    }
+
+    #[test]
+    fn globally_absent_path_term_skips_later_term_scans() {
+        let (_dir, view) = base_view(2_000);
+        TERM_INTERVAL_BUILDS.with(|count| count.set(0));
+
+        let results = view.search_hits(
+            &Query::PathTerms(vec!["globally_absent_qzxv".to_owned(), "match".to_owned()]),
+            SearchOptions::new(10),
+        );
+
+        assert!(results.is_empty());
+        TERM_INTERVAL_BUILDS.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[test]
@@ -1549,7 +1626,7 @@ impl IndexView {
             }
             let base_len = self.base.archived().len() as u32;
             if current < base_len {
-                let parent = self.base.archived().parent(current);
+                let parent = self.base.archived().tree_parent(current);
                 if parent == PARENT_NONE || parent >= base_len {
                     return false;
                 }
@@ -2024,6 +2101,8 @@ impl PathSearchScratch {
 thread_local! {
     static PATH_SEARCH_SCRATCH: RefCell<PathSearchScratch> =
         RefCell::new(PathSearchScratch::default());
+    #[cfg(test)]
+    static TERM_INTERVAL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Modification time of a record in the combined base-then-delta space.
@@ -2351,6 +2430,8 @@ fn build_term_interval_set(
     cancel: Option<Cancellation>,
     checked: &mut u32,
 ) -> bool {
+    #[cfg(test)]
+    TERM_INTERVAL_BUILDS.with(|count| count.set(count.get() + 1));
     let filtered = use_filter
         && arena.candidate_blocks_into(
             term_lower,
@@ -2474,6 +2555,16 @@ fn search_path_terms_with_scratch(
         if !completed {
             return Vec::new();
         }
+        if term_set.is_empty()
+            && !delta.added.iter().any(|record| {
+                record.live && crate::ascii::contains_ci(record.name.as_bytes(), term_lower)
+            })
+        {
+            // No base record or live delta record can introduce this term.
+            // Descendants only inherit terms from those two sources, so later
+            // full-index term scans cannot possibly recover a result.
+            return Vec::new();
+        }
     }
 
     let full_mask = if terms.len() == 16 {
@@ -2486,14 +2577,22 @@ fn search_path_terms_with_scratch(
     // be satisfied by different ancestor records. The per-term IntervalSets
     // above are built from fully independent scans; only their *derived* DFS
     // position sets are intersected here.
-    let any_term_empty = scratch.term_sets[..terms.len()]
-        .iter()
-        .any(|set| set.is_empty());
+    let mut term_order = [0usize; crate::terms::MAX_TERMS];
+    for (index, slot) in term_order[..terms.len()].iter_mut().enumerate() {
+        *slot = index;
+    }
+    term_order[..terms.len()].sort_unstable_by_key(|&index| {
+        (
+            scratch.term_sets[index].len_positions(),
+            scratch.term_sets[index].runs().len(),
+        )
+    });
+    let any_term_empty = scratch.term_sets[term_order[0]].is_empty();
     let mut final_runs: Vec<(u32, u32)> = Vec::new();
     if !any_term_empty {
-        scratch.fold_a = scratch.term_sets[0].clone();
+        scratch.fold_a = scratch.term_sets[term_order[0]].clone();
         let mut current_in_a = true;
-        for term_index in 1..terms.len() {
+        for &term_index in &term_order[1..terms.len()] {
             if current_in_a {
                 scratch.term_sets[term_index].intersect_into(&scratch.fold_a, &mut scratch.fold_b);
                 current_in_a = false;

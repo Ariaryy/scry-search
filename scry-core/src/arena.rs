@@ -106,6 +106,45 @@ impl Arena {
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
     }
+
+    /// Parent edge retained by the deterministic DFS spanning forest.
+    /// Corrupt cycle/self/dangling edges that DFS had to skip read as roots.
+    #[inline]
+    pub fn tree_parent(&self, idx: u32) -> u32 {
+        canonical_tree_parent(
+            idx,
+            unpack_parent(self.parents[idx as usize]),
+            self.parents.len(),
+            &self.dfs_positions,
+            &self.dfs_ends,
+        )
+    }
+}
+
+#[inline]
+fn canonical_tree_parent(
+    idx: u32,
+    parent: u32,
+    len: usize,
+    dfs_positions: &[u32],
+    dfs_ends: &[u32],
+) -> u32 {
+    if parent == PARENT_NONE || parent as usize >= len || parent == idx {
+        return PARENT_NONE;
+    }
+    // Empty DFS columns are retained only as a defensive legacy fallback.
+    // A current v9 snapshot always has them when it has records.
+    if dfs_positions.is_empty() || dfs_ends.is_empty() {
+        return parent;
+    }
+    let position = dfs_positions[idx as usize];
+    let parent_start = dfs_positions[parent as usize];
+    let parent_end = dfs_ends[parent as usize];
+    if (parent_start..parent_end).contains(&position) {
+        parent
+    } else {
+        PARENT_NONE
+    }
 }
 
 // ── varint helpers (unsigned LEB128) ─────────────────────────────────────────
@@ -356,6 +395,24 @@ impl ArchivedArena {
     #[inline]
     pub fn parent(&self, idx: u32) -> u32 {
         unpack_parent(self.parents[idx as usize])
+    }
+
+    /// Parent edge retained by the deterministic DFS spanning forest.
+    ///
+    /// The raw parent column can contain cycles. DFS necessarily skips one
+    /// edge in every cycle, and a single subtree interval can describe only
+    /// that resulting forest. Checking whether `idx` lies in its raw parent's
+    /// subtree identifies the retained edges in O(1), making parent walks and
+    /// interval-based path search agree without storing another column.
+    #[inline]
+    pub fn tree_parent(&self, idx: u32) -> u32 {
+        canonical_tree_parent(
+            idx,
+            self.parent(idx),
+            self.parents.len(),
+            self.dfs_positions.as_slice(),
+            self.dfs_ends.as_slice(),
+        )
     }
 
     /// Whether entry `idx` is a directory.
@@ -689,9 +746,10 @@ impl ArchivedArena {
         loop {
             chain[len] = idx;
             len += 1;
-            // `self.parent(idx)` reads only from the hot `parents` column;
-            // mtime and size stay evicted.
-            let parent = self.parent(idx);
+            // `tree_parent` additionally reads the hot DFS-position column
+            // and one cold subtree end per hop so corrupt cycles use exactly
+            // the same spanning forest as interval-based path search.
+            let parent = self.tree_parent(idx);
             if parent == PARENT_NONE || len == chain.len() {
                 break;
             }
@@ -2029,12 +2087,12 @@ mod tests {
         let store = crate::store::ArenaStore::open(&path).unwrap();
         let archived = store.archived();
 
-        // Must not hang; returns something finite.
-        let path = archived.full_path(0, '\\');
-        assert!(
-            !path.is_empty(),
-            "full_path should return something even with a cycle"
-        );
+        // DFS starts at record 0, retains 0 -> 1 as a child edge, and cuts
+        // the raw 0 -> 1 parent edge that would return to the descendant.
+        assert_eq!(archived.tree_parent(0), PARENT_NONE);
+        assert_eq!(archived.tree_parent(1), 0);
+        assert_eq!(archived.full_path(0, '\\'), "a");
+        assert_eq!(archived.full_path(1, '\\'), "a\\b");
     }
 
     /// The key equivalence test for the blob-backed staging refactor: building
