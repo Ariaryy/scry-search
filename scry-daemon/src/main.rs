@@ -105,8 +105,8 @@ impl QueryMetrics {
         self.sample_memory(true);
         let mut out = format!("queries: {}\n", self.count);
         for (label, get) in [
-            ("match_ns", span_match as fn(QuerySpans) -> u64),
-            ("rank_ns", span_rank),
+            ("select_ns", span_select as fn(QuerySpans) -> u64),
+            ("finalize_ns", span_finalize),
             ("materialize_ns", span_materialize),
             ("encode_ns", span_encode),
             ("candidates", span_candidates),
@@ -151,8 +151,8 @@ fn query_metrics() -> &'static std::sync::Mutex<QueryMetrics> {
 
 macro_rules! span_fields {
     ($target:expr, $source:expr, $op:expr) => {{
-        $op(&mut $target.match_ns, $source.match_ns);
-        $op(&mut $target.rank_ns, $source.rank_ns);
+        $op(&mut $target.select_ns, $source.select_ns);
+        $op(&mut $target.finalize_ns, $source.finalize_ns);
         $op(&mut $target.materialize_ns, $source.materialize_ns);
         $op(&mut $target.encode_ns, $source.encode_ns);
         $op(&mut $target.candidates, $source.candidates);
@@ -172,11 +172,11 @@ fn max_spans(target: &mut QuerySpans, source: QuerySpans) {
         (*field).max(value));
 }
 
-fn span_match(spans: QuerySpans) -> u64 {
-    spans.match_ns
+fn span_select(spans: QuerySpans) -> u64 {
+    spans.select_ns
 }
-fn span_rank(spans: QuerySpans) -> u64 {
-    spans.rank_ns
+fn span_finalize(spans: QuerySpans) -> u64 {
+    spans.finalize_ns
 }
 fn span_materialize(spans: QuerySpans) -> u64 {
     spans.materialize_ns
@@ -1166,20 +1166,20 @@ fn matches_refined(
     view: &IndexView,
     hit: Hit,
     kind: QueryKind,
-    terms: &[String],
+    terms_lower: &[Vec<u8>],
     name: &mut Vec<u8>,
 ) -> bool {
     match kind {
         QueryKind::Prefix => {
             view.name_into(hit.record, name);
-            name.len() >= terms[0].len()
-                && name[..terms[0].len()].eq_ignore_ascii_case(terms[0].as_bytes())
+            name.len() >= terms_lower[0].len()
+                && name[..terms_lower[0].len()].eq_ignore_ascii_case(&terms_lower[0])
         }
         QueryKind::Substring => {
             view.name_into(hit.record, name);
-            scry_core::ascii::contains_ci(name, &terms[0].as_bytes().to_ascii_lowercase())
+            scry_core::ascii::contains_ci(name, &terms_lower[0])
         }
-        QueryKind::PathTerms => view.matches_path_terms(hit.record, terms, name),
+        QueryKind::PathTerms => view.matches_path_terms_lower(hit.record, terms_lower, name),
         QueryKind::Wildcard | QueryKind::ShareIndex | QueryKind::QueryStats => false,
     }
 }
@@ -1229,6 +1229,10 @@ fn search_indexes_with_cache_with_spans(
     };
     let refine =
         cache.kind == Some(kind) && cache.order == order && is_refinement(&cache.terms, &new_terms);
+    let terms_lower: Vec<Vec<u8>> = new_terms
+        .iter()
+        .map(|term| term.as_bytes().to_ascii_lowercase())
+        .collect();
     if !refine || cache.per_volume.len() != indexes.len() {
         cache.per_volume.clear();
         cache.per_volume.resize_with(indexes.len(), || None);
@@ -1266,7 +1270,7 @@ fn search_indexes_with_cache_with_spans(
                 .hits
                 .iter()
                 .copied()
-                .filter(|hit| matches_refined(&view, *hit, kind, &new_terms, &mut name))
+                .filter(|hit| matches_refined(&view, *hit, kind, &terms_lower, &mut name))
                 .collect::<Vec<_>>()
         } else {
             view.search_hits_cancellable_with_spans(
@@ -1981,10 +1985,8 @@ mod tests {
     }
 
     /// `contains_ci` only lowercases the haystack, not the needle, so the
-    /// refinement filter must lowercase the term itself before calling it —
-    /// otherwise an uppercase search term would silently fail to match a
-    /// lowercase name even though a fresh rescan (which case-folds via
-    /// `aho_corasick`/case-insensitive matching) would find it.
+    /// per-request normalization passed to the refinement filter must handle
+    /// uppercase terms before any cached hit is visited.
     #[test]
     fn matches_refined_substring_is_case_insensitive_regardless_of_which_side_carries_the_case() {
         let dir = tempfile::tempdir().unwrap();
@@ -1995,7 +1997,7 @@ mod tests {
             &view,
             hit,
             QueryKind::Substring,
-            &["LEDGER".to_string()],
+            &[b"ledger".to_vec()],
             &mut name,
         ));
     }
@@ -2237,11 +2239,11 @@ mod tests {
                 &mut spans,
             );
             println!(
-                "  {label:22} hits={:<6} match_ns={:<9} rank_ns={:<8} materialize_ns={:<8} \
+                "  {label:22} hits={:<6} select_ns={:<9} finalize_ns={:<8} materialize_ns={:<8} \
                  candidates={:<7} emitted={}",
                 entries.len(),
-                spans.match_ns,
-                spans.rank_ns,
+                spans.select_ns,
+                spans.finalize_ns,
                 spans.materialize_ns,
                 spans.candidates,
                 spans.emitted,

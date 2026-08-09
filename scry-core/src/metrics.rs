@@ -4,8 +4,11 @@
 /// instrumentation do not take timestamps on the search path.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct QuerySpans {
-    pub match_ns: u64,
-    pub rank_ns: u64,
+    /// Select matching base records and retain the best base hits. Streaming
+    /// queries fuse those operations, so they deliberately share one span.
+    pub select_ns: u64,
+    /// Merge live delta additions into the bounded heap and drain final hits.
+    pub finalize_ns: u64,
     pub materialize_ns: u64,
     pub encode_ns: u64,
     pub candidates: u64,

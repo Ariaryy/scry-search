@@ -1292,6 +1292,8 @@ mod tests {
             Some(&mut spans),
         );
         assert_eq!(hits.len(), 10);
+        assert!(spans.select_ns > 0);
+        assert!(spans.finalize_ns > 0);
         assert_eq!(spans.candidates, 100);
         assert_eq!(spans.blocks_scanned, spans.blocks_total);
     }
@@ -1554,8 +1556,8 @@ impl IndexView {
                 cancel,
             );
             if let (Some(spans), Some(started)) = (spans, started) {
-                spans.match_ns = spans
-                    .match_ns
+                spans.select_ns = spans
+                    .select_ns
                     .saturating_add(started.elapsed().as_nanos() as u64);
                 spans.candidates = spans.candidates.saturating_add(hits.len() as u64);
             }
@@ -1601,17 +1603,26 @@ impl IndexView {
     /// Test terms against a record and its ancestors without allocating a
     /// full path. The hop cap matches [`ArchivedArena::full_path`].
     pub fn matches_path_terms(&self, record: u32, terms: &[String], name: &mut Vec<u8>) -> bool {
-        if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS {
-            return false;
-        }
-        let expected = (1u16 << terms.len()) - 1;
-        // `contains_ci` only lowercases the haystack; the needle must already
-        // be lowercase, so terms are lowered once up front rather than per
-        // ancestor hop.
         let terms_lower: Vec<Vec<u8>> = terms
             .iter()
             .map(|term| term.as_bytes().to_ascii_lowercase())
             .collect();
+        self.matches_path_terms_lower(record, &terms_lower, name)
+    }
+
+    /// Allocation-free refinement primitive for callers that normalize the
+    /// term list once per request. Every `terms_lower` entry must already be
+    /// ASCII-lowercase.
+    pub fn matches_path_terms_lower(
+        &self,
+        record: u32,
+        terms_lower: &[Vec<u8>],
+        name: &mut Vec<u8>,
+    ) -> bool {
+        if terms_lower.is_empty() || terms_lower.len() > crate::terms::MAX_TERMS {
+            return false;
+        }
+        let expected = (1u16 << terms_lower.len()) - 1;
         let mut matched = 0u16;
         let mut current = record;
         for _ in 0..512 {
@@ -2236,7 +2247,7 @@ fn search_ranked_cancellable_with_spans(
     let needs_name = !order.needs_metadata();
     let mut heap = match query {
         Query::Substring(_) | Query::Regex(_) => {
-            let match_started = spans.as_ref().map(|_| std::time::Instant::now());
+            let select_started = spans.as_ref().map(|_| std::time::Instant::now());
             let (heap, seen) = crate::query::search_ranked_streaming(
                 arena,
                 query,
@@ -2256,16 +2267,16 @@ fn search_ranked_cancellable_with_spans(
                     Some(sort_key(order, arena, delta, index, quality, name_len))
                 },
             );
-            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
-                spans.match_ns = spans
-                    .match_ns
+            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), select_started) {
+                spans.select_ns = spans
+                    .select_ns
                     .saturating_add(started.elapsed().as_nanos() as u64);
                 spans.candidates = spans.candidates.saturating_add(seen);
             }
             heap
         }
         _ => {
-            let match_started = spans.as_ref().map(|_| std::time::Instant::now());
+            let select_started = spans.as_ref().map(|_| std::time::Instant::now());
             let base_hits = crate::query::search_base_parallel_with_spans(
                 arena,
                 query,
@@ -2273,10 +2284,7 @@ fn search_ranked_cancellable_with_spans(
                 cancel,
                 spans.as_deref_mut(),
             );
-            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), match_started) {
-                spans.match_ns = spans
-                    .match_ns
-                    .saturating_add(started.elapsed().as_nanos() as u64);
+            if let Some(spans) = spans.as_deref_mut() {
                 spans.candidates = spans.candidates.saturating_add(base_hits.len() as u64);
             }
             let mut heap = BinaryHeap::with_capacity(limit.min(4096));
@@ -2297,10 +2305,15 @@ fn search_ranked_cancellable_with_spans(
                     limit,
                 );
             }
+            if let (Some(spans), Some(started)) = (spans.as_deref_mut(), select_started) {
+                spans.select_ns = spans
+                    .select_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+            }
             heap
         }
     };
-    let rank_started = spans.as_ref().map(|_| std::time::Instant::now());
+    let finalize_started = spans.as_ref().map(|_| std::time::Instant::now());
 
     let regex = match query {
         Query::Regex(pattern) => Regex::builder()
@@ -2345,9 +2358,9 @@ fn search_ranked_cancellable_with_spans(
     }
 
     let hits = drain_heap(arena, delta, &mut heap);
-    if let (Some(spans), Some(started)) = (spans, rank_started) {
-        spans.rank_ns = spans
-            .rank_ns
+    if let (Some(spans), Some(started)) = (spans, finalize_started) {
+        spans.finalize_ns = spans
+            .finalize_ns
             .saturating_add(started.elapsed().as_nanos() as u64);
     }
     hits
