@@ -5,8 +5,10 @@
 > corresponds to today's delta-merge-and-drain `finalize_ns`.
 
 Reference numbers for the query instrumentation and bounded-materialization
-work, captured at commit `57d2486` on a single dev machine. These are
-diagnostic snapshots from synthetic corpora, not a regression gate — re-run
+work on a single dev machine. Commit `57d2486` is the pre-instrumentation
+reference point; the span capture itself was taken later, after instrumentation
+and bounded materialization had landed, so it is not a pre-017 timing capture.
+These are diagnostic snapshots from synthetic corpora, not a regression gate — re-run
 the underlying tests/benchmarks rather than trusting these numbers to still
 hold on a different machine or corpus.
 
@@ -74,6 +76,30 @@ scan over 3+ byte needles looks worth building." Treat this as a directional
 signal from a synthetic corpus, not a decision by itself — a flat name
 distribution has no directory clustering, which a real volume's substring
 queries would exhibit.
+
+### Live-volume selectivity gate
+
+The maintained ignored harness (`SCRY_LIVE_SNAPSHOT=... cargo test -p
+scry-core --release live_selectivity_distribution -- --ignored --nocapture`)
+sampled 2,000 records from a 1,994,839-record snapshot. It deduplicated their
+1–5 byte prefixes, counted every substring match in one multi-pattern archive
+pass, and printed aggregates only—never sampled names.
+
+| Prefix bytes | distinct | selectivity p10 | p50 | p90 | block survival p50 | p90 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 42 | 3.77% | 25.53% | 55.97% | 100.00% | 100.00% |
+| 2 | 490 | 0.14% | 1.74% | 7.24% | 100.00% | 100.00% |
+| 3 | 953 | 0.01% | 0.10% | 0.90% | 27.19% | 55.82% |
+| 4 | 1,148 | 0.00% | 0.01% | 0.30% | 14.67% | 36.69% |
+| 5 | 1,245 | 0.00% | 0.00% | 0.17% | 6.98% | 25.19% |
+
+Median selectivity across all sampled 3–5 byte needles was **0.02%**, far
+below M2's 5% threshold. M2 therefore passes. This does **not** authorize plan
+023 as written: its static rank permutations accelerate Recent/Largest, while
+the default Relevance key depends on the current query and must stay on the
+filtered scan. Under the harsh storage/compaction budget, the XL design remains
+a no-go unless rewritten around default relevance or supported by workload
+evidence that non-default orderings dominate.
 
 ## Benchmark baseline (`cargo bench -p scry-core`)
 

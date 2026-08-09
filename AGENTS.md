@@ -179,6 +179,11 @@
   scan. Regex/wildcard queries use bounded must-contain HIR analysis and
   evaluate AND-of-OR literal clauses directly over the same rows. Patterns
   without a provable ASCII literal of at least 3 bytes still scan linearly.
+  A live 1,994,839-record distribution sampled 2,000 names: exact-match p50
+  was 0.10% for 3-byte prefixes, 0.01% for 4-byte prefixes, effectively zero
+  for 5-byte prefixes, and 0.02% across all sampled 3–5 byte needles. This
+  clears the old M2 selectivity gate but does not justify static rank-order
+  permutations for default `Relevance`, whose key is query-dependent.
 - **Ranking is one `u64` sort key per candidate** (`scry-core/src/rank.rs`), not a
   comparator or a trait object: the bounded top-k heap compares plain integers, and every
   key carries the record in its low 32 bits so the order is total and the record reads back
