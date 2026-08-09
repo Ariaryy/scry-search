@@ -322,6 +322,7 @@ fn materialize(c: &mut Criterion) {
         let hits: Vec<Hit> = (0..count as u32)
             .map(|record| Hit {
                 record,
+                rank_bits: 0,
                 size: 0,
                 mtime: 0,
                 is_dir: false,

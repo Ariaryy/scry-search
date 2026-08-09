@@ -202,12 +202,17 @@
   `Order::needs_metadata` is what lets `Relevance` skip the cold `mtimes`/`sizes` reads and
   the other orderings skip the name decode.
 - **Matching, ranking and path reconstruction are three separate steps.** `search_hits`
-  returns `Hit`s (record, size, mtime, is_dir); `full_path` costs a parent-chain walk and a
+  returns `Hit`s (record, rank bits, size, mtime, is_dir); `full_path` costs a parent-chain walk and a
   `String` (~2.4–3.0 µs per hit, measured via the `materialize` criterion bench at 50/1000/20000
   hits on a 440k-record corpus) and happens only in `materialize_hits`. A consumer that counts,
   aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
-  (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
-  record indices from different volumes are not comparable. A later acceptance
+  compares the carried high 32 rank bits, then the stable volume slot and its
+  local record; record indices themselves are not comparable across volumes.
+  Cached refinement refreshes relevance rank bits for the narrower query before
+  merging. The extra `u32` occupies existing `Hit` padding (`size_of::<Hit>()`
+  remains 24), so a 20k-entry refinement cache does not grow. On the maintained
+  worst-case refinement probe this cut merge p50 from 2.225 ms to 26.3 us and
+  request p50 from 4.525 ms to 2.283 ms. A later materialization acceptance
   rerun measured 124.82 µs/50, 2.698 ms/1000, and 58.235 ms/20000—only
   1.31–1.39× better than the pre-018 baseline, not the plan's aspirational 3×.
   Since normal queries materialize 50, the remaining ~125 µs is not a priority
@@ -216,7 +221,8 @@
   covers base matching plus bounded-heap retention because substring and regex
   perform those operations in one streaming pass; calling it only "matching"
   would be misleading. `finalize_ns` covers the independently measurable live-
-  delta merge and final heap drain. Path-term search reports its complete hit
+  delta merge and final heap drain. `merge_ns` measures only the bounded
+  cross-volume/refinement merge before path reconstruction. Path-term search reports its complete hit
   selection in `select_ns` and leaves `finalize_ns` at zero because that pipeline
   is not split at the same boundary. Materialization and encoding remain separate.
 - **`scry --verbose` prints in-process CLI phase timings** for argument parsing,

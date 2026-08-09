@@ -9,6 +9,8 @@ pub struct QuerySpans {
     pub select_ns: u64,
     /// Merge live delta additions into the bounded heap and drain final hits.
     pub finalize_ns: u64,
+    /// Re-rank and truncate the already-bounded per-volume hit sets.
+    pub merge_ns: u64,
     pub materialize_ns: u64,
     pub encode_ns: u64,
     pub candidates: u64,

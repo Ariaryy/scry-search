@@ -62,6 +62,9 @@ impl SearchOptions {
 pub struct Hit {
     /// Index into the combined base-then-delta record space.
     pub record: u32,
+    /// Ordering-significant high half of the key used to retain this hit.
+    /// This is comparable across volumes; `record` is not.
+    pub rank_bits: u32,
     pub size: u64,
     pub mtime: u32,
     pub is_dir: bool,
@@ -94,6 +97,11 @@ mod tests {
             MAX_LIMIT
         );
         assert_eq!(SearchOptions::new(50).limit, 50);
+    }
+
+    #[test]
+    fn carried_rank_bits_do_not_grow_a_hit() {
+        assert_eq!(std::mem::size_of::<Hit>(), 24);
     }
 
     #[test]
@@ -2245,17 +2253,23 @@ fn sort_key(
 fn drain_heap(arena: &crate::ArchivedArena, delta: &Delta, heap: &mut BinaryHeap<u64>) -> Vec<Hit> {
     let mut hits = Vec::with_capacity(heap.len());
     while let Some(key) = heap.pop() {
-        hits.push(hit_for(arena, delta, rank::key_record(key)));
+        hits.push(hit_for(
+            arena,
+            delta,
+            rank::key_record(key),
+            rank::key_rank_bits(key),
+        ));
     }
     // The heap yields worst-first; the caller wants best-first.
     hits.reverse();
     hits
 }
 
-fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> Hit {
+fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32, rank_bits: u32) -> Hit {
     match record.checked_sub(arena.len() as u32) {
         None => Hit {
             record,
+            rank_bits,
             size: arena.size_bytes(record),
             mtime: arena.mtime(record),
             is_dir: arena.is_dir(record),
@@ -2264,6 +2278,7 @@ fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> Hit {
             let added = &delta.added[index as usize];
             Hit {
                 record,
+                rank_bits,
                 size: added.size_bytes,
                 mtime: added.mtime_secs,
                 is_dir: added.is_dir,

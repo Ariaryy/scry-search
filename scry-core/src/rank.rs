@@ -89,6 +89,13 @@ pub fn key_record(key: u64) -> u32 {
     key as u32
 }
 
+/// The ordering-significant half of a key. Unlike the low record bits, this
+/// value is comparable across independently numbered volume indexes.
+#[inline]
+pub fn key_rank_bits(key: u64) -> u32 {
+    (key >> 32) as u32
+}
+
 /// Retain `key` in a bounded top-`limit` max-heap if it beats the current
 /// worst retained candidate. Shared by every search loop that ranks while it
 /// scans — single-threaded, per-thread during a parallel scan, and the merge
@@ -121,6 +128,17 @@ mod tests {
             assert_eq!(key_record(recent_key(1_700_000_000, record)), record);
             assert_eq!(key_record(largest_key(9_001, record)), record);
         }
+    }
+
+    #[test]
+    fn rank_bits_discard_only_the_volume_local_record() {
+        assert_eq!(key_rank_bits(relevance_key(2, 40, 1)), 0x0200_0028);
+        assert_eq!(
+            key_rank_bits(relevance_key(2, 40, 1)),
+            key_rank_bits(relevance_key(2, 40, u32::MAX))
+        );
+        assert_eq!(key_rank_bits(recent_key(123, 1)), !123);
+        assert_eq!(key_rank_bits(largest_key(456, 1)), !456);
     }
 
     #[test]

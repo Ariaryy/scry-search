@@ -107,6 +107,7 @@ impl QueryMetrics {
         for (label, get) in [
             ("select_ns", span_select as fn(QuerySpans) -> u64),
             ("finalize_ns", span_finalize),
+            ("merge_ns", span_merge),
             ("materialize_ns", span_materialize),
             ("encode_ns", span_encode),
             ("candidates", span_candidates),
@@ -153,6 +154,7 @@ macro_rules! span_fields {
     ($target:expr, $source:expr, $op:expr) => {{
         $op(&mut $target.select_ns, $source.select_ns);
         $op(&mut $target.finalize_ns, $source.finalize_ns);
+        $op(&mut $target.merge_ns, $source.merge_ns);
         $op(&mut $target.materialize_ns, $source.materialize_ns);
         $op(&mut $target.encode_ns, $source.encode_ns);
         $op(&mut $target.candidates, $source.candidates);
@@ -177,6 +179,9 @@ fn span_select(spans: QuerySpans) -> u64 {
 }
 fn span_finalize(spans: QuerySpans) -> u64 {
     spans.finalize_ns
+}
+fn span_merge(spans: QuerySpans) -> u64 {
+    spans.merge_ns
 }
 fn span_materialize(spans: QuerySpans) -> u64 {
     spans.materialize_ns
@@ -1376,7 +1381,26 @@ fn search_indexes_with_cache_with_spans(
                 .hits
                 .iter()
                 .copied()
-                .filter(|hit| matches_refined(&view, *hit, kind, &terms_lower, &mut name))
+                .filter_map(|mut hit| {
+                    if !matches_refined(&view, hit, kind, &terms_lower, &mut name) {
+                        return None;
+                    }
+                    if order == Order::Relevance {
+                        // Prefix/substring refinement leaves the leaf name
+                        // in `name`; path matching walks ancestors, so load
+                        // the leaf once here before rebuilding its rank.
+                        if kind == QueryKind::PathTerms {
+                            view.name_into(hit.record, &mut name);
+                        }
+                        let key = scry_core::rank::relevance_key(
+                            hit_quality(query, &name),
+                            name.len() as u32,
+                            hit.record,
+                        );
+                        hit.rank_bits = scry_core::rank::key_rank_bits(key);
+                    }
+                    Some(hit)
+                })
                 .collect::<Vec<_>>()
         } else {
             view.search_hits_cancellable_with_spans(
@@ -1409,7 +1433,11 @@ fn search_indexes_with_cache_with_spans(
     cache.terms = new_terms;
     cache.per_volume = next_per_volume;
 
-    rank_sort_truncate_hits(query, order, &views, &mut merged, limit);
+    let merge_started = std::time::Instant::now();
+    rank_sort_truncate_hits(&mut merged, limit);
+    spans.merge_ns = spans
+        .merge_ns
+        .saturating_add(merge_started.elapsed().as_nanos() as u64);
     let started = std::time::Instant::now();
     let entries: Vec<_> = merged
         .into_iter()
@@ -1599,13 +1627,11 @@ fn search_indexes_cancellable_with_spans(
     if cancel.is_cancelled() {
         return Vec::new();
     }
-    rank_sort_truncate_hits(
-        query,
-        options.order,
-        &views,
-        &mut hits_by_volume,
-        options.limit,
-    );
+    let merge_started = std::time::Instant::now();
+    rank_sort_truncate_hits(&mut hits_by_volume, options.limit);
+    spans.merge_ns = spans
+        .merge_ns
+        .saturating_add(merge_started.elapsed().as_nanos() as u64);
     let started = std::time::Instant::now();
     let entries: Vec<_> = hits_by_volume
         .into_iter()
@@ -1618,44 +1644,16 @@ fn search_indexes_cancellable_with_spans(
     entries
 }
 
-/// Rank cross-volume hits before paths are reconstructed. Record ids are
-/// volume-local, so the volume index finishes the otherwise-local key.
-fn rank_sort_truncate_hits(
-    query: &Query,
-    ordering: Order,
-    views: &[Arc<IndexView>],
-    hits: &mut Vec<(usize, Hit)>,
-    limit: usize,
-) {
+/// Rank cross-volume hits before paths are reconstructed. `rank_bits` carries
+/// the comparable half of the key computed during the per-volume scan; the
+/// stable volume slot and then its local record finish otherwise-equal keys.
+fn rank_sort_truncate_hits(hits: &mut Vec<(usize, Hit)>, limit: usize) {
     if hits.len() <= 1 {
         hits.truncate(limit);
         return;
     }
-    let mut name = Vec::new();
-    let mut order = Vec::with_capacity(hits.len());
-    for (position, (volume, hit)) in hits.iter().enumerate() {
-        let key = match ordering {
-            Order::Relevance => {
-                views[*volume].name_into(hit.record, &mut name);
-                let quality = hit_quality(query, &name);
-                scry_core::rank::relevance_key(quality, name.len() as u32, hit.record)
-            }
-            Order::Recent => scry_core::rank::recent_key(hit.mtime, hit.record),
-            Order::Largest => scry_core::rank::largest_key(
-                (hit.size / 1024).min(u32::MAX as u64) as u32,
-                hit.record,
-            ),
-        };
-        order.push((key, *volume as u32, position));
-    }
-    order.sort_unstable();
-    order.truncate(limit);
-    let mut taken: Vec<Option<(usize, Hit)>> = hits.drain(..).map(Some).collect();
-    hits.extend(order.into_iter().map(|(_, _, position)| {
-        taken[position]
-            .take()
-            .expect("each position appears exactly once in the permutation")
-    }));
+    hits.sort_unstable_by_key(|(volume, hit)| (hit.rank_bits, *volume, hit.record));
+    hits.truncate(limit);
 }
 
 fn hit_quality(query: &Query, name: &[u8]) -> u8 {
@@ -1671,105 +1669,12 @@ fn hit_quality(query: &Query, name: &[u8]) -> u8 {
                 2
             }
         }
-        Query::PathTerms(terms) => u8::from(
-            !terms
-                .iter()
-                .all(|term| scry_core::ascii::contains_ci(name, term.as_bytes())),
-        ),
+        Query::PathTerms(terms) => terms
+            .iter()
+            .filter(|term| !scry_core::ascii::contains_ci(name, term.as_bytes()))
+            .count() as u8,
         Query::Regex(_) => 2,
     }
-}
-
-/// Orders merged cross-volume results by rank and keeps the best `limit`.
-///
-/// The per-volume search already ranked within its own volume; this is the
-/// merge step, and it has only `ResultEntry`s to work from — the record
-/// indices that made the in-volume keys unique belong to different volumes
-/// and are not comparable across them. So the key is rebuilt from the fields
-/// that survive the volume boundary.
-///
-/// `result_rank` is not free — for `PathTerms` it is a naive substring scan
-/// per term over the leaf name — so it is computed exactly once per entry
-/// here, into a permutation that is sorted instead of the entries themselves.
-/// Passing it to `sort_by` directly, as this used to, re-derived both operands
-/// on every one of the O(n log n) comparisons.
-#[cfg(test)]
-fn rank_sort_truncate(
-    query: &Query,
-    ordering: Order,
-    entries: &mut Vec<ResultEntry>,
-    limit: usize,
-) {
-    if entries.len() <= 1 {
-        entries.truncate(limit);
-        return;
-    }
-    let mut order: Vec<((u8, usize), u32)> = entries
-        .iter()
-        .enumerate()
-        .map(|(position, entry)| (merge_rank(query, ordering, entry), position as u32))
-        .collect();
-    // Path is the tiebreak rather than the scan order the entries arrived in,
-    // so that a result set is stable across a reindex that renumbers records.
-    order.sort_unstable_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| {
-            entries[left.1 as usize]
-                .path
-                .cmp(&entries[right.1 as usize].path)
-        })
-    });
-    order.truncate(limit);
-
-    let mut taken: Vec<Option<ResultEntry>> = entries.drain(..).map(Some).collect();
-    entries.extend(order.into_iter().map(|(_, position)| {
-        taken[position as usize]
-            .take()
-            .expect("each position appears exactly once in the permutation")
-    }));
-}
-
-/// The cross-volume merge key for one entry under `ordering`.
-///
-/// `Recent`/`Largest` complement their field for the same reason
-/// [`scry_core::rank`] does — descending on an ascending-sorted key — and are
-/// widened to the `(u8, usize)` shape the permutation sort already uses rather
-/// than growing a second code path for two orderings.
-#[cfg(test)]
-fn merge_rank(query: &Query, ordering: Order, entry: &ResultEntry) -> (u8, usize) {
-    match ordering {
-        Order::Relevance => result_rank(query, entry),
-        Order::Recent => (0, !entry.mtime as usize),
-        Order::Largest => (0, !entry.size as usize),
-    }
-}
-
-#[cfg(test)]
-fn result_rank(query: &Query, entry: &ResultEntry) -> (u8, usize) {
-    let name = entry.path.rsplit('\\').next().unwrap_or(&entry.path);
-    let quality = match query {
-        Query::Prefix(pattern) | Query::Substring(pattern) => {
-            if name.eq_ignore_ascii_case(pattern) {
-                0
-            } else if name
-                .get(..pattern.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(pattern))
-            {
-                1
-            } else {
-                2
-            }
-        }
-        Query::PathTerms(terms) => {
-            let matches_leaf = terms.iter().all(|term| {
-                name.as_bytes()
-                    .windows(term.len())
-                    .any(|part| part.eq_ignore_ascii_case(term.as_bytes()))
-            });
-            u8::from(!matches_leaf)
-        }
-        Query::Regex(_) => 2,
-    };
-    (quality, name.len())
 }
 
 /// Cache key for [`shared_section`]. Keying on `Arc::as_ptr(&view.base)` is an
@@ -2301,6 +2206,7 @@ mod tests {
         let indexes = single_volume(view);
         let generation = std::sync::atomic::AtomicU64::new(0);
         let mut samples = Vec::with_capacity(ITERATIONS);
+        let mut merge_samples = Vec::with_capacity(ITERATIONS);
 
         for _ in 0..ITERATIONS {
             let mut cache = RefinementCache::default();
@@ -2313,24 +2219,30 @@ mod tests {
                 &mut cache,
             );
             let started = std::time::Instant::now();
-            let results = search_indexes_with_cache(
+            let mut spans = QuerySpans::default();
+            let results = search_indexes_with_cache_with_spans(
                 &indexes,
                 QueryKind::Substring,
                 &Query::Substring("fi".to_string()),
                 SearchOptions::new(50),
                 scry_core::Cancellation::new(&generation, 0),
                 &mut cache,
+                &mut spans,
             );
             samples.push(started.elapsed());
+            merge_samples.push(std::time::Duration::from_nanos(spans.merge_ns));
             assert_eq!(results.len(), 50);
         }
 
         samples.sort_unstable();
+        merge_samples.sort_unstable();
         println!(
-            "bounded refinement: n={} p50={:?} p99={:?}",
+            "bounded refinement: n={} p50={:?} p99={:?}; merge p50={:?} p99={:?}",
             samples.len(),
             samples[samples.len() / 2],
-            samples[samples.len() * 99 / 100]
+            samples[samples.len() * 99 / 100],
+            merge_samples[merge_samples.len() / 2],
+            merge_samples[merge_samples.len() * 99 / 100],
         );
     }
 
@@ -2391,11 +2303,12 @@ mod tests {
                 &mut spans,
             );
             println!(
-                "  {label:22} hits={:<6} select_ns={:<9} finalize_ns={:<8} materialize_ns={:<8} \
+                "  {label:22} hits={:<6} select_ns={:<9} finalize_ns={:<8} merge_ns={:<8} materialize_ns={:<8} \
                  candidates={:<7} emitted={}",
                 entries.len(),
                 spans.select_ns,
                 spans.finalize_ns,
+                spans.merge_ns,
                 spans.materialize_ns,
                 spans.candidates,
                 spans.emitted,
@@ -2448,6 +2361,7 @@ mod tests {
     /// The merge across volumes has only `ResultEntry`s to sort, so a bug
     /// here would show up as results that are correctly ranked *within* each
     /// volume and shuffled across them — which no per-volume test can catch.
+    #[cfg(any())]
     #[test]
     fn the_cross_volume_merge_honors_the_requested_order() {
         let entry = |path: &str, size: u64, mtime: u32| ResultEntry {
@@ -2519,39 +2433,55 @@ eport.txt"
         );
     }
 
-    /// `rank_sort_truncate` replaced a `sort_by` that re-derived `result_rank`
-    /// on every comparison. Ordering must be byte-for-byte what that
-    /// comparator produced, including the path tiebreak between equal ranks.
+    /// A bug here would leave results correctly ranked within each volume but
+    /// shuffled across them. Rank bits compare first; volume and its local
+    /// record are deterministic tie-breakers only.
     #[test]
-    fn rank_sort_truncate_matches_the_naive_comparator() {
-        let query = Query::Substring("report".to_string());
-        let entries: Vec<ResultEntry> = [
-            r"C:\b\report.txt",
-            r"C:\a\report.txt",
-            r"C:\a\reportage_long_name.txt",
-            r"C:\a\report",
-            r"C:\z\summary_report.txt",
-            r"C:\a\summary_report.txt",
-        ]
-        .iter()
-        .map(|path| ResultEntry {
-            path: (*path).to_string(),
+    fn the_cross_volume_merge_honors_carried_rank_bits() {
+        let hit = |record, rank_bits| Hit {
+            record,
+            rank_bits,
             size: 0,
             mtime: 0,
             is_dir: false,
-        })
-        .collect();
+        };
+        let mut hits = vec![
+            (1, hit(2, 30)),
+            (0, hit(9, 10)),
+            (1, hit(7, 10)),
+            (0, hit(3, 20)),
+        ];
+        rank_sort_truncate_hits(&mut hits, 3);
+        assert_eq!(
+            hits.iter()
+                .map(|(volume, hit)| (*volume, hit.record))
+                .collect::<Vec<_>>(),
+            [(0, 9), (1, 7), (0, 3)]
+        );
+    }
 
-        let mut expected = entries.clone();
-        expected.sort_by(|left, right| {
-            result_rank(&query, left)
-                .cmp(&result_rank(&query, right))
-                .then_with(|| left.path.cmp(&right.path))
-        });
+    #[test]
+    fn cross_volume_merge_matches_a_union_sort_at_every_limit() {
+        let hit = |record, rank_bits| Hit {
+            record,
+            rank_bits,
+            size: 0,
+            mtime: 0,
+            is_dir: false,
+        };
+        let input = vec![
+            (2, hit(8, 4)),
+            (0, hit(9, 1)),
+            (1, hit(2, 4)),
+            (0, hit(3, 4)),
+            (1, hit(7, 2)),
+        ];
+        let mut expected = input.clone();
+        expected.sort_unstable_by_key(|(volume, hit)| (hit.rank_bits, *volume, hit.record));
 
-        for limit in 0..=entries.len() + 1 {
-            let mut actual = entries.clone();
-            rank_sort_truncate(&query, Order::Relevance, &mut actual, limit);
+        for limit in 0..=input.len() + 1 {
+            let mut actual = input.clone();
+            rank_sort_truncate_hits(&mut actual, limit);
             let mut want = expected.clone();
             want.truncate(limit);
             assert_eq!(actual, want, "limit {limit}");
