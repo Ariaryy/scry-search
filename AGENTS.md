@@ -119,6 +119,12 @@
   working set 1.95–3.04 MB. This validates the absolute target and bounded growth
   at the measured scale; the old roughly 2M-record baseline was not rerun at the
   same scale, so do not present this as a like-for-like throughput comparison.
+  Idle durability uses an adaptive schedule rather than treating every
+  30-second journal lull as permission to rewrite the whole snapshot:
+  structural deltas persist after ten minutes without another structural
+  change, cursor-only progress checkpoints at most hourly, and failed writes
+  back off for five minutes. The worker still polls every 30 seconds (no disk
+  I/O), while 5% compaction and clean shutdown remain immediate write points.
 - **Client-local queries use an anonymous read-only section** for the immutable
   base plus a serialized delta overlay in the same generation response. Handle
   duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients
