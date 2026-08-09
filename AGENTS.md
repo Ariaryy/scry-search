@@ -29,6 +29,11 @@
   O(1). The parent column comes off a live volume and may contain cycles, self-parents
   and dangling indices; `dfs::build` still assigns every record exactly one position
   (cycle members become pseudo-roots), so `dfs_positions` is always a total permutation.
+  A raw parent edge is part of that canonical forest only when the child's DFS position
+  lies inside the raw parent's stored subtree; `Arena::tree_parent` and
+  `ArchivedArena::tree_parent` apply that O(1) test. All path reconstruction and
+  ancestor matching must use `tree_parent`, not the raw `parent`, so a corrupt cycle
+  cannot give materialized paths ancestry that interval search cannot represent.
   The traversal is iterative on purpose — a recursive DFS overflows the stack on a
   deep or corrupt parent chain.
 - **Recursive directory sizes are a prefix sum over `sizes`, laid out in the same
@@ -131,8 +136,9 @@
   its own `IntervalSet` (`scry-core/src/intervals.rs`) from an independent
   trigram-filtered scan: a directory match pushes its whole `subtree()` span,
   a name match pushes a single point. The answer is the intersection of all
-  terms' interval sets, folded smallest-first; an empty set at any term short-
-  circuits the whole query before the intersection or the final scan runs.
+  terms' interval sets, folded smallest-first. An empty base set short-circuits
+  later term scans only when no live delta name can supply that term; otherwise
+  the remaining base sets are still needed to evaluate delta records correctly.
   Delta records have no DFS position, so they're handled by a separate,
   unconditional linear walk up each addition's ancestor chain, testing base
   containment via the same interval sets. Never intersect trigram candidate
@@ -185,10 +191,14 @@
   the RPC query dominated at ~100–170 ms. Process wall time added ~20–25 ms outside
   `main`. A no-match path-term query now costs microseconds in-process (~37 µs,
   measured via the `path_terms/no_match` criterion bench on a 440k-record corpus)
-  rather than a fixed per-query pass over every directory — the interval-algebra
-  rewrite's early exit means an empty term short-circuits the whole query before
-  any scan or intersection runs. Treat these as diagnostic local measurements, not
-  a regression benchmark.
+  rather than a fixed per-query pass over every directory. On the live two-volume
+  index, 200 process-per-query samples of a generic absent term measured 0.853 ms
+  p50 / 6.449 ms p99 query round trip; over one steady client connection the same
+  query measured 0.020 ms p50 / 0.334 ms p99. A generic selective two-term query
+  measured 21.449 ms p50 / 24.197 ms p99 across 200 cold connections. The early
+  exit is valid only when neither the base nor a live delta name can supply the
+  empty term. Treat these as diagnostic local measurements, not a regression
+  benchmark.
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
