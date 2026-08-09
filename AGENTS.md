@@ -244,7 +244,14 @@
   Each volume gets its own `IndexView`, watcher, and snapshot; queries fan out and merge
   through the same bounded top-k heap used within a single volume. Initial indexing is
   serialized across volumes to bound peak RSS and disk load; steady-state watching is
-  concurrent. Peak-RSS and idle-reindex measurements across volumes are still outstanding.
+  concurrent. Full enumeration deliberately stays at normal Windows thread
+  priority: in an equally warmed 1.995M-record comparison at the default
+  128 MiB/s cap, background mode changed concurrent generic-query p99 from
+  133.595 ms to 133.955 ms and wall time from 25.736 s to 26.072 s, firing the
+  plan's no-improvement STOP condition. `compact_view` retains its scoped
+  `BackgroundModeGuard`; full enumeration uses the explicit aggregate token
+  bucket instead. A two-volume 10-minute idle run recorded zero reindexes and
+  an 89.7 MB peak working set across ~2.7M records.
 - **C ABI export for the SDK is not implemented.** `scry-client` is Rust-only for now; non-Rust
   consumers would need a `cdylib` shim over `scry-ipc`'s framing.
 - **`daemon-release` Cargo profile exists but isn't wired to any build script** — `scryd` currently
