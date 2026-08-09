@@ -38,6 +38,31 @@ pub struct Client {
 }
 
 impl Client {
+    /// A daemon creates the next named-pipe instance immediately after
+    /// accepting the previous one, but there is a small interval where
+    /// `CreateFileW` reports ERROR_FILE_NOT_FOUND rather than PIPE_BUSY.
+    /// Initial connections should still fail fast when no daemon exists;
+    /// only this known-live fallback path retries that transient gap.
+    fn reconnect_for_rpc_fallback(&mut self) -> anyhow::Result<()> {
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match scry_ipc::connect_client(&self.pipe_name) {
+                Ok(pipe) => {
+                    self.pipe = pipe;
+                    return Ok(());
+                }
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub fn connect() -> anyhow::Result<Self> {
         Self::connect_to(scry_ipc::PIPE_NAME)
     }
@@ -203,7 +228,7 @@ impl Client {
             let shared = match shared {
                 Ok(shared) => shared,
                 Err(_) => {
-                    self.pipe = scry_ipc::connect_client(&self.pipe_name)?;
+                    self.reconnect_for_rpc_fallback()?;
                     return self.query_ordered(kind, pattern, limit, order);
                 }
             };
