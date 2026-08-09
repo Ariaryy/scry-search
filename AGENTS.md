@@ -65,11 +65,55 @@
   are applied to a `Delta` (a bitset of tombstoned base indices plus a `Vec` of
   added records) and published together with the base through one
   `ArcSwap<IndexView>` — never two, or a reader could pair a new base with a
-  stale delta. The delta is compacted into a new base by streaming merge (no
-  MFT re-enumeration) once it exceeds 5% of base size. Full reindex remains the
-  fallback whenever an event can't be applied confidently, whenever the event
-  channel overflowed, and on startup. Deletes use an FRN-to-index `.frn`
-  sidecar kept out of the hot mmap so it stays evicted between bursts.
+  stale delta. The delta is compacted into a new base once it exceeds 5% of
+  base size, without MFT re-enumeration and without ever materializing an
+  owned `Arena`: `IndexView::compact_to_snapshot` (`scry-core/src/view.rs`)
+  merges base survivors and live delta additions straight into file-backed
+  spools (`scry-core/src/spool.rs`) via `SpooledArenaBuilder`
+  (`scry-core/src/arena.rs`), builds the `dfs_*` columns in a second pass
+  over the finished (file-backed) parent column (`dfs::build_file_backed`,
+  `scry-core/src/dfs.rs` — same iterative, corrupt-parent-tolerant traversal
+  as `dfs::build`, just spool-backed scratch and outputs instead of `Vec`),
+  serializes the same v9 archive layout straight from those spools via a
+  hand-written `rkyv::Archive`/`Serialize`
+  impl on `ArenaColumns` (`scry-core/src/store.rs`) that drives the same
+  `ArchivedVec` primitives the derived `Arena` impl would — proven
+  byte-identical to the derived path by
+  `save_columns_with_matches_save_with_byte_for_byte`, then merges the FRN
+  sidecar by walking the already frn-sorted base sidecar alongside the small
+  sorted delta-FRN list (`FrnMap::save_streaming`, `scry-core/src/frnmap.rs`)
+  instead of collecting a full-size `Vec<FrnEntry>`. The snapshot header's
+  generation tag is copied into the sidecar and checked when opening, so a
+  crash between the two independent renames can only make the sidecar get
+  ignored; it cannot pair indices from different generations. A mutable mmap's
+  dirty pages are written back to the backing file and counted by Windows
+  as "Mapped File" memory (`WorkingSetSize`), not `PrivateUsage`, so this
+  keeps compaction's transient heap footprint far below an owned-`Arena`
+  merge regardless of index size. Every spool/scratch file lives under a
+  per-volume scratch directory and is deleted on drop; each one is passed
+  through the same `on_create` auxiliary-marking hook as the final snapshot
+  (see the self-write accounting note above and `compaction_scratch_names`
+  in `scry-daemon/src/main.rs`). Full reindex remains the fallback whenever
+  an event can't be applied confidently, whenever the event channel
+  overflowed, and on startup. Deletes use an FRN-to-index `.frn` sidecar
+  kept out of the hot mmap so it stays evicted between bursts.
+  `compact_to_snapshot` takes an `on_phase` callback fired after merge,
+  dfs_build, prefix_sums, serialize, and frn_merge, purely so a caller can
+  sample process memory between phases (`SCRY_COMPACTION_MEM_PROBE=1` in
+  `scry-daemon`); it costs nothing when the callback is a no-op. The event burst
+  is explicitly dropped after its records have been copied into `Delta`, before
+  compaction starts — retaining both copies was enough to miss the absolute
+  private-memory target even though the writer itself was bounded. Measured on
+  an elevated dedicated NTFS test volume, adding 12,000 records to a 224,231-
+  record base produced a 236,232-record snapshot in 0.846 s. Continuous external
+  sampling and the phase probe agreed on a 29,229,056-byte peak `PrivateUsage`
+  (only ~20 KB above compaction start); sampled `WorkingSet` peaked at 29,126,656
+  bytes as mapped spool pages were touched. A subsequent ten-minute idle run
+  sampled the daemon once per second: zero read/write bytes, reindexes,
+  compactions, or idle-persist writes; private commit stayed 18.43–18.50 MB and
+  working set 1.95–3.04 MB. This validates the absolute target and bounded growth
+  at the measured scale; the old roughly 2M-record baseline was not rerun at the
+  same scale, so do not present this as a like-for-like throughput comparison.
 - **Client-local queries use an anonymous read-only section** for the immutable
   base plus a serialized delta overlay in the same generation response. Handle
   duplication targets the PID reported by `GetNamedPipeClientProcessId`; clients
