@@ -197,7 +197,11 @@
   hits on a 440k-record corpus) and happens only in `materialize_hits`. A consumer that counts,
   aggregates, or renders lazily should stop at `Hit`. The daemon's cross-volume merge
   (`rank_sort_truncate`/`merge_rank`) rebuilds a key from `ResultEntry` fields instead —
-  record indices from different volumes are not comparable.
+  record indices from different volumes are not comparable. A later acceptance
+  rerun measured 124.82 µs/50, 2.698 ms/1000, and 58.235 ms/20000—only
+  1.31–1.39× better than the pre-018 baseline, not the plan's aspirational 3×.
+  Since normal queries materialize 50, the remaining ~125 µs is not a priority
+  without a new profile.
 - **Daemon query spans reflect the fused top-k implementation.** `select_ns`
   covers base matching plus bounded-heap retention because substring and regex
   perform those operations in one streaming pass; calling it only "matching"
@@ -220,12 +224,21 @@
   exit is valid only when neither the base nor a live delta name can supply the
   empty term. Treat these as diagnostic local measurements, not a regression
   benchmark.
+- **A one-byte, high-selectivity PathTerms query remains pathological.** Ten
+  real two-volume `scry --verbose a` samples measured 1.19–1.25 s warm, so plan
+  018's `<250 ms` acceptance gate is not met even though streaming substring
+  benchmarks improved 1.57–3.71×. Plain CLI queries intentionally use
+  PathTerms; changing a single term to Substring would change ancestor-match
+  semantics. Treat this as a separate parallel-interval/product decision, not
+  unfinished streaming-top-k cleanup.
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
   different records. Refinement terms are ASCII-normalized once per request and
   borrowed by every cached-hit predicate; do not move case folding back inside
-  the up-to-20,000-hit filter loop.
+  the up-to-20,000-hit filter loop. An attributable 30,000-record before/after
+  probe measured the 20,000-candidate second keystroke at 12.753→4.625 ms p50
+  and 19.597→5.198 ms p99 (2.76×/3.77×).
 - **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
   saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
   it 0 because USN records do not carry size, so 0 means unknown rather than

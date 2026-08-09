@@ -137,6 +137,40 @@ Corpus: 440,001 records, 40,001 directories, mean depth 5.8, max depth 7.
 materialized entry costing one bounded parent-chain walk regardless of how
 many candidates were scanned to find it.
 
+### Post-017/018 acceptance rerun
+
+The maintained Criterion suite was rerun after all later plans, on the same
+440,001-record deterministic corpus:
+
+| benchmark | recorded baseline | current median | speedup |
+|---|---:|---:|---:|
+| `materialize/50` | 174 µs | 124.82 µs | 1.39× |
+| `materialize/1000` | 3.53 ms | 2.698 ms | 1.31× |
+| `materialize/20000` | 78.60 ms | 58.235 ms | 1.35× |
+| `substring/high` | 54.94 ms | 14.812 ms | 3.71× |
+| `substring/medium` | 11.07 ms | 3.274 ms | 3.38× |
+| `substring/low` | 1.97 ms | 1.258 ms | 1.57× |
+
+Plan 018's streaming/top-k substring work is a large, meaningful win, but its
+separate **3× materialization target was missed**. At the normal result limit,
+the remaining materialization cost is about 125 µs for 50 paths; further work
+there is not justified by the harsh compute budget without a new profile.
+
+The plan's real `scry --verbose a <250 ms` gate also remains missed. Ten queries
+against the running two-volume daemon measured 1.19–1.25 s warm (1.55 s first
+run). Plain CLI input is a PathTerms query, and a one-byte, extremely common
+term is the interval algorithm's pathological full-scan/double-decode case—not
+the now-fast streaming substring path. Fixing it requires a new decision about
+single-term CLI semantics or parallel interval construction; it is not a safe
+extension of plan 018.
+
+Plan 017 has an attributable direct comparison. The same release-mode
+30,000-record test timed only the second keystroke that overscans 20,000
+candidates: the pre-017 parent took 12.753 ms p50 / 19.597 ms p99; current code
+took 4.625 ms / 5.198 ms. The **2.76× p50 and 3.77× p99 improvements** clear its
+2× gate, while the existing counter test proves no more than the final limit is
+materialized.
+
 ## Materialization call count
 
 The span report above shows the first `"l"` query scanning 2,690 candidates
