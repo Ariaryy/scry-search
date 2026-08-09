@@ -661,14 +661,12 @@ fn compact_view(
     auxiliary_marking_enabled: bool,
 ) -> anyhow::Result<Arc<IndexView>> {
     let _background = BackgroundModeGuard::enter();
-    let (mut arena, mut frns) = view.compact();
-    arena.journal_id = view.journal_id;
-    arena.next_usn = view.next_usn;
-    arena.volume_serial = view.volume_serial;
     let path = snapshot_path(volume);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let scratch_dir = compaction_scratch_dir(volume);
+    std::fs::create_dir_all(&scratch_dir)?;
     let host = hosting_volume(&path);
     let mark = |file: &std::fs::File| {
         if auxiliary_marking_enabled {
@@ -682,8 +680,30 @@ fn compact_view(
             }
         }
     };
-    scry_core::store::save_with_sidecar(&arena, &mut frns, &path, mark, mark)?;
+    let mem_probe_enabled = std::env::var_os("SCRY_COMPACTION_MEM_PROBE").is_some();
+    let mut on_phase = |phase: &str| {
+        if mem_probe_enabled {
+            eprintln!("scryd: compact[{volume}] {phase}: {:?}", process_memory());
+        }
+    };
+    if mem_probe_enabled {
+        eprintln!("scryd: compact[{volume}] start: {:?}", process_memory());
+    }
+    view.compact_to_snapshot(&scratch_dir, &path, &mark, &mut on_phase)?;
     Ok(Arc::new(IndexView::new(Arc::new(ArenaStore::open(&path)?))))
+}
+
+/// Scratch directory for one volume's compaction spools, next to that
+/// volume's snapshot. Every file created under it is removed automatically
+/// when its `Spool`/`ByteSpool` drops; the directory itself is left in place
+/// between runs so repeated compactions don't pay repeated `create_dir_all`
+/// races, but it holds nothing durable.
+fn compaction_scratch_dir(volume: &str) -> std::path::PathBuf {
+    let safe: String = volume.chars().filter(|c| c.is_alphanumeric()).collect();
+    snapshot_path(volume)
+        .parent()
+        .expect("snapshot path always has a parent")
+        .join(format!("compact-{safe}"))
 }
 
 struct BackgroundModeGuard;
@@ -764,12 +784,48 @@ fn snapshot_file_names(volume: &str) -> [String; 4] {
     ]
 }
 
-/// Every snapshot filename that could land on `watched_volume`'s journal:
-/// not just `watched_volume`'s own snapshot, but any other indexed volume's
-/// snapshot too, since they all live under the same `%LOCALAPPDATA%` and so
-/// may physically share a hosting drive. Without this, a daemon watching C:
-/// while also indexing D: sees D:'s snapshot write (physically on C:) as an
-/// unrecognized file and reindexes C: for no real change.
+/// Every filename `compact_to_snapshot` can create under `volume`'s scratch
+/// directory (plus the scratch directory's own name), so its `Created`
+/// events can be recognized the same way the final snapshot's can. Must be
+/// kept in sync with every `dir.join(...)` in `SpooledArenaBuilder::new` and
+/// `dfs::build_file_backed`/`FileBackedChildTable::build`, plus the
+/// `dfs-size-prefix.spool` file `IndexView::compact_to_snapshot` creates
+/// directly — a spool this list omits would retrigger a reindex of whichever
+/// volume hosts the scratch directory the moment it's created.
+fn compaction_scratch_names(volume: &str) -> Vec<String> {
+    let dir = compaction_scratch_dir(volume);
+    let mut names = vec![dir.file_name().unwrap().to_string_lossy().into_owned()];
+    names.extend(
+        [
+            "names.spool",
+            "bucket-offsets.spool",
+            "parents.spool",
+            "mtimes.spool",
+            "sizes.spool",
+            "trigram.spool",
+            "dfs-positions.spool",
+            "dfs-records.spool",
+            "dfs-subtree-ends.spool",
+            "dfs-visited.spool",
+            "dfs-stack.spool",
+            "dfs-starts.spool",
+            "dfs-children.spool",
+            "dfs-cursor.spool",
+            "dfs-size-prefix.spool",
+        ]
+        .iter()
+        .map(|name| (*name).to_string()),
+    );
+    names
+}
+
+/// Every snapshot and compaction-scratch filename that could land on
+/// `watched_volume`'s journal: not just `watched_volume`'s own snapshot, but
+/// any other indexed volume's snapshot and scratch files too, since they all
+/// live under the same `%LOCALAPPDATA%` and so may physically share a
+/// hosting drive. Without this, a daemon watching C: while also indexing D:
+/// sees D:'s snapshot write (physically on C:) as an unrecognized file and
+/// reindexes C: for no real change.
 fn owned_snapshot_names(
     watched_volume: &str,
     all_volumes: &[String],
@@ -779,6 +835,7 @@ fn owned_snapshot_names(
         let path = snapshot_path(volume);
         if hosting_volume(&path).as_deref() == Some(watched_volume) {
             names.extend(snapshot_file_names(volume));
+            names.extend(compaction_scratch_names(volume));
         }
     }
     names
@@ -911,6 +968,11 @@ fn reindex_on_changes(
                 break;
             }
         }
+        // Every structural name has now been copied into `delta`; retaining
+        // the burst alongside it through compaction pointlessly doubles the
+        // live event payload at exactly the phase whose private-memory budget
+        // is strictest.
+        drop(batch);
 
         if !needs_full_reindex {
             let next = Arc::new(IndexView {
@@ -2442,6 +2504,31 @@ eport.txt"
                 is_auxiliary: false,
             };
             assert!(!is_real_change(&renamed, &mut filter));
+        }
+    }
+
+    #[test]
+    fn a_sibling_volumes_compaction_scratch_write_never_triggers_this_volumes_reindex() {
+        // Compaction's spool files land in the same scratch directory
+        // structure as the snapshot itself, on the same hosting drive, so
+        // they need the identical name-based fallback treatment.
+        let host = hosting_volume(&snapshot_path("D:")).expect("snapshot path has a drive letter");
+        let all_volumes = vec![host.clone(), "D:".to_string()];
+        let mut filter = SelfWriteFilter::new(&host, &all_volumes, false);
+
+        for name in compaction_scratch_names("D:") {
+            let created = ChangeEvent::Created {
+                frn: 10,
+                parent_frn: 0,
+                name: name.clone(),
+                is_dir: false,
+                is_auxiliary: false,
+            };
+            assert!(
+                !is_real_change(&created, &mut filter),
+                "{name} is D:'s own compaction scratch file, physically hosted on {host}; \
+                 {host}'s watcher must not treat writing it as a real change"
+            );
         }
     }
 

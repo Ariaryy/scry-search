@@ -7,6 +7,7 @@ use rkyv::ser::serializers::{
     WriteSerializer,
 };
 use rkyv::ser::Serializer as _;
+use rkyv::vec::{ArchivedVec, VecResolver};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -37,10 +38,35 @@ pub enum StoreError {
 /// a byte of it.
 const MAGIC: [u8; 8] = *b"SCRYIDX\0";
 
-/// Magic, version, and four reserved bytes. Sixteen rather than twelve so the
-/// archive stays 8-aligned behind it — the archive contains `u64` fields, and
-/// rkyv's validator rejects a misaligned buffer.
+/// Magic, version, and a snapshot generation tag. Sixteen rather than twelve
+/// so the archive stays 8-aligned behind it — the archive contains `u64`
+/// fields, and rkyv's validator rejects a misaligned buffer. The tag pairs a
+/// snapshot with its separately-renamed FRN sidecar; zero means unpaired.
 const HEADER_LEN: usize = 16;
+
+pub(crate) fn fresh_snapshot_tag() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = elapsed.as_nanos() as u64;
+    let sequence = NEXT.fetch_add(0x9e37_79b9, Ordering::Relaxed);
+    let tag = (nanos as u32) ^ ((nanos >> 32) as u32) ^ std::process::id() ^ sequence;
+    if tag == 0 {
+        1
+    } else {
+        tag
+    }
+}
+
+fn write_header(mut writer: impl Write, snapshot_tag: u32) -> std::io::Result<()> {
+    writer.write_all(&MAGIC)?;
+    writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    writer.write_all(&snapshot_tag.to_le_bytes())
+}
 
 /// Serializer that writes the archive straight to a `BufWriter<File>` instead
 /// of building it up in an in-memory `AlignedVec` first. Scratch space and the
@@ -76,8 +102,8 @@ pub fn to_bytes(arena: &Arena) -> Result<rkyv::AlignedVec, StoreError> {
     Ok(out)
 }
 
-/// Validates the header and returns the archive bytes behind it.
-fn split_header(bytes: &[u8]) -> Result<&[u8], StoreError> {
+/// Validates the header and returns the archive bytes and sidecar pairing tag.
+fn split_header(bytes: &[u8]) -> Result<(&[u8], u32), StoreError> {
     let header = bytes.get(..HEADER_LEN).ok_or(StoreError::BadMagic)?;
     if header[..8] != MAGIC {
         return Err(StoreError::BadMagic);
@@ -89,7 +115,8 @@ fn split_header(bytes: &[u8]) -> Result<&[u8], StoreError> {
             expected: FORMAT_VERSION,
         });
     }
-    Ok(&bytes[HEADER_LEN..])
+    let snapshot_tag = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+    Ok((&bytes[HEADER_LEN..], snapshot_tag))
 }
 
 /// Serialize an Arena to disk via rkyv. This is the only place allocation-heavy
@@ -106,14 +133,24 @@ pub fn save_with<F>(arena: &Arena, path: &Path, on_create: F) -> Result<(), Stor
 where
     F: FnOnce(&File),
 {
+    save_with_tag(arena, path, 0, on_create)
+}
+
+fn save_with_tag<F>(
+    arena: &Arena,
+    path: &Path,
+    snapshot_tag: u32,
+    on_create: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce(&File),
+{
     let tmp_path = path.with_extension("tmp");
     let file = {
         let f = File::create(&tmp_path)?;
         on_create(&f);
         let mut writer = BufWriter::new(f);
-        writer.write_all(&MAGIC)?;
-        writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
+        write_header(&mut writer, snapshot_tag)?;
 
         let mut serializer = StreamingSerializer::new(
             WriteSerializer::new(writer),
@@ -122,6 +159,203 @@ where
         );
         serializer
             .serialize_value(arena)
+            .map_err(|e| StoreError::Validation(e.to_string()))?;
+        let (writer, _, _) = serializer.into_components();
+        let mut buf_writer = writer.into_inner();
+        buf_writer.flush()?;
+        buf_writer
+            .into_inner()
+            .map_err(|e| StoreError::Io(e.into_error()))?
+    };
+    file.sync_all()?;
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+/// Stand-in for `&Arena` that lets compaction emit the v9 archive without
+/// ever materializing an owned `Arena`: scalar header fields plus a `&[T]`
+/// view into each column, which — unlike a real `Arena`'s fields — can be
+/// backed by a [`crate::spool::Spool`]'s mmap rather than a `Vec`.
+///
+/// Its [`rkyv::Archive`] `Archived` type is `ArchivedArena`, the *same* type
+/// `#[derive(Archive)]` generates for `Arena` — this hand-written impl below
+/// drives the same primitives (`rkyv::out_field!` for each field's offset,
+/// `ArchivedVec::resolve_from_len`/`serialize_copy_from_slice` for each `Vec`
+/// field) that the derived code would, just fed from borrowed slices instead
+/// of owned `Vec`s. Field order here matches `Arena`'s declaration order, so
+/// the emitted bytes match what `serializer.serialize_value(&arena)` would
+/// have produced from the equivalent owned `Arena` exactly. This keeps
+/// `FORMAT_VERSION` and `check_archived_root::<Arena>` unchanged — it is not
+/// a custom container, just a different producer for the same archive.
+pub struct ArenaColumns<'a> {
+    pub format_version: u32,
+    pub journal_id: u64,
+    pub next_usn: i64,
+    pub volume_serial: u64,
+    pub names: &'a [u8],
+    pub bucket_offsets: &'a [u32],
+    pub parents: &'a [u32],
+    pub mtimes: &'a [u32],
+    pub sizes: &'a [u32],
+    pub trigram_index: &'a [u8],
+    pub dfs_positions: &'a [u32],
+    pub dfs_records: &'a [u32],
+    pub dfs_ends: &'a [u32],
+    pub dfs_size_prefix: &'a [u64],
+}
+
+#[doc(hidden)]
+pub struct ArenaColumnsResolver {
+    names: VecResolver,
+    bucket_offsets: VecResolver,
+    parents: VecResolver,
+    mtimes: VecResolver,
+    sizes: VecResolver,
+    trigram_index: VecResolver,
+    dfs_positions: VecResolver,
+    dfs_records: VecResolver,
+    dfs_ends: VecResolver,
+    dfs_size_prefix: VecResolver,
+}
+
+impl rkyv::Archive for ArenaColumns<'_> {
+    type Archived = ArchivedArena;
+    type Resolver = ArenaColumnsResolver;
+
+    #[allow(clippy::unit_arg)]
+    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut ArchivedArena) {
+        let (fp, fo) = rkyv::out_field!(out.format_version);
+        rkyv::Archive::resolve(&self.format_version, pos + fp, (), fo);
+        let (fp, fo) = rkyv::out_field!(out.journal_id);
+        rkyv::Archive::resolve(&self.journal_id, pos + fp, (), fo);
+        let (fp, fo) = rkyv::out_field!(out.next_usn);
+        rkyv::Archive::resolve(&self.next_usn, pos + fp, (), fo);
+        let (fp, fo) = rkyv::out_field!(out.volume_serial);
+        rkyv::Archive::resolve(&self.volume_serial, pos + fp, (), fo);
+
+        let (fp, fo) = rkyv::out_field!(out.names);
+        ArchivedVec::resolve_from_len(self.names.len(), pos + fp, resolver.names, fo);
+        let (fp, fo) = rkyv::out_field!(out.bucket_offsets);
+        ArchivedVec::resolve_from_len(
+            self.bucket_offsets.len(),
+            pos + fp,
+            resolver.bucket_offsets,
+            fo,
+        );
+        let (fp, fo) = rkyv::out_field!(out.parents);
+        ArchivedVec::resolve_from_len(self.parents.len(), pos + fp, resolver.parents, fo);
+        let (fp, fo) = rkyv::out_field!(out.mtimes);
+        ArchivedVec::resolve_from_len(self.mtimes.len(), pos + fp, resolver.mtimes, fo);
+        let (fp, fo) = rkyv::out_field!(out.sizes);
+        ArchivedVec::resolve_from_len(self.sizes.len(), pos + fp, resolver.sizes, fo);
+        let (fp, fo) = rkyv::out_field!(out.trigram_index);
+        ArchivedVec::resolve_from_len(
+            self.trigram_index.len(),
+            pos + fp,
+            resolver.trigram_index,
+            fo,
+        );
+        let (fp, fo) = rkyv::out_field!(out.dfs_positions);
+        ArchivedVec::resolve_from_len(
+            self.dfs_positions.len(),
+            pos + fp,
+            resolver.dfs_positions,
+            fo,
+        );
+        let (fp, fo) = rkyv::out_field!(out.dfs_records);
+        ArchivedVec::resolve_from_len(self.dfs_records.len(), pos + fp, resolver.dfs_records, fo);
+        let (fp, fo) = rkyv::out_field!(out.dfs_ends);
+        ArchivedVec::resolve_from_len(self.dfs_ends.len(), pos + fp, resolver.dfs_ends, fo);
+        let (fp, fo) = rkyv::out_field!(out.dfs_size_prefix);
+        ArchivedVec::resolve_from_len(
+            self.dfs_size_prefix.len(),
+            pos + fp,
+            resolver.dfs_size_prefix,
+            fo,
+        );
+    }
+}
+
+impl<S: rkyv::ser::Serializer + ?Sized> rkyv::Serialize<S> for ArenaColumns<'_> {
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        // Safety: u8/u32/u64 have no padding and their archived
+        // representation equals their native one (no endian feature is
+        // enabled in this workspace), so a raw byte copy is copy-safe.
+        let names =
+            unsafe { ArchivedVec::<u8>::serialize_copy_from_slice(self.names, serializer)? };
+        let bucket_offsets = unsafe {
+            ArchivedVec::<u32>::serialize_copy_from_slice(self.bucket_offsets, serializer)?
+        };
+        let parents =
+            unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.parents, serializer)? };
+        let mtimes =
+            unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.mtimes, serializer)? };
+        let sizes =
+            unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.sizes, serializer)? };
+        let trigram_index = unsafe {
+            ArchivedVec::<u8>::serialize_copy_from_slice(self.trigram_index, serializer)?
+        };
+        let dfs_positions = unsafe {
+            ArchivedVec::<u32>::serialize_copy_from_slice(self.dfs_positions, serializer)?
+        };
+        let dfs_records =
+            unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.dfs_records, serializer)? };
+        let dfs_ends =
+            unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.dfs_ends, serializer)? };
+        let dfs_size_prefix = unsafe {
+            ArchivedVec::<u64>::serialize_copy_from_slice(self.dfs_size_prefix, serializer)?
+        };
+        Ok(ArenaColumnsResolver {
+            names,
+            bucket_offsets,
+            parents,
+            mtimes,
+            sizes,
+            trigram_index,
+            dfs_positions,
+            dfs_records,
+            dfs_ends,
+            dfs_size_prefix,
+        })
+    }
+}
+
+/// Like [`save_with`], but for [`ArenaColumns`] instead of an owned `Arena` —
+/// compaction's entry point, so it never has to build one.
+pub fn save_columns_with<F>(
+    columns: &ArenaColumns<'_>,
+    path: &Path,
+    on_create: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce(&File),
+{
+    save_columns_with_tag(columns, path, 0, on_create)
+}
+
+pub(crate) fn save_columns_with_tag<F>(
+    columns: &ArenaColumns<'_>,
+    path: &Path,
+    snapshot_tag: u32,
+    on_create: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce(&File),
+{
+    let tmp_path = path.with_extension("tmp");
+    let file = {
+        let f = File::create(&tmp_path)?;
+        on_create(&f);
+        let mut writer = BufWriter::new(f);
+        write_header(&mut writer, snapshot_tag)?;
+
+        let mut serializer = StreamingSerializer::new(
+            WriteSerializer::new(writer),
+            FallbackScratch::default(),
+            SharedSerializeMap::default(),
+        );
+        serializer
+            .serialize_value(columns)
             .map_err(|e| StoreError::Validation(e.to_string()))?;
         let (writer, _, _) = serializer.into_components();
         let mut buf_writer = writer.into_inner();
@@ -146,8 +380,14 @@ where
     FA: FnOnce(&File),
     FF: FnOnce(&File),
 {
-    save_with(arena, path, on_arena_create)?;
-    FrnMap::save_with(&path.with_extension("frn"), frns, on_sidecar_create)?;
+    let snapshot_tag = fresh_snapshot_tag();
+    save_with_tag(arena, path, snapshot_tag, on_arena_create)?;
+    FrnMap::save_with(
+        &path.with_extension("frn"),
+        frns,
+        snapshot_tag,
+        on_sidecar_create,
+    )?;
     Ok(())
 }
 
@@ -174,11 +414,11 @@ impl ArenaStore {
         // Header first, so a stale snapshot is reported as a version mismatch
         // rather than as a bytecheck failure over a layout that no longer
         // applies. Then validate once at open time (bytecheck), not per query.
-        let archive = split_header(&mmap[..])?;
+        let (archive, snapshot_tag) = split_header(&mmap[..])?;
         rkyv::check_archived_root::<Arena>(archive)
             .map_err(|e| StoreError::Validation(e.to_string()))?;
         let sidecar = path.with_extension("frn");
-        let frn_map = match FrnMap::open(&sidecar) {
+        let frn_map = match FrnMap::open(&sidecar, snapshot_tag) {
             Ok(map) => Some(map),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
@@ -214,7 +454,7 @@ impl ArenaStore {
 }
 
 pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
-    let archive = split_header(bytes)?;
+    let (archive, _) = split_header(bytes)?;
     rkyv::check_archived_root::<Arena>(archive)
         .map_err(|e| StoreError::Validation(e.to_string()))?;
     Ok(unsafe { rkyv::archived_root::<Arena>(archive) })
@@ -234,6 +474,88 @@ pub unsafe fn archived_bytes_validated(bytes: &[u8]) -> &ArchivedArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `save_columns_with` must emit exactly the archive `save_with` would
+    /// for the equivalent owned `Arena` — same header, same rkyv bytes — so
+    /// this compares full file contents, not just that `ArenaStore::open`
+    /// accepts the result.
+    #[test]
+    fn save_columns_with_matches_save_with_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = crate::arena::ArenaBuilder::default();
+        b.push("alpha", 10, true);
+        b.push("alpha/beta.txt", 20, false);
+        b.push("gamma.txt", 30, false);
+        for i in 0..(crate::trigram::TRIGRAM_BLOCK + crate::record::BUCKET_SIZE + 7) {
+            b.push(&format!("entry_{i:04}_shared_suffix.dat"), i as u32, false);
+        }
+        let (mut arena, _) = b.build();
+        arena.journal_id = 42;
+        arena.next_usn = 7;
+        arena.volume_serial = 99;
+
+        let derived_path = dir.path().join("derived.rkyv");
+        save(&arena, &derived_path).unwrap();
+
+        let columns = ArenaColumns {
+            format_version: arena.format_version,
+            journal_id: arena.journal_id,
+            next_usn: arena.next_usn,
+            volume_serial: arena.volume_serial,
+            names: &arena.names,
+            bucket_offsets: &arena.bucket_offsets,
+            parents: &arena.parents,
+            mtimes: &arena.mtimes,
+            sizes: &arena.sizes,
+            trigram_index: &arena.trigram_index,
+            dfs_positions: &arena.dfs_positions,
+            dfs_records: &arena.dfs_records,
+            dfs_ends: &arena.dfs_ends,
+            dfs_size_prefix: &arena.dfs_size_prefix,
+        };
+        let manual_path = dir.path().join("manual.rkyv");
+        save_columns_with(&columns, &manual_path, |_| {}).unwrap();
+
+        assert_eq!(
+            std::fs::read(&derived_path).unwrap(),
+            std::fs::read(&manual_path).unwrap()
+        );
+
+        // And the manually-produced archive must actually validate and read
+        // back correctly through the normal open path.
+        let store = ArenaStore::open(&manual_path).unwrap();
+        let reopened = store.archived();
+        assert_eq!(reopened.len(), arena.len());
+        let mut name = Vec::new();
+        reopened.name_into(1, &mut name);
+        assert_eq!(name, b"alpha/beta.txt");
+    }
+
+    #[test]
+    fn open_ignores_a_sidecar_from_another_snapshot_generation() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut first_builder = crate::arena::ArenaBuilder::default();
+        first_builder.push_bytes_with_frn(b"first", 0, false, 11);
+        let (first, mut first_frns) = first_builder.build();
+        let first_path = dir.path().join("first.rkyv");
+        save_with_sidecar(&first, &mut first_frns, &first_path, |_| {}, |_| {}).unwrap();
+        assert!(ArenaStore::open(&first_path).unwrap().frn_map.is_some());
+
+        let mut second_builder = crate::arena::ArenaBuilder::default();
+        second_builder.push_bytes_with_frn(b"second", 0, false, 22);
+        let (second, mut second_frns) = second_builder.build();
+        let second_path = dir.path().join("second.rkyv");
+        save_with_sidecar(&second, &mut second_frns, &second_path, |_| {}, |_| {}).unwrap();
+
+        std::fs::copy(
+            second_path.with_extension("frn"),
+            first_path.with_extension("frn"),
+        )
+        .unwrap();
+        let reopened = ArenaStore::open(&first_path).unwrap();
+        assert!(reopened.frn_map.is_none());
+    }
 
     #[test]
     fn open_diagnoses_a_stale_or_alien_snapshot_from_the_header() {

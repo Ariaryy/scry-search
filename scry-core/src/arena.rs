@@ -3,8 +3,12 @@ use crate::frnmap::FrnEntry;
 use crate::record::{
     bytes_to_size_kib, pack_parent, unpack_parent, word_is_dir, BUCKET_SIZE, PARENT_NONE,
 };
+use crate::spool::{ByteSpool, Spool};
 use crate::trigram::{for_each_trigram, num_blocks, row_bytes, TRIGRAM_BLOCK, TRIGRAM_ROWS};
 use rkyv::{Archive, Deserialize, Serialize};
+use std::fs::File;
+use std::io;
+use std::path::Path;
 
 /// The full index: entries in name-sorted order, names front-coded in a
 /// separate blob, version-stamped for safe mmap reuse across daemon upgrades.
@@ -192,6 +196,73 @@ impl FrontCoder {
         self.offsets.push(self.blob.len() as u32); // sentinel
         (self.blob, self.offsets)
     }
+}
+
+/// Spool-backed twin of [`FrontCoder`], for [`SpooledArenaBuilder`]: same
+/// incremental front-coding and bucket-boundary logic, byte-identical output
+/// to `FrontCoder` given the same names in the same order, but `blob` and
+/// `offsets` are mmap-backed instead of heap `Vec`s. `prev` stays a small
+/// heap `Vec` — bounded by one name's length, not by record count.
+struct SpooledFrontCoder {
+    blob: ByteSpool,
+    offsets: Spool<u32>,
+    prev: Vec<u8>,
+    pos_in_bucket: usize,
+    absolute_index: usize,
+}
+
+impl SpooledFrontCoder {
+    fn push(&mut self, name: &[u8], trigram_index: &mut Spool<u8>, row_len: usize) {
+        index_trigrams_spooled(self.absolute_index, name, trigram_index, row_len);
+        if self.pos_in_bucket == 0 {
+            self.offsets.push(self.blob.len() as u32);
+            write_varint_spooled(&mut self.blob, name.len() as u32);
+            self.blob.extend_from_slice(name);
+        } else {
+            let shared = common_prefix_len(&self.prev, name);
+            write_varint_spooled(&mut self.blob, shared as u32);
+            let suffix = &name[shared..];
+            write_varint_spooled(&mut self.blob, suffix.len() as u32);
+            self.blob.extend_from_slice(suffix);
+        }
+        self.prev.clear();
+        self.prev.extend_from_slice(name);
+        self.absolute_index += 1;
+        self.pos_in_bucket += 1;
+        if self.pos_in_bucket == BUCKET_SIZE {
+            self.pos_in_bucket = 0;
+        }
+    }
+
+    fn finish(mut self) -> (ByteSpool, Spool<u32>) {
+        self.offsets.push(self.blob.len() as u32); // sentinel
+        (self.blob, self.offsets)
+    }
+}
+
+fn write_varint_spooled(out: &mut ByteSpool, mut v: u32) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        } else {
+            out.push(byte | 0x80);
+        }
+    }
+}
+
+fn index_trigrams_spooled(index: usize, name: &[u8], matrix: &mut Spool<u8>, row_len: usize) {
+    if matrix.is_empty() {
+        return;
+    }
+    let block = index / TRIGRAM_BLOCK;
+    for_each_trigram(name, |hash| {
+        let i = hash as usize * row_len + block / 8;
+        let byte = matrix.get(i);
+        matrix.set(i, byte | (1 << (block % 8)));
+    });
 }
 
 /// Encode `names_in_order` (already in sorted order) into `blob` and
@@ -1084,18 +1155,25 @@ impl ArenaBuilder {
     }
 }
 
-/// Builds an `Arena` from records already known to be in final sorted
-/// (name-ascending, tie-broken however the caller's merge already resolved
-/// ties) order, streaming the front-coded name blob and trigram index as
-/// records arrive instead of staging names and sorting afterward.
+/// Builds an Arena's columns from records already known to be in final
+/// sorted (name-ascending, tie-broken however the caller's merge already
+/// resolved ties) order, writing every column straight to a [`Spool`]/
+/// [`ByteSpool`] as records arrive rather than an owned `Vec` — so pushing
+/// two million records costs a handful of resident mmap pages, not ~120 MB
+/// of heap. FRN handling lives entirely outside this type now: a record's
+/// FRN sidecar entry depends on its *name-sorted* final index, which the
+/// sidecar needs in FRN order, not push order, so `IndexView::compact_to_snapshot`
+/// produces it as a separate frn-sorted merge (see `crate::frnmap::FrnMap::save_streaming`)
+/// instead of collecting entries here.
 ///
-/// This exists for `IndexView::compact`, which can produce records in final
-/// order cheaply (base survivors are already name-sorted on disk; delta
-/// additions are a small in-memory list, sorted once) via a merge of the two
-/// streams — so paying for `ArenaBuilder`'s full stage-then-sort pass would
-/// duplicate work the caller already did. It intentionally does not replace
-/// `ArenaBuilder`: callers that push records in arbitrary order (the MFT/USN
-/// enumerators) still need a real sort.
+/// This exists for `IndexView::compact_to_snapshot`, which can produce
+/// records in final order cheaply (base survivors are already name-sorted on
+/// disk; delta additions are a small in-memory list, sorted once) via a merge
+/// of the two streams — so paying for `ArenaBuilder`'s full stage-then-sort
+/// pass would duplicate work the caller already did. It intentionally does
+/// not replace `ArenaBuilder`: callers that push records in arbitrary order
+/// (the MFT/USN enumerators) still need a real sort, and that path's memory
+/// profile is out of scope here (see AGENTS.md).
 ///
 /// A record's parent may not have been pushed yet when the record itself is
 /// pushed (name order and tree order are unrelated), so `push` accepts a
@@ -1104,43 +1182,69 @@ impl ArenaBuilder {
 /// mirrors `ArenaBuilder::push_bytes_with_metadata` + `set_parent`, except
 /// here a record's own final index is known at push time (it is just the
 /// push count), so there is no separate order/rank permutation to build.
-pub struct StreamingArenaBuilder {
-    front_coder: FrontCoder,
-    parents: Vec<u32>,
-    mtimes: Vec<u32>,
-    sizes: Vec<u32>,
-    trigram_index: Vec<u8>,
+pub struct SpooledArenaBuilder {
+    front_coder: SpooledFrontCoder,
+    parents: Spool<u32>,
+    mtimes: Spool<u32>,
+    sizes: Spool<u32>,
+    trigram_index: Spool<u8>,
     row_len: usize,
-    frn_entries: Vec<FrnEntry>,
     journal_id: u64,
     next_usn: i64,
     volume_serial: u64,
 }
 
-impl StreamingArenaBuilder {
+/// The finished columns, still spool-backed, ready for `dfs::build_file_backed`
+/// and `store::save_columns_with` — never assembled into an owned `Arena`.
+pub struct SpooledColumns {
+    pub names: ByteSpool,
+    pub bucket_offsets: Spool<u32>,
+    pub parents: Spool<u32>,
+    pub mtimes: Spool<u32>,
+    pub sizes: Spool<u32>,
+    pub trigram_index: Spool<u8>,
+    pub journal_id: u64,
+    pub next_usn: i64,
+    pub volume_serial: u64,
+}
+
+impl SpooledArenaBuilder {
     /// `total_entries` must be the exact final record count — it sizes the
-    /// trigram block filter, which (like `ArenaBuilder::build`'s) is built
-    /// once for the whole archive rather than grown incrementally.
-    pub fn new(total_entries: usize, name_bytes_hint: usize) -> Self {
+    /// trigram block filter and every fixed-capacity column spool up front.
+    /// `dir` holds this compaction's scratch files; `on_create` runs against
+    /// every one of them, so a caller can mark them auxiliary before they
+    /// can generate a watched USN event, same as the final snapshot file.
+    pub fn new(total_entries: usize, dir: &Path, on_create: &impl Fn(&File)) -> io::Result<Self> {
         let blocks = num_blocks(total_entries);
         let row_len = row_bytes(blocks);
-        let trigram_index = if total_entries < TRIGRAM_BLOCK {
-            Vec::new()
+        let trigram_len = if total_entries < TRIGRAM_BLOCK {
+            0
         } else {
-            vec![0; TRIGRAM_ROWS * row_len]
+            TRIGRAM_ROWS * row_len
         };
-        StreamingArenaBuilder {
-            front_coder: FrontCoder::new(total_entries, name_bytes_hint),
-            parents: Vec::with_capacity(total_entries),
-            mtimes: Vec::with_capacity(total_entries),
-            sizes: Vec::with_capacity(total_entries),
-            trigram_index,
+        Ok(SpooledArenaBuilder {
+            front_coder: SpooledFrontCoder {
+                blob: ByteSpool::create(&dir.join("names.spool"), 4096, |f| on_create(f))?,
+                offsets: Spool::create(
+                    &dir.join("bucket-offsets.spool"),
+                    total_entries.div_ceil(BUCKET_SIZE) + 1,
+                    |f| on_create(f),
+                )?,
+                prev: Vec::new(),
+                pos_in_bucket: 0,
+                absolute_index: 0,
+            },
+            parents: Spool::create(&dir.join("parents.spool"), total_entries, |f| on_create(f))?,
+            mtimes: Spool::create(&dir.join("mtimes.spool"), total_entries, |f| on_create(f))?,
+            sizes: Spool::create(&dir.join("sizes.spool"), total_entries, |f| on_create(f))?,
+            trigram_index: Spool::zeroed(&dir.join("trigram.spool"), trigram_len, |f| {
+                on_create(f)
+            })?,
             row_len,
-            frn_entries: Vec::new(),
             journal_id: 0,
             next_usn: 0,
             volume_serial: 0,
-        }
+        })
     }
 
     pub fn set_snapshot_cursor(&mut self, journal_id: u64, next_usn: i64, volume_serial: u64) {
@@ -1161,7 +1265,6 @@ impl StreamingArenaBuilder {
         is_dir: bool,
         size_bytes: u64,
         raw_parent: u32,
-        frn: Option<u64>,
     ) -> u32 {
         let idx = self.parents.len() as u32;
         self.front_coder
@@ -1169,54 +1272,33 @@ impl StreamingArenaBuilder {
         self.parents.push(pack_parent(raw_parent, is_dir));
         self.mtimes.push(mtime_secs);
         self.sizes.push(bytes_to_size_kib(size_bytes));
-        if let Some(frn) = frn {
-            self.frn_entries.push(FrnEntry {
-                frn,
-                index: idx,
-                _pad: 0,
-            });
-        }
         idx
     }
 
     /// Overwrites the parent index left at `idx` by `push` (its directory
     /// flag is preserved) with a resolved final index, or `PARENT_NONE`.
     pub fn patch_parent(&mut self, idx: u32, final_parent: u32) {
-        let is_dir = word_is_dir(self.parents[idx as usize]);
-        self.parents[idx as usize] = pack_parent(final_parent, is_dir);
+        let is_dir = word_is_dir(self.parents.get(idx as usize));
+        self.parents
+            .set(idx as usize, pack_parent(final_parent, is_dir));
     }
 
-    /// The `dfs_*` columns can only be built once every `parents` entry has
-    /// its final value, so this is the second of the two passes over
-    /// records `compact` performs (push, then patch). The chosen approach
-    /// keeps just the finished `parents: Vec<u32>` in memory for this call
-    /// — 4 bytes/record, ~8 MB at 2M records — and calls the same
-    /// `dfs::build`/`prefix_sums_u64` a full rebuild would, rather than
-    /// re-reading a partially-written mmap or maintaining `dfs_*`
-    /// incrementally as parents are patched.
-    pub fn finish(self) -> (Arena, Vec<FrnEntry>) {
+    /// Ends the push/patch phase and hands back the finished, still
+    /// spool-backed columns for the caller's next pass (`dfs::build_file_backed`
+    /// followed by `store::save_columns_with`).
+    pub fn finish(self) -> SpooledColumns {
         let (names, bucket_offsets) = self.front_coder.finish();
-        let dfs = crate::dfs::build(&self.parents);
-        let dfs_size_prefix = crate::dfs::prefix_sums_u64(&dfs.records, &self.sizes);
-        (
-            Arena {
-                format_version: crate::record::FORMAT_VERSION,
-                journal_id: self.journal_id,
-                next_usn: self.next_usn,
-                volume_serial: self.volume_serial,
-                names,
-                bucket_offsets,
-                parents: self.parents,
-                mtimes: self.mtimes,
-                sizes: self.sizes,
-                trigram_index: self.trigram_index,
-                dfs_positions: dfs.positions,
-                dfs_records: dfs.records,
-                dfs_ends: dfs.subtree_ends,
-                dfs_size_prefix,
-            },
-            self.frn_entries,
-        )
+        SpooledColumns {
+            names,
+            bucket_offsets,
+            parents: self.parents,
+            mtimes: self.mtimes,
+            sizes: self.sizes,
+            trigram_index: self.trigram_index,
+            journal_id: self.journal_id,
+            next_usn: self.next_usn,
+            volume_serial: self.volume_serial,
+        }
     }
 }
 
@@ -1233,18 +1315,19 @@ mod tests {
         b.build().0
     }
 
-    /// `StreamingArenaBuilder` must produce a byte-identical archive to
+    /// `SpooledArenaBuilder` must produce the same columns as
     /// `ArenaBuilder::build()` given the same records: push them into
-    /// `StreamingArenaBuilder` in final sorted order (mirroring what
+    /// `SpooledArenaBuilder` in final sorted order (mirroring what
     /// `IndexView::compact`'s merge guarantees) with every parent left as a
     /// placeholder, then patch every parent out of push order, then
-    /// `finish()`. `dfs::build`'s own handling of malformed parent columns
+    /// `finish()` followed by the same file-backed DFS pass compaction runs.
+    /// `dfs::build_file_backed`'s own handling of malformed parent columns
     /// (cycles, self-parents, dangling indices) is exercised directly in
-    /// `dfs.rs`'s tests — `finish()` calls the same function unchanged — so
-    /// this test's job is narrower: prove `FrontCoder` matches the batch
-    /// `front_code` byte-for-byte, and that patching parents after the fact
-    /// (rather than knowing them at push time) still feeds `dfs::build` the
-    /// same column the regular builder would have.
+    /// `dfs.rs`'s tests against `dfs::build` — so this test's job is
+    /// narrower: prove `SpooledFrontCoder` matches the batch `front_code`
+    /// byte-for-byte, and that patching parents after the fact (rather than
+    /// knowing them at push time) still feeds the DFS pass the same column
+    /// the regular builder would have.
     #[test]
     fn streaming_builder_matches_regular_builder_output() {
         // (name, is_dir, mtime, size_bytes, raw parent by *input* index).
@@ -1279,12 +1362,14 @@ mod tests {
         // position so parents can be patched afterward.
         let mut order: Vec<usize> = (0..records.len()).collect();
         order.sort_by(|&a, &b| ascii::cmp_ci(records[a].0.as_bytes(), records[b].0.as_bytes()));
-        let mut streaming = StreamingArenaBuilder::new(records.len(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut streaming = SpooledArenaBuilder::new(records.len(), dir.path(), &|_| {}).unwrap();
         let mut streaming_indices = vec![0u32; records.len()];
         for &i in &order {
             let (name, is_dir, mtime, size, _) = records[i];
             streaming_indices[i] =
-                streaming.push(name.as_bytes(), mtime, is_dir, size, PARENT_NONE, None);
+                streaming.push(name.as_bytes(), mtime, is_dir, size, PARENT_NONE);
         }
         // Patch in an order unrelated to push order, matching the "parent
         // may not have been pushed yet" reality `compact`'s second pass
@@ -1294,20 +1379,109 @@ mod tests {
                 streaming.patch_parent(streaming_indices[i], streaming_indices[parent]);
             }
         }
-        let (streaming_arena, _) = streaming.finish();
+        let columns = streaming.finish();
+        let dfs_layout =
+            crate::dfs::build_file_backed(columns.parents.as_slice(), dir.path(), &|_| {}).unwrap();
+        let dfs_size_prefix = crate::dfs::prefix_sums_u64_file_backed(
+            &dfs_layout.records,
+            &columns.sizes,
+            &dir.path().join("dfs-size-prefix.spool"),
+            &|_| {},
+        )
+        .unwrap();
 
-        assert_eq!(streaming_arena.names, regular_arena.names);
-        assert_eq!(streaming_arena.bucket_offsets, regular_arena.bucket_offsets);
-        assert_eq!(streaming_arena.parents, regular_arena.parents);
-        assert_eq!(streaming_arena.mtimes, regular_arena.mtimes);
-        assert_eq!(streaming_arena.sizes, regular_arena.sizes);
-        assert_eq!(streaming_arena.trigram_index, regular_arena.trigram_index);
-        assert_eq!(streaming_arena.dfs_positions, regular_arena.dfs_positions);
-        assert_eq!(streaming_arena.dfs_records, regular_arena.dfs_records);
-        assert_eq!(streaming_arena.dfs_ends, regular_arena.dfs_ends);
+        assert_eq!(columns.names.as_slice(), regular_arena.names.as_slice());
         assert_eq!(
-            streaming_arena.dfs_size_prefix,
-            regular_arena.dfs_size_prefix
+            columns.bucket_offsets.as_slice(),
+            regular_arena.bucket_offsets.as_slice()
+        );
+        assert_eq!(columns.parents.as_slice(), regular_arena.parents.as_slice());
+        assert_eq!(columns.mtimes.as_slice(), regular_arena.mtimes.as_slice());
+        assert_eq!(columns.sizes.as_slice(), regular_arena.sizes.as_slice());
+        assert_eq!(
+            columns.trigram_index.as_slice(),
+            regular_arena.trigram_index.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.positions.as_slice(),
+            regular_arena.dfs_positions.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.records.as_slice(),
+            regular_arena.dfs_records.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.subtree_ends.as_slice(),
+            regular_arena.dfs_ends.as_slice()
+        );
+        assert_eq!(
+            dfs_size_prefix.as_slice(),
+            regular_arena.dfs_size_prefix.as_slice()
+        );
+    }
+
+    #[test]
+    fn streaming_builder_matches_across_bucket_and_trigram_boundaries() {
+        let count = TRIGRAM_BLOCK + BUCKET_SIZE + 7;
+        let records: Vec<_> = (0..count)
+            .map(|i| {
+                (
+                    format!("entry_{i:04}_shared_suffix.dat"),
+                    i as u32,
+                    (i as u64 + 1) * 1536,
+                )
+            })
+            .collect();
+
+        let mut regular = ArenaBuilder::with_capacity(count, count * 32);
+        for (name, mtime, size) in &records {
+            regular.push_bytes_with_metadata(name.as_bytes(), *mtime, false, None, *size);
+        }
+        let (regular_arena, _) = regular.build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut streaming = SpooledArenaBuilder::new(count, dir.path(), &|_| {}).unwrap();
+        for (name, mtime, size) in &records {
+            streaming.push(name.as_bytes(), *mtime, false, *size, PARENT_NONE);
+        }
+        let columns = streaming.finish();
+        let dfs_layout =
+            crate::dfs::build_file_backed(columns.parents.as_slice(), dir.path(), &|_| {}).unwrap();
+        let dfs_size_prefix = crate::dfs::prefix_sums_u64_file_backed(
+            &dfs_layout.records,
+            &columns.sizes,
+            &dir.path().join("boundary-prefix.spool"),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(columns.names.as_slice(), regular_arena.names.as_slice());
+        assert_eq!(
+            columns.bucket_offsets.as_slice(),
+            regular_arena.bucket_offsets.as_slice()
+        );
+        assert_eq!(columns.parents.as_slice(), regular_arena.parents.as_slice());
+        assert_eq!(columns.mtimes.as_slice(), regular_arena.mtimes.as_slice());
+        assert_eq!(columns.sizes.as_slice(), regular_arena.sizes.as_slice());
+        assert_eq!(
+            columns.trigram_index.as_slice(),
+            regular_arena.trigram_index.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.positions.as_slice(),
+            regular_arena.dfs_positions.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.records.as_slice(),
+            regular_arena.dfs_records.as_slice()
+        );
+        assert_eq!(
+            dfs_layout.subtree_ends.as_slice(),
+            regular_arena.dfs_ends.as_slice()
+        );
+        assert_eq!(
+            dfs_size_prefix.as_slice(),
+            regular_arena.dfs_size_prefix.as_slice()
         );
     }
 

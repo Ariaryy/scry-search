@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod query;
 pub mod rank;
 pub mod record;
+pub mod spool;
 pub mod store;
 pub mod terms;
 pub mod trigram;

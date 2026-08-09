@@ -4,17 +4,23 @@ use std::{cell::RefCell, collections::BinaryHeap};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 
-use crate::arena::StreamingArenaBuilder;
+use crate::arena::SpooledArenaBuilder;
 use crate::ascii;
 use crate::cancel::Cancellation;
 use crate::delta::{Delta, ParentRef};
+use crate::dfs;
+use crate::frnmap::{FrnEntry, FrnMap};
 use crate::metrics::QuerySpans;
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
 use crate::query::Query;
 use crate::rank::{self, Order};
-use crate::store::ArenaStore;
-use crate::{Arena, FrnEntry, PARENT_NONE};
+use crate::store::{self, ArenaColumns, ArenaStore, StoreError};
+#[cfg(test)]
+use crate::Arena;
+use crate::PARENT_NONE;
+use std::fs::File;
+use std::path::Path;
 
 /// Ceiling on any caller-supplied result limit. The bounded top-k heap is the
 /// only thing standing between a one-character query and an allocation
@@ -432,10 +438,12 @@ mod tests {
     }
 
     fn open_compacted(view: &IndexView) -> (tempfile::TempDir, IndexView) {
-        let (arena, mut frns) = view.compact();
         let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
         let path = dir.path().join("compacted.rkyv");
-        crate::store::save_with_sidecar(&arena, &mut frns, &path, |_| {}, |_| {}).unwrap();
+        view.compact_to_snapshot(&scratch, &path, &|_| {}, &mut |_| {})
+            .unwrap();
         let base = Arc::new(ArenaStore::open(&path).unwrap());
         (dir, IndexView::new(base))
     }
@@ -534,14 +542,14 @@ mod tests {
     fn compaction_removes_tombstones_and_empty_is_identity() {
         let (_dir, mut view) = base_view(20);
         let original = view.len();
-        let empty = view.compact().0;
+        let (_empty_dir, empty) = open_compacted(&view);
         assert_eq!(empty.len(), original);
 
         let mut delta = Delta::new(view.base.archived().len());
         assert!(delta.tombstones.set(3));
         assert!(delta.tombstones.set(7));
         view.delta = Arc::new(delta);
-        let compacted = view.compact().0;
+        let (_compacted_dir, compacted) = open_compacted(&view);
         assert_eq!(compacted.len(), original - 2);
     }
 
@@ -830,6 +838,11 @@ mod tests {
             size_bytes: 0,
             live: true,
         });
+        // Deliberately reverse FRN order relative to delta insertion order so
+        // compaction must sort and merge both halves rather than accidentally
+        // preserving the additions vector's order.
+        delta.added_frns.insert(5_000, 0);
+        delta.added_frns.insert(500, 1);
         view.delta = Arc::new(delta);
 
         let archived = view.base.archived();
@@ -851,16 +864,11 @@ mod tests {
             }
         }
 
-        let (compacted_arena, mut compacted_frns) = view.compact();
         let out_path = dir.path().join("compacted.rkyv");
-        crate::store::save_with_sidecar(
-            &compacted_arena,
-            &mut compacted_frns,
-            &out_path,
-            |_| {},
-            |_| {},
-        )
-        .unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        view.compact_to_snapshot(&scratch, &out_path, &|_| {}, &mut |_| {})
+            .unwrap();
         let compacted_store = ArenaStore::open(&out_path).unwrap();
         let compacted_archived = compacted_store.archived();
         let compacted_frn_map = compacted_store.frn_map.as_ref().unwrap();
@@ -877,6 +885,16 @@ mod tests {
             let actual_path = compacted_archived.full_path(new_index, '\\');
             assert_eq!(&actual_path, expected_path);
         }
+        let delta_child = compacted_frn_map.lookup(5_000).unwrap();
+        let delta_grandchild = compacted_frn_map.lookup(500).unwrap();
+        assert_eq!(
+            compacted_archived.full_path(delta_child, '\\'),
+            "C:\\delta_root_child"
+        );
+        assert_eq!(
+            compacted_archived.full_path(delta_grandchild, '\\'),
+            "C:\\delta_root_child\\delta_grandchild"
+        );
     }
 
     #[test]
@@ -1626,10 +1644,10 @@ impl IndexView {
     /// its `staging_names` copy, both `O(total name bytes)`.
     ///
     /// Every record is pushed with a `PARENT_NONE` placeholder parent
-    /// (`StreamingArenaBuilder::push`'s own final index — the push count —
-    /// is already known, so nothing needs to round-trip through a raw
-    /// marker); a second pass then patches every live record's real parent.
-    /// A record's own final index and its parent's final index are each
+    /// (`SpooledArenaBuilder::push`'s own final index — the push count — is
+    /// already known, so nothing needs to round-trip through a raw marker);
+    /// a second pass then patches every live record's real parent. A
+    /// record's own final index and its parent's final index are each
     /// recomputed by formula in that second pass rather than looked up in a
     /// stored old-to-new map: a base index's final position is
     /// `base_new_index` (the existing tombstone-rank formula) plus the
@@ -1640,7 +1658,37 @@ impl IndexView {
     /// into the on-disk base, cheap because it runs once per delta addition,
     /// not once per base record) plus its rank within the sorted delta list.
     /// This costs a second `O(n)` walk over base but no `O(n)`-sized array.
-    pub fn compact(&self) -> (Arena, Vec<FrnEntry>) {
+    ///
+    /// FRNs are handled entirely separately from the push/patch phase above,
+    /// since a sidecar entry needs frn order, not push (name) order: the
+    /// base sidecar is already frn-sorted on disk (`FrnMap::save_with`'s
+    /// invariant), so filtering out tombstoned entries and remapping the
+    /// survivors' indices through `final_index_of_base` preserves that
+    /// order — a filtered subsequence of a sorted sequence stays sorted.
+    /// That frn-ascending stream is then merged with the small
+    /// (compaction-threshold-bounded) sorted list of live delta FRNs and
+    /// written straight to the sidecar by `FrnMap::save_streaming`, without
+    /// ever collecting a full-size `Vec<FrnEntry>` (the `by_index` vector
+    /// this function used to build).
+    ///
+    /// Every temporary file this creates lives under `scratch_dir` and is
+    /// deleted automatically when its `Spool`/`ByteSpool` drops; `on_create`
+    /// runs against every one of them (scratch and final alike) so a caller
+    /// can mark them auxiliary before they can generate a watched USN
+    /// journal entry.
+    /// `on_phase` fires with a short label after each major phase (merge,
+    /// dfs build, prefix sums, final serialize, frn merge) — a hook for a
+    /// caller to sample process memory between phases, so a future hidden
+    /// `O(n)` heap allocation shows up as a spike attributable to one named
+    /// phase instead of an unexplained total. No-op cost for a caller that
+    /// passes an empty closure.
+    pub fn compact_to_snapshot(
+        &self,
+        scratch_dir: &Path,
+        snapshot_path: &Path,
+        on_create: &impl Fn(&File),
+        on_phase: &mut impl FnMut(&str),
+    ) -> Result<(), StoreError> {
         let arena = self.base.archived();
 
         // Rank query over the tombstone bitset in place of a dense
@@ -1709,21 +1757,10 @@ impl IndexView {
 
         let live_base = arena.len() - self.delta.tombstones.count_ones() as usize;
         let live_delta = delta_sorted.len();
-        let mut builder = StreamingArenaBuilder::new(live_base + live_delta, arena.names.len());
+        let mut builder = SpooledArenaBuilder::new(live_base + live_delta, scratch_dir, on_create)?;
+        builder.set_snapshot_cursor(self.journal_id, self.next_usn, self.volume_serial);
 
         {
-            // Sorted-by-index view of the FRN sidecar (stored FRN-sorted, for
-            // `FrnMap::lookup`), consumed by one monotonic pass alongside the
-            // ascending old-index half of the merge below — `base_old` only
-            // ever advances forward across the whole merge, so the cursor
-            // stays monotonic even though delta pushes are interleaved.
-            let mut by_index: Vec<FrnEntry> = match &self.base.frn_map {
-                Some(map) => map.iter().collect(),
-                None => Vec::new(),
-            };
-            by_index.sort_unstable_by_key(|entry| entry.index);
-            let mut frn_cursor = 0usize;
-
             let mut base_old = 0u32;
             while base_old < arena.len() as u32 && self.delta.tombstones.get(base_old) {
                 base_old += 1;
@@ -1750,19 +1787,12 @@ impl IndexView {
                 };
 
                 if take_base {
-                    while frn_cursor < by_index.len() && by_index[frn_cursor].index < base_old {
-                        frn_cursor += 1;
-                    }
-                    let frn = (frn_cursor < by_index.len()
-                        && by_index[frn_cursor].index == base_old)
-                        .then(|| by_index[frn_cursor].frn);
                     builder.push(
                         &base_name,
                         arena.mtime(base_old),
                         arena.is_dir(base_old),
                         arena.size_bytes(base_old),
                         PARENT_NONE,
-                        frn,
                     );
                     base_old += 1;
                     while base_old < arena.len() as u32 && self.delta.tombstones.get(base_old) {
@@ -1777,7 +1807,6 @@ impl IndexView {
                         record.is_dir,
                         record.size_bytes,
                         PARENT_NONE,
-                        frns_by_delta[delta_idx as usize],
                     );
                     delta_i += 1;
                 }
@@ -1812,7 +1841,109 @@ impl IndexView {
             }
         }
 
-        builder.finish()
+        on_phase("merge");
+        let columns = builder.finish();
+        let dfs_layout =
+            dfs::build_file_backed(columns.parents.as_slice(), scratch_dir, on_create)?;
+        on_phase("dfs_build");
+        let dfs_size_prefix = dfs::prefix_sums_u64_file_backed(
+            &dfs_layout.records,
+            &columns.sizes,
+            &scratch_dir.join("dfs-size-prefix.spool"),
+            on_create,
+        )?;
+        on_phase("prefix_sums");
+
+        // Small (delta-threshold-bounded), sorted by frn: the delta half of
+        // the sidecar merge.
+        let mut delta_frn_entries: Vec<FrnEntry> = self
+            .delta
+            .live_added()
+            .filter_map(|(idx, _)| {
+                frns_by_delta[idx as usize].map(|frn| FrnEntry {
+                    frn,
+                    index: final_index_of_delta(idx),
+                    _pad: 0,
+                })
+            })
+            .collect();
+        delta_frn_entries.sort_unstable_by_key(|entry| entry.frn);
+
+        // The base half: the on-disk sidecar is already frn-sorted
+        // (`FrnMap::save_with`'s invariant), so filtering out tombstoned
+        // entries and remapping survivors through `final_index_of_base`
+        // preserves that order without ever collecting a full-size Vec.
+        let mut base_name_buf = Vec::new();
+        let final_index_of_base_ref = &final_index_of_base;
+        let mut base_frn_iter = self
+            .base
+            .frn_map
+            .as_ref()
+            .map(|map| map.iter())
+            .into_iter()
+            .flatten()
+            .filter_map(move |entry| {
+                final_index_of_base_ref(entry.index, &mut base_name_buf).map(|index| FrnEntry {
+                    frn: entry.frn,
+                    index,
+                    _pad: 0,
+                })
+            })
+            .peekable();
+        let mut delta_frn_iter = delta_frn_entries.into_iter().peekable();
+        let merged_frns =
+            std::iter::from_fn(
+                move || match (base_frn_iter.peek(), delta_frn_iter.peek()) {
+                    (Some(b), Some(d)) => {
+                        if b.frn <= d.frn {
+                            base_frn_iter.next()
+                        } else {
+                            delta_frn_iter.next()
+                        }
+                    }
+                    (Some(_), None) => base_frn_iter.next(),
+                    (None, Some(_)) => delta_frn_iter.next(),
+                    (None, None) => None,
+                },
+            );
+        // Snapshot and sidecar are separate files and therefore cannot be
+        // renamed atomically as a pair. Give both this compaction generation
+        // the same nonzero tag. Opening a snapshot ignores any sidecar whose
+        // tag differs, so a crash between the two renames cannot apply FRNs
+        // containing record indices from one generation to another.
+        let snapshot_tag = store::fresh_snapshot_tag();
+        store::save_columns_with_tag(
+            &ArenaColumns {
+                format_version: crate::record::FORMAT_VERSION,
+                journal_id: columns.journal_id,
+                next_usn: columns.next_usn,
+                volume_serial: columns.volume_serial,
+                names: columns.names.as_slice(),
+                bucket_offsets: columns.bucket_offsets.as_slice(),
+                parents: columns.parents.as_slice(),
+                mtimes: columns.mtimes.as_slice(),
+                sizes: columns.sizes.as_slice(),
+                trigram_index: columns.trigram_index.as_slice(),
+                dfs_positions: dfs_layout.positions.as_slice(),
+                dfs_records: dfs_layout.records.as_slice(),
+                dfs_ends: dfs_layout.subtree_ends.as_slice(),
+                dfs_size_prefix: dfs_size_prefix.as_slice(),
+            },
+            snapshot_path,
+            snapshot_tag,
+            on_create,
+        )?;
+        on_phase("serialize");
+
+        FrnMap::save_streaming(
+            &snapshot_path.with_extension("frn"),
+            merged_frns,
+            snapshot_tag,
+            on_create,
+        )?;
+        on_phase("frn_merge");
+
+        Ok(())
     }
 }
 
