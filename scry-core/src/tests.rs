@@ -387,3 +387,149 @@ fn selectivity_distribution_over_realistic_query_prefixes() {
         println!("  -> between 5% and 20%: inconclusive on this synthetic corpus.");
     }
 }
+
+/// Live-volume counterpart to the synthetic distribution above. Set
+/// `SCRY_LIVE_SNAPSHOT` to an existing snapshot path. All sampled names stay
+/// private: output contains only aggregate percentiles and the generic fixed
+/// queries below.
+///
+/// Exact match counts are collected in one archive pass with a multi-pattern
+/// automaton rather than rescanning a multi-million-record snapshot once per
+/// sampled prefix.
+#[test]
+#[ignore = "requires SCRY_LIVE_SNAPSHOT; prints aggregate live-index data"]
+fn live_selectivity_distribution() {
+    use aho_corasick::{AhoCorasickBuilder, MatchKind};
+    use std::ops::ControlFlow;
+
+    const SAMPLES: usize = 2_000;
+    let path = std::env::var_os("SCRY_LIVE_SNAPSHOT")
+        .map(std::path::PathBuf::from)
+        .expect("set SCRY_LIVE_SNAPSHOT to an existing .rkyv snapshot");
+    let store = ArenaStore::open(&path).expect("open live snapshot");
+    let archived = store.archived();
+    assert!(!archived.is_empty(), "live snapshot is empty");
+    let total_blocks = crate::trigram::num_blocks(archived.len());
+
+    let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut next_rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut sampled: [std::collections::BTreeSet<String>; 5] = Default::default();
+    for _ in 0..SAMPLES {
+        let record = (next_rand() as usize) % archived.len();
+        let name = archived.name(record as u32);
+        for len in 1..=5.min(name.len()) {
+            if let Some(prefix) = name.get(..len) {
+                sampled[len - 1].insert(prefix.to_ascii_lowercase());
+            }
+        }
+    }
+
+    let fixed = [
+        ".pdf",
+        ".log",
+        "document",
+        "readme",
+        "node_modules",
+        ".dll",
+        ".exe",
+        "config",
+        "test",
+        "image",
+    ];
+    let mut all = std::collections::BTreeSet::new();
+    for group in &sampled {
+        all.extend(group.iter().cloned());
+    }
+    all.extend(fixed.iter().map(|needle| (*needle).to_string()));
+    let patterns: Vec<String> = all.into_iter().collect();
+    let pattern_index: std::collections::BTreeMap<&str, usize> = patterns
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| (pattern.as_str(), index))
+        .collect();
+    let automaton = AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::Standard)
+        .build(&patterns)
+        .expect("build live-prefix automaton");
+
+    let mut match_counts = vec![0u32; patterns.len()];
+    let mut seen_at_record = vec![u32::MAX; patterns.len()];
+    archived.for_each_name(|record, name| {
+        for matched in automaton.find_overlapping_iter(name) {
+            let pattern = matched.pattern().as_usize();
+            if seen_at_record[pattern] != record {
+                seen_at_record[pattern] = record;
+                match_counts[pattern] += 1;
+            }
+        }
+        ControlFlow::Continue(())
+    });
+
+    let score = |needle: &str| -> (f64, f64) {
+        let index = pattern_index[needle];
+        let surviving = archived
+            .candidate_blocks(needle.as_bytes())
+            .map_or(total_blocks, |blocks| blocks.len());
+        (
+            match_counts[index] as f64 / archived.len() as f64,
+            surviving as f64 / total_blocks as f64,
+        )
+    };
+    let percentile = |values: &mut [f64], p: f64| -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values[((values.len() - 1) as f64 * p).round() as usize]
+    };
+
+    println!(
+        "\nlive corpus: {} records, {total_blocks} blocks, {} distinct sampled/fixed needles",
+        archived.len(),
+        patterns.len()
+    );
+    let mut all_3plus = Vec::new();
+    for (offset, group) in sampled.iter().enumerate() {
+        let len = offset + 1;
+        let scores: Vec<(f64, f64)> = group.iter().map(|needle| score(needle)).collect();
+        let selectivity: Vec<f64> = scores.iter().map(|score| score.0).collect();
+        let block_survival: Vec<f64> = scores.iter().map(|score| score.1).collect();
+        if len >= 3 {
+            all_3plus.extend(selectivity.iter().copied());
+        }
+        println!(
+            "  prefix len {len}: n={:5} selectivity p10={:6.2}% p50={:6.2}% p90={:6.2}% | blocks p50={:6.2}% p90={:6.2}%",
+            group.len(),
+            percentile(&mut selectivity.clone(), 0.10) * 100.0,
+            percentile(&mut selectivity.clone(), 0.50) * 100.0,
+            percentile(&mut selectivity.clone(), 0.90) * 100.0,
+            percentile(&mut block_survival.clone(), 0.50) * 100.0,
+            percentile(&mut block_survival.clone(), 0.90) * 100.0,
+        );
+    }
+
+    println!("  fixed generic queries:");
+    for needle in fixed {
+        let (selectivity, block_survival) = score(needle);
+        println!(
+            "    {needle:14} -> {:6.2}% of records, {:6.2}% of blocks",
+            selectivity * 100.0,
+            block_survival * 100.0
+        );
+    }
+    let p50_3plus = percentile(&mut all_3plus, 0.50);
+    println!(
+        "\n  live gate: p50 selectivity across all sampled 3–5 byte needles = {:.2}%",
+        p50_3plus * 100.0
+    );
+    if p50_3plus < 0.05 {
+        println!("  -> below 5%; the selectivity gate alone supports further investigation.");
+    } else if p50_3plus > 0.20 {
+        println!("  -> above 20%; a rank-ordered budget would usually fall back; reject the bet.");
+    } else {
+        println!("  -> between 5% and 20%; the live selectivity gate is inconclusive.");
+    }
+}

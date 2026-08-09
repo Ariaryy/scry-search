@@ -531,6 +531,35 @@ mod tests {
         assert_eq!(name, b"alpha/beta.txt");
     }
 
+    /// Replacing the path publishes a new generation without invalidating an
+    /// mmap held by an in-flight reader. This is the file-level fault case;
+    /// ArcSwap and client handshake tests cover publication/detection above it.
+    #[test]
+    fn live_mapping_survives_atomic_snapshot_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaceable.rkyv");
+
+        let mut first_builder = crate::arena::ArenaBuilder::default();
+        first_builder.push_bytes_with_frn(b"first", 0, false, 1);
+        let (first, mut first_frns) = first_builder.build();
+        save_with_sidecar(&first, &mut first_frns, &path, |_| {}, |_| {}).unwrap();
+        let old_mapping = ArenaStore::open(&path).unwrap();
+        let old_tag = u32::from_le_bytes(old_mapping.archive_bytes()[12..16].try_into().unwrap());
+
+        let mut second_builder = crate::arena::ArenaBuilder::default();
+        second_builder.push_bytes_with_frn(b"second-a", 0, false, 2);
+        second_builder.push_bytes_with_frn(b"second-b", 0, false, 3);
+        let (second, mut second_frns) = second_builder.build();
+        save_with_sidecar(&second, &mut second_frns, &path, |_| {}, |_| {}).unwrap();
+        let new_mapping = ArenaStore::open(&path).unwrap();
+        let new_tag = u32::from_le_bytes(new_mapping.archive_bytes()[12..16].try_into().unwrap());
+
+        assert_eq!(old_mapping.archived().len(), 1);
+        assert_eq!(old_mapping.archived().name(0), "first");
+        assert_eq!(new_mapping.archived().len(), 2);
+        assert_ne!(old_tag, new_tag, "replacement must publish a new tag");
+    }
+
     #[test]
     fn open_ignores_a_sidecar_from_another_snapshot_generation() {
         let dir = tempfile::tempdir().unwrap();
