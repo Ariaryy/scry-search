@@ -10,8 +10,9 @@
   `parent()`, `mtime()`) needs an impl on each — the accessors on `ArchivedArena` read
   directly from the archived column vectors. `FileRecord` no longer exists; the dual-impl
   pattern now applies to functions on `ArchivedArena` vs the free functions in `record.rs`.
-- `Arena` uses a format v9 index (parallel 4-byte columns: `parents`/`dfs_positions`/
-  `dfs_records` hot, `mtimes`/`sizes`/`dfs_ends` cold, plus the 8-byte `dfs_size_prefix`
+- `Arena` uses a format v10 index (parallel 4-byte columns: `parents`/`dfs_positions`/
+  `dfs_records` hot, `mtimes`/`sizes`/`dfs_ends` cold, plus the one-bit
+  `size_exact_bits` and 8-byte `dfs_size_prefix`
   cold column; plus name-sorted front-coded names) rather than plain `String` fields
   or a single interleaved struct. The hot/cold split is load-bearing: `parents` alone
   in its column gives 16 parent hops per cache line; keeping the rest separate lets
@@ -79,7 +80,7 @@
   over the finished (file-backed) parent column (`dfs::build_file_backed`,
   `scry-core/src/dfs.rs` — same iterative, corrupt-parent-tolerant traversal
   as `dfs::build`, just spool-backed scratch and outputs instead of `Vec`),
-  serializes the same v9 archive layout straight from those spools via a
+  serializes the same v10 archive layout straight from those spools via a
   hand-written `rkyv::Archive`/`Serialize`
   impl on `ArenaColumns` (`scry-core/src/store.rs`) that drives the same
   `ArchivedVec` primitives the derived `Arena` impl would — proven
@@ -263,10 +264,12 @@
   probe measured the 20,000-candidate second keystroke at 12.753→4.625 ms p50
   and 19.597→5.198 ms p99 (2.76×/3.77×).
 - **`size` is populated only by the raw `$MFT` reader**, in KiB (rounded up,
-  saturating at approximately 4 TiB). The `FSCTL_ENUM_USN_DATA` fallback leaves
-  it 0 because USN records do not carry size, so 0 means unknown rather than
-  empty. The raw reader is used for a supported elevated NTFS volume and
-  demotes to USN on parse errors or excessive torn records. `MftEnumReport`
+  saturating at approximately 4 TiB). `size_exact_bits` distinguishes measured
+  empty files from unknown sizes and marks a directory exact only when every
+  live file in its DFS subtree is measured. USN fallback sizes remain unknown.
+  Incomplete directories retain their displayed lower bound but rank as zero
+  under `Order::Largest`. The raw reader is used for a supported elevated NTFS
+  volume and demotes to USN on parse errors or excessive torn records. `MftEnumReport`
   (`scry-fsevents/src/mft/mod.rs`) splits `size == 0` into
   `files_with_unknown_size` (no unnamed `$DATA` attribute was ever found —
   a coverage gap) and `files_with_confirmed_empty_size` (an unnamed `$DATA`
@@ -277,6 +280,15 @@
   unresolved `$ATTRIBUTE_LIST`s; on D: they were 0.93% and roughly 0.9%. Most
   of `files_with_unknown_size` is therefore not attribute-list residue — the
   actual cause of the remainder is still open.
+  An elevated fixed-seed diagnostic sampled 2,000 unknown records: 1,961
+  directories, 25 readable files with no observed unnamed data stream, and 14
+  open failures; all other aggregate buckets were zero. No identifiers were
+  emitted. A release compaction probe over the plan-024 scale (224,231 base,
+  12,000 additions, 3,000 deletions) measured 2,871,296 bytes absolute peak
+  private usage and 217,088 bytes growth; all scratch files were removed.
+  The bitmap adds exactly `ceil(records/8)` payload bytes (55,001 bytes on the
+  maintained 440,001-record corpus). `Order::Largest` measured 2.254 ms after
+  versus 2.210 ms before on that corpus (~2%, not material).
 - **Non-resident `$ATTRIBUTE_LIST` streams are detected but not decoded.** The
   reference C: measurement reported 4,220 such lists, 1,540 unresolved base
   records, and a stable 1,555–1,564 USN-only residual versus 18–25 raw-only
