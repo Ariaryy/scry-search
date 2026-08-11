@@ -70,6 +70,7 @@ pub struct Hit {
     pub size: u64,
     pub mtime: u32,
     pub is_dir: bool,
+    pub size_exact: bool,
 }
 
 /// Immutable base-and-overlay pair published through one atomic pointer.
@@ -214,6 +215,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn largest_places_incomplete_directory_after_exact_file() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("root", 0, true);
+        let directory = builder.push("match_large_dir", 0, true);
+        let unknown = builder.push_bytes_with_metadata_exact(
+            b"unmeasured.bin",
+            0,
+            false,
+            None,
+            1_000_000,
+            false,
+        );
+        let exact =
+            builder.push_bytes_with_metadata_exact(b"match_small.bin", 0, false, None, 1_024, true);
+        builder.set_parent(directory, root);
+        builder.set_parent(unknown, directory);
+        builder.set_parent(exact, root);
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("largest-exactness.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+
+        let hits = view.search_hits(
+            &Query::Prefix("match".into()),
+            SearchOptions::ordered(10, Order::Largest),
+        );
+        assert!(hits[0].size_exact);
+        assert_eq!(hits[0].size, 1_024);
+        assert!(!hits[1].size_exact);
+        assert!(hits[1].size > hits[0].size, "lower bound is retained");
+    }
+
     /// A corpus for the streaming top-k tests: varied mtimes/sizes (so
     /// `Recent`/`Largest` have something to order on), a tombstoned base
     /// record (so a streaming candidate must still be filtered out without
@@ -249,6 +284,7 @@ mod tests {
             mtime_secs: 5_000,
             is_dir: false,
             size_bytes: 999_999,
+            size_exact: true,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -417,6 +453,7 @@ mod tests {
                 mtime_secs: 0,
                 is_dir: false,
                 size_bytes: 0,
+                size_exact: true,
                 live: true,
             });
         }
@@ -444,6 +481,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: true,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         delta.added.push(DeltaRecord {
@@ -452,6 +490,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -482,6 +521,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -531,6 +571,7 @@ mod tests {
                     mtime_secs: 0,
                     is_dir: false,
                     size_bytes: 0,
+                    size_exact: true,
                     live: true,
                 });
             }
@@ -598,6 +639,7 @@ mod tests {
                     mtime_secs: 0,
                     is_dir: false,
                     size_bytes: 0,
+                    size_exact: true,
                     live: true,
                 });
             }
@@ -721,6 +763,7 @@ mod tests {
                     mtime_secs: 1_000 + i as u32,
                     is_dir: false,
                     size_bytes: (i as u64 + 1) * 4096,
+                    size_exact: true,
                     live: true,
                 });
             }
@@ -793,6 +836,7 @@ mod tests {
                 mtime_secs: 0,
                 is_dir: false,
                 size_bytes: 0,
+                size_exact: true,
                 live: true,
             });
         }
@@ -930,6 +974,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: true,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         delta.added.push(DeltaRecord {
@@ -938,6 +983,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         // Deliberately reverse FRN order relative to delta insertion order so
@@ -1012,6 +1058,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 17,
+            size_exact: true,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -1216,6 +1263,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: true,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         let delta_dir_index = (delta.added.len() - 1) as u32;
@@ -1225,6 +1273,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         // A live delta addition parented directly under an existing base
@@ -1236,6 +1285,7 @@ mod tests {
             mtime_secs: 0,
             is_dir: false,
             size_bytes: 0,
+            size_exact: true,
             live: true,
         });
         view.delta = Arc::new(delta);
@@ -2100,6 +2150,7 @@ impl IndexView {
                         arena.mtime(base_old),
                         arena.is_dir(base_old),
                         arena.size_bytes(base_old),
+                        arena.size_exact(base_old),
                         PARENT_NONE,
                     );
                     base_old += 1;
@@ -2114,6 +2165,7 @@ impl IndexView {
                         record.mtime_secs,
                         record.is_dir,
                         record.size_bytes,
+                        record.size_exact,
                         PARENT_NONE,
                     );
                     delta_i += 1;
@@ -2153,6 +2205,13 @@ impl IndexView {
         let columns = builder.finish();
         let dfs_layout =
             dfs::build_file_backed(columns.parents.as_slice(), scratch_dir, on_create)?;
+        let size_exact_bits = crate::arena::derive_spooled_size_exact(
+            columns.parents.as_slice(),
+            &columns.size_exact_inputs,
+            &dfs_layout,
+            scratch_dir,
+            on_create,
+        )?;
         on_phase("dfs_build");
         let dfs_size_prefix = dfs::prefix_sums_u64_file_backed(
             &dfs_layout.records,
@@ -2231,6 +2290,7 @@ impl IndexView {
                 parents: columns.parents.as_slice(),
                 mtimes: columns.mtimes.as_slice(),
                 sizes: columns.sizes.as_slice(),
+                size_exact_bits: size_exact_bits.as_slice(),
                 trigram_index: columns.trigram_index.as_slice(),
                 dfs_positions: dfs_layout.positions.as_slice(),
                 dfs_records: dfs_layout.records.as_slice(),
@@ -2368,6 +2428,14 @@ fn record_size_kib(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> 
     }
 }
 
+#[inline]
+fn record_size_exact(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> bool {
+    match record.checked_sub(arena.len() as u32) {
+        None => arena.size_exact(record),
+        Some(index) => delta.added[index as usize].size_exact,
+    }
+}
+
 /// The sort key for one candidate under `order`.
 ///
 /// `quality` and `name_len` are already in hand at every call site; the cold
@@ -2385,7 +2453,14 @@ fn sort_key(
     match order {
         Order::Relevance => rank::relevance_key(quality, name_len, record),
         Order::Recent => rank::recent_key(record_mtime(arena, delta, record), record),
-        Order::Largest => rank::largest_key(record_size_kib(arena, delta, record), record),
+        Order::Largest => rank::largest_key(
+            if record_size_exact(arena, delta, record) {
+                record_size_kib(arena, delta, record)
+            } else {
+                0
+            },
+            record,
+        ),
     }
 }
 
@@ -2410,9 +2485,10 @@ fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32, rank_bits: 
         None => Hit {
             record,
             rank_bits,
-            size: arena.size_bytes(record),
+            size: arena.recursive_size_kib(record) as u64 * 1024,
             mtime: arena.mtime(record),
             is_dir: arena.is_dir(record),
+            size_exact: arena.size_exact(record),
         },
         Some(index) => {
             let added = &delta.added[index as usize];
@@ -2422,6 +2498,7 @@ fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32, rank_bits: 
                 size: added.size_bytes,
                 mtime: added.mtime_secs,
                 is_dir: added.is_dir,
+                size_exact: added.size_exact,
             }
         }
     }
@@ -2618,6 +2695,7 @@ fn materialize(
         size: hit.size,
         mtime: hit.mtime,
         is_dir: hit.is_dir,
+        size_exact: hit.size_exact,
     }
 }
 

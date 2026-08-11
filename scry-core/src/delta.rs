@@ -73,6 +73,7 @@ pub struct DeltaRecord {
     pub mtime_secs: u32,
     pub is_dir: bool,
     pub size_bytes: u64,
+    pub size_exact: bool,
     pub live: bool,
 }
 
@@ -144,7 +145,7 @@ impl Delta {
                 *frn,
                 *parent_frn,
                 name.clone(),
-                (*is_dir, *mtime_secs, 0),
+                (*is_dir, *mtime_secs, 0, false),
                 base,
             ),
             DeltaEvent::Deleted { frn } => {
@@ -165,7 +166,8 @@ impl Delta {
                         return ApplyOutcome::Applied;
                     }
                 }
-                let Some((is_dir, mtime_secs, size_bytes)) = self.metadata(*frn, base) else {
+                let Some((is_dir, mtime_secs, size_bytes, size_exact)) = self.metadata(*frn, base)
+                else {
                     return ApplyOutcome::NeedsFullReindex;
                 };
                 self.delete(*frn, base);
@@ -173,7 +175,7 @@ impl Delta {
                     *frn,
                     *parent_frn,
                     name.clone(),
-                    (is_dir, mtime_secs, size_bytes),
+                    (is_dir, mtime_secs, size_bytes, size_exact),
                     base,
                 )
             }
@@ -198,7 +200,7 @@ impl Delta {
         frn: u64,
         parent_frn: u64,
         name: String,
-        metadata: (bool, u32, u64),
+        metadata: (bool, u32, u64, bool),
         base: &ArenaStore,
     ) -> ApplyOutcome {
         if self
@@ -217,13 +219,14 @@ impl Delta {
             return ApplyOutcome::NeedsFullReindex;
         };
         let index = self.added.len() as u32;
-        let (is_dir, mtime_secs, size_bytes) = metadata;
+        let (is_dir, mtime_secs, size_bytes, size_exact) = metadata;
         self.added.push(DeltaRecord {
             name,
             parent,
             mtime_secs,
             is_dir,
             size_bytes,
+            size_exact,
             live: true,
         });
         self.added_frns.insert(frn, index);
@@ -238,12 +241,15 @@ impl Delta {
         }
     }
 
-    fn metadata(&self, frn: u64, base: &ArenaStore) -> Option<(bool, u32, u64)> {
+    fn metadata(&self, frn: u64, base: &ArenaStore) -> Option<(bool, u32, u64, bool)> {
         if let Some(&index) = self.added_frns.get(&frn) {
             let record = &self.added[index as usize];
-            return record
-                .live
-                .then_some((record.is_dir, record.mtime_secs, record.size_bytes));
+            return record.live.then_some((
+                record.is_dir,
+                record.mtime_secs,
+                record.size_bytes,
+                record.size_exact,
+            ));
         }
         let index = base.frn_map.as_ref()?.lookup(frn)?;
         let arena = base.archived();
@@ -251,6 +257,7 @@ impl Delta {
             arena.is_dir(index),
             arena.mtime(index),
             arena.size_bytes(index),
+            arena.size_exact(index),
         ))
     }
 }
@@ -282,6 +289,15 @@ impl Delta {
             out.extend_from_slice(&(record.name.len() as u32).to_le_bytes());
             out.extend_from_slice(record.name.as_bytes());
         }
+        out.extend_from_slice(b"SCSE");
+        out.push(1);
+        let mut flags = vec![0u8; self.added.len().div_ceil(8)];
+        for (index, record) in self.added.iter().enumerate() {
+            if record.size_exact {
+                flags[index / 8] |= 1 << (index % 8);
+            }
+        }
+        out.extend_from_slice(&flags);
         out
     }
 
@@ -347,11 +363,22 @@ impl Delta {
                 mtime_secs,
                 is_dir,
                 size_bytes,
+                size_exact: !is_dir && size_bytes != 0,
                 live,
             });
         }
-        if !input.is_empty() {
-            return None;
+        if input.starts_with(b"SCSE") {
+            input = input.get(4..)?;
+            if *take(&mut input, 1)?.first()? != 1 {
+                return None;
+            }
+            let flags = take(&mut input, count.div_ceil(8))?;
+            for (index, record) in added.iter_mut().enumerate() {
+                record.size_exact = flags[index / 8] & (1 << (index % 8)) != 0;
+            }
+            if !input.is_empty() {
+                return None;
+            }
         }
         Some(Self {
             tombstones,

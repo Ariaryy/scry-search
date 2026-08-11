@@ -209,6 +209,13 @@ struct IndexAssembly<'a> {
     parent_frns: Vec<u64>,
 }
 
+struct IndexMetadata {
+    is_dir: bool,
+    mtime_secs: u32,
+    size_bytes: u64,
+    size_exact: bool,
+}
+
 impl<'a> IndexAssembly<'a> {
     fn new(volume: &'a str) -> Self {
         Self {
@@ -219,18 +226,15 @@ impl<'a> IndexAssembly<'a> {
         }
     }
 
-    fn push(
-        &mut self,
-        frn: u64,
-        parent_frn: u64,
-        name: &[u8],
-        is_dir: bool,
-        mtime_secs: u32,
-        size_bytes: u64,
-    ) {
-        let index =
-            self.builder
-                .push_bytes_with_metadata(name, mtime_secs, is_dir, Some(frn), size_bytes);
+    fn push(&mut self, frn: u64, parent_frn: u64, name: &[u8], metadata: IndexMetadata) {
+        let index = self.builder.push_bytes_with_metadata_exact(
+            name,
+            metadata.mtime_secs,
+            metadata.is_dir,
+            Some(frn),
+            metadata.size_bytes,
+            metadata.size_exact,
+        );
         self.frn_table.push((frn, index));
         self.parent_frns.push(parent_frn);
     }
@@ -265,10 +269,22 @@ fn build_raw_index(
     crate::mft::MftError,
 > {
     let mut assembly = IndexAssembly::new(volume);
-    let report =
-        crate::mft::enumerate_mft_raw(volume, |frn, parent, name, is_dir, mtime, size| {
-            assembly.push(frn, parent, name, is_dir, mtime, size);
-        })?;
+    let report = crate::mft::enumerate_mft_raw(
+        volume,
+        |frn, parent, name, is_dir, mtime, size, size_exact| {
+            assembly.push(
+                frn,
+                parent,
+                name,
+                IndexMetadata {
+                    is_dir,
+                    mtime_secs: mtime,
+                    size_bytes: size,
+                    size_exact,
+                },
+            );
+        },
+    )?;
     if report.torn_records_skipped > report.emitted / 100 {
         return Err(crate::mft::MftError::Invalid("excessive torn-record rate"));
     }
@@ -281,7 +297,17 @@ fn build_usn_index(
 ) -> Result<(scry_core::Arena, Vec<scry_core::frnmap::FrnEntry>), WindowsBackendError> {
     let mut assembly = IndexAssembly::new(volume);
     enumerate_mft_usn(volume, |frn, parent, name, is_dir, mtime, size| {
-        assembly.push(frn, parent, name, is_dir, mtime, size);
+        assembly.push(
+            frn,
+            parent,
+            name,
+            IndexMetadata {
+                is_dir,
+                mtime_secs: mtime,
+                size_bytes: size,
+                size_exact: false,
+            },
+        );
     })?;
     Ok(assembly.finish())
 }

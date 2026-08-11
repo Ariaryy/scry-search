@@ -326,6 +326,7 @@ fn materialize(c: &mut Criterion) {
                 size: 0,
                 mtime: 0,
                 is_dir: false,
+                size_exact: true,
             })
             .collect();
         group.bench_with_input(BenchmarkId::from_parameter(count), &hits, |b, hits| {

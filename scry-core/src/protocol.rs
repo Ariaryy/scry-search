@@ -93,6 +93,7 @@ pub struct ResultEntry {
     /// Modification time, seconds since the Unix epoch.
     pub mtime: u32,
     pub is_dir: bool,
+    pub size_exact: bool,
 }
 
 pub fn encode_request(req: &Request) -> Vec<u8> {
@@ -127,6 +128,11 @@ pub fn encode_results(entries: &[ResultEntry]) -> Vec<u8> {
         buf.extend_from_slice(&e.mtime.to_le_bytes());
         buf.push(e.is_dir as u8);
     }
+    buf.extend_from_slice(b"SCRE");
+    buf.push(1);
+    for entry in entries {
+        buf.push(entry.size_exact as u8);
+    }
     buf
 }
 
@@ -144,7 +150,25 @@ pub fn decode_results(buf: &[u8]) -> Option<Vec<ResultEntry>> {
             size,
             mtime,
             is_dir,
+            size_exact: !is_dir && size != 0,
         });
+    }
+    let remaining = &buf[c.pos..];
+    if remaining.starts_with(b"SCRE") {
+        let mut trailer = Cursor::new(&remaining[4..]);
+        if trailer.read_u8()? != 1 {
+            return None;
+        }
+        for entry in &mut out {
+            entry.size_exact = match trailer.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+        }
+        if trailer.pos != remaining.len() - 4 {
+            return None;
+        }
     }
     Some(out)
 }
@@ -232,12 +256,14 @@ mod tests {
                 size: 10,
                 mtime: 1_700_000_000,
                 is_dir: false,
+                size_exact: true,
             },
             ResultEntry {
                 path: "C:\\dir".into(),
                 size: 0,
                 mtime: 0,
                 is_dir: true,
+                size_exact: false,
             },
         ];
         let bytes = encode_results(&entries);
@@ -245,6 +271,20 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].path, "C:\\a.txt");
         assert!(decoded[1].is_dir);
+        assert!(decoded[0].size_exact);
+        assert!(!decoded[1].size_exact);
+
+        let legacy = &bytes[..bytes.len() - 7];
+        let decoded = decode_results(legacy).unwrap();
+        assert!(decoded[0].size_exact, "nonzero legacy file is safely exact");
+        assert!(
+            !decoded[1].size_exact,
+            "legacy directory is not provably exact"
+        );
+
+        let mut malformed = legacy.to_vec();
+        malformed.extend_from_slice(b"SCRE\x01\x01");
+        assert!(decode_results(&malformed).is_none());
     }
 
     #[test]

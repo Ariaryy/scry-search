@@ -823,6 +823,9 @@ fn compaction_scratch_names(volume: &str) -> Vec<String> {
             "parents.spool",
             "mtimes.spool",
             "sizes.spool",
+            "size-exact-inputs.spool",
+            "size-unknown-dfs.spool",
+            "size-exact.spool",
             "trigram.spool",
             "dfs-positions.spool",
             "dfs-records.spool",
@@ -2369,6 +2372,7 @@ mod tests {
             size,
             mtime,
             is_dir: false,
+            size_exact: false,
         };
         let query = Query::Substring("report".to_string());
         let merged = vec![
@@ -2444,6 +2448,7 @@ eport.txt"
             size: 0,
             mtime: 0,
             is_dir: false,
+            size_exact: false,
         };
         let mut hits = vec![
             (1, hit(2, 30)),
@@ -2468,6 +2473,7 @@ eport.txt"
             size: 0,
             mtime: 0,
             is_dir: false,
+            size_exact: false,
         };
         let input = vec![
             (2, hit(8, 4)),

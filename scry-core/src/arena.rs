@@ -65,6 +65,8 @@ pub struct Arena {
     /// Cold: same eviction rationale as `mtimes`. 0 means unknown (USN path),
     /// not empty — see the `size` limitation note in CLAUDE.md.
     pub sizes: Vec<u32>,
+    /// One LSB-first exactness bit per name-sorted record.
+    pub size_exact_bits: Vec<u8>,
     /// Trigram row matrix; each row has one LSB-first bit per 1024 records.
     pub trigram_index: Vec<u8>,
     /// Depth-first position of each record, indexed by name-sorted record.
@@ -107,6 +109,11 @@ impl Arena {
         self.parents.is_empty()
     }
 
+    #[inline]
+    pub fn size_exact(&self, idx: u32) -> bool {
+        bitmap_get(&self.size_exact_bits, idx as usize)
+    }
+
     /// Parent edge retained by the deterministic DFS spanning forest.
     /// Corrupt cycle/self/dangling edges that DFS had to skip read as roots.
     #[inline]
@@ -145,6 +152,42 @@ fn canonical_tree_parent(
     } else {
         PARENT_NONE
     }
+}
+
+#[inline]
+fn bitmap_get(bits: &[u8], index: usize) -> bool {
+    bits.get(index / 8)
+        .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+}
+
+#[inline]
+fn bitmap_set(bits: &mut [u8], index: usize) {
+    bits[index / 8] |= 1 << (index % 8);
+}
+
+fn derive_size_exact_bits(parents: &[u32], dfs: &crate::dfs::DfsLayout, raw: &[bool]) -> Vec<u8> {
+    let mut unknown_dfs = vec![0u8; parents.len().div_ceil(8)];
+    for (record, &exact) in raw.iter().enumerate() {
+        if !word_is_dir(parents[record]) && !exact {
+            bitmap_set(&mut unknown_dfs, dfs.positions[record] as usize);
+        }
+    }
+    let samples = crate::bitvec::build_superblocks(&unknown_dfs);
+    let rank = crate::bitvec::RankSelect::new(&unknown_dfs, &samples);
+    let mut result = vec![0u8; parents.len().div_ceil(8)];
+    for record in 0..parents.len() {
+        let exact = if word_is_dir(parents[record]) {
+            let start = dfs.positions[record] as usize;
+            let end = dfs.subtree_ends[record] as usize;
+            rank.rank1(start) == rank.rank1(end)
+        } else {
+            raw[record]
+        };
+        if exact {
+            bitmap_set(&mut result, record);
+        }
+    }
+    result
 }
 
 // ── varint helpers (unsigned LEB128) ─────────────────────────────────────────
@@ -432,6 +475,11 @@ impl ArchivedArena {
     #[inline]
     pub fn size_bytes(&self, idx: u32) -> u64 {
         self.sizes[idx as usize] as u64 * 1024
+    }
+
+    #[inline]
+    pub fn size_exact(&self, idx: u32) -> bool {
+        bitmap_get(self.size_exact_bits.as_slice(), idx as usize)
     }
 
     /// Depth-first position of record `idx` in tree order.
@@ -1000,6 +1048,7 @@ pub struct ArenaBuilder {
     mtimes: Vec<u32>,
     dirs: Vec<bool>,
     sizes: Vec<u64>,
+    size_exact: Vec<bool>,
     frns: Vec<Option<u64>>,
     journal_id: u64,
     next_usn: i64,
@@ -1018,6 +1067,7 @@ impl ArenaBuilder {
             mtimes: Vec::with_capacity(entries),
             dirs: Vec::with_capacity(entries),
             sizes: Vec::with_capacity(entries),
+            size_exact: Vec::with_capacity(entries),
             frns: Vec::with_capacity(entries),
             journal_id: 0,
             next_usn: 0,
@@ -1061,6 +1111,18 @@ impl ArenaBuilder {
         frn: Option<u64>,
         size_bytes: u64,
     ) -> u32 {
+        self.push_bytes_with_metadata_exact(name, mtime_secs, is_dir, frn, size_bytes, true)
+    }
+
+    pub fn push_bytes_with_metadata_exact(
+        &mut self,
+        name: &[u8],
+        mtime_secs: u32,
+        is_dir: bool,
+        frn: Option<u64>,
+        size_bytes: u64,
+        size_exact: bool,
+    ) -> u32 {
         let idx = self.name_ends.len() as u32;
         self.staging_names.extend_from_slice(name);
         self.name_ends.push(self.staging_names.len() as u32);
@@ -1069,6 +1131,7 @@ impl ArenaBuilder {
         self.dirs.push(is_dir);
         self.frns.push(frn);
         self.sizes.push(size_bytes);
+        self.size_exact.push(size_exact);
         idx
     }
 
@@ -1134,6 +1197,7 @@ impl ArenaBuilder {
         let mut out_parents: Vec<u32> = Vec::with_capacity(n);
         let mut out_mtimes: Vec<u32> = Vec::with_capacity(n);
         let mut out_sizes: Vec<u32> = Vec::with_capacity(n);
+        let mut out_size_exact = Vec::with_capacity(n);
         for &orig in &order {
             let orig_parent = self.parents[orig as usize];
             let new_parent = if orig_parent == PARENT_NONE {
@@ -1144,6 +1208,7 @@ impl ArenaBuilder {
             out_parents.push(pack_parent(new_parent, self.dirs[orig as usize]));
             out_mtimes.push(self.mtimes[orig as usize]);
             out_sizes.push(bytes_to_size_kib(self.sizes[orig as usize]));
+            out_size_exact.push(self.size_exact[orig as usize]);
         }
         let frn_entries = order
             .iter()
@@ -1187,6 +1252,7 @@ impl ArenaBuilder {
         // 5. Tree order, over the *remapped* parents — `dfs` indexes records
         // the same way every other column does.
         let dfs = crate::dfs::build(&out_parents);
+        let size_exact_bits = derive_size_exact_bits(&out_parents, &dfs, &out_size_exact);
         // 6. Recursive-size prefix sums, over the same tree order and the
         // just-built size column — see the `dfs_size_prefix` doc comment.
         let dfs_size_prefix = crate::dfs::prefix_sums_u64(&dfs.records, &out_sizes);
@@ -1202,6 +1268,7 @@ impl ArenaBuilder {
                 parents: out_parents,
                 mtimes: out_mtimes,
                 sizes: out_sizes,
+                size_exact_bits,
                 trigram_index,
                 dfs_positions: dfs.positions,
                 dfs_records: dfs.records,
@@ -1245,6 +1312,7 @@ pub struct SpooledArenaBuilder {
     parents: Spool<u32>,
     mtimes: Spool<u32>,
     sizes: Spool<u32>,
+    size_exact_inputs: Spool<u8>,
     trigram_index: Spool<u8>,
     row_len: usize,
     journal_id: u64,
@@ -1260,6 +1328,7 @@ pub struct SpooledColumns {
     pub parents: Spool<u32>,
     pub mtimes: Spool<u32>,
     pub sizes: Spool<u32>,
+    pub size_exact_inputs: Spool<u8>,
     pub trigram_index: Spool<u8>,
     pub journal_id: u64,
     pub next_usn: i64,
@@ -1295,6 +1364,11 @@ impl SpooledArenaBuilder {
             parents: Spool::create(&dir.join("parents.spool"), total_entries, |f| on_create(f))?,
             mtimes: Spool::create(&dir.join("mtimes.spool"), total_entries, |f| on_create(f))?,
             sizes: Spool::create(&dir.join("sizes.spool"), total_entries, |f| on_create(f))?,
+            size_exact_inputs: Spool::zeroed(
+                &dir.join("size-exact-inputs.spool"),
+                total_entries.div_ceil(8),
+                |f| on_create(f),
+            )?,
             trigram_index: Spool::zeroed(&dir.join("trigram.spool"), trigram_len, |f| {
                 on_create(f)
             })?,
@@ -1322,6 +1396,7 @@ impl SpooledArenaBuilder {
         mtime_secs: u32,
         is_dir: bool,
         size_bytes: u64,
+        size_exact: bool,
         raw_parent: u32,
     ) -> u32 {
         let idx = self.parents.len() as u32;
@@ -1330,6 +1405,13 @@ impl SpooledArenaBuilder {
         self.parents.push(pack_parent(raw_parent, is_dir));
         self.mtimes.push(mtime_secs);
         self.sizes.push(bytes_to_size_kib(size_bytes));
+        if size_exact {
+            let byte = idx as usize / 8;
+            self.size_exact_inputs.set(
+                byte,
+                self.size_exact_inputs.get(byte) | (1 << (idx as usize % 8)),
+            );
+        }
         idx
     }
 
@@ -1352,12 +1434,48 @@ impl SpooledArenaBuilder {
             parents: self.parents,
             mtimes: self.mtimes,
             sizes: self.sizes,
+            size_exact_inputs: self.size_exact_inputs,
             trigram_index: self.trigram_index,
             journal_id: self.journal_id,
             next_usn: self.next_usn,
             volume_serial: self.volume_serial,
         }
     }
+}
+
+pub fn derive_spooled_size_exact(
+    parents: &[u32],
+    raw: &Spool<u8>,
+    dfs: &crate::dfs::FileBackedDfsLayout,
+    dir: &Path,
+    on_create: &impl Fn(&File),
+) -> io::Result<Spool<u8>> {
+    let bytes = parents.len().div_ceil(8);
+    let mut unknown = Spool::zeroed(&dir.join("size-unknown-dfs.spool"), bytes, |f| on_create(f))?;
+    for (record, &parent) in parents.iter().enumerate() {
+        if !word_is_dir(parent) && !bitmap_get(raw.as_slice(), record) {
+            let position = dfs.positions.get(record) as usize;
+            let byte = position / 8;
+            unknown.set(byte, unknown.get(byte) | (1 << (position % 8)));
+        }
+    }
+    let samples = crate::bitvec::build_superblocks(unknown.as_slice());
+    let rank = crate::bitvec::RankSelect::new(unknown.as_slice(), &samples);
+    let mut result = Spool::zeroed(&dir.join("size-exact.spool"), bytes, |f| on_create(f))?;
+    for (record, &parent) in parents.iter().enumerate() {
+        let exact = if word_is_dir(parent) {
+            let start = dfs.positions.get(record) as usize;
+            let end = dfs.subtree_ends.get(record) as usize;
+            rank.rank1(start) == rank.rank1(end)
+        } else {
+            bitmap_get(raw.as_slice(), record)
+        };
+        if exact {
+            let byte = record / 8;
+            result.set(byte, result.get(byte) | (1 << (record % 8)));
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1427,7 +1545,7 @@ mod tests {
         for &i in &order {
             let (name, is_dir, mtime, size, _) = records[i];
             streaming_indices[i] =
-                streaming.push(name.as_bytes(), mtime, is_dir, size, PARENT_NONE);
+                streaming.push(name.as_bytes(), mtime, is_dir, size, true, PARENT_NONE);
         }
         // Patch in an order unrelated to push order, matching the "parent
         // may not have been pushed yet" reality `compact`'s second pass
@@ -1440,6 +1558,14 @@ mod tests {
         let columns = streaming.finish();
         let dfs_layout =
             crate::dfs::build_file_backed(columns.parents.as_slice(), dir.path(), &|_| {}).unwrap();
+        let exact = derive_spooled_size_exact(
+            columns.parents.as_slice(),
+            &columns.size_exact_inputs,
+            &dfs_layout,
+            dir.path(),
+            &|_| {},
+        )
+        .unwrap();
         let dfs_size_prefix = crate::dfs::prefix_sums_u64_file_backed(
             &dfs_layout.records,
             &columns.sizes,
@@ -1456,6 +1582,7 @@ mod tests {
         assert_eq!(columns.parents.as_slice(), regular_arena.parents.as_slice());
         assert_eq!(columns.mtimes.as_slice(), regular_arena.mtimes.as_slice());
         assert_eq!(columns.sizes.as_slice(), regular_arena.sizes.as_slice());
+        assert_eq!(exact.as_slice(), regular_arena.size_exact_bits.as_slice());
         assert_eq!(
             columns.trigram_index.as_slice(),
             regular_arena.trigram_index.as_slice()
@@ -1500,11 +1627,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut streaming = SpooledArenaBuilder::new(count, dir.path(), &|_| {}).unwrap();
         for (name, mtime, size) in &records {
-            streaming.push(name.as_bytes(), *mtime, false, *size, PARENT_NONE);
+            streaming.push(name.as_bytes(), *mtime, false, *size, true, PARENT_NONE);
         }
         let columns = streaming.finish();
         let dfs_layout =
             crate::dfs::build_file_backed(columns.parents.as_slice(), dir.path(), &|_| {}).unwrap();
+        let exact = derive_spooled_size_exact(
+            columns.parents.as_slice(),
+            &columns.size_exact_inputs,
+            &dfs_layout,
+            dir.path(),
+            &|_| {},
+        )
+        .unwrap();
         let dfs_size_prefix = crate::dfs::prefix_sums_u64_file_backed(
             &dfs_layout.records,
             &columns.sizes,
@@ -1521,6 +1656,7 @@ mod tests {
         assert_eq!(columns.parents.as_slice(), regular_arena.parents.as_slice());
         assert_eq!(columns.mtimes.as_slice(), regular_arena.mtimes.as_slice());
         assert_eq!(columns.sizes.as_slice(), regular_arena.sizes.as_slice());
+        assert_eq!(exact.as_slice(), regular_arena.size_exact_bits.as_slice());
         assert_eq!(
             columns.trigram_index.as_slice(),
             regular_arena.trigram_index.as_slice()
@@ -1596,6 +1732,36 @@ mod tests {
         assert_eq!(archived.parents.len(), archived.dfs_records.len());
         assert_eq!(archived.parents.len(), archived.dfs_ends.len());
         assert_eq!(archived.parents.len() + 1, archived.dfs_size_prefix.len());
+        assert_eq!(archived.size_exact_bits.len(), archived.len().div_ceil(8));
+    }
+
+    #[test]
+    fn exact_empty_and_unknown_sizes_remain_distinct() {
+        let mut builder = ArenaBuilder::default();
+        let root = builder.push("root", 0, true);
+        let known =
+            builder.push_bytes_with_metadata_exact(b"known-empty.bin", 0, false, None, 0, true);
+        let unknown =
+            builder.push_bytes_with_metadata_exact(b"unknown.bin", 0, false, None, 0, false);
+        builder.set_parent(known, root);
+        builder.set_parent(unknown, root);
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exactness.rkyv");
+        save(&arena, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let archived = store.archived();
+        let find = |name: &str| {
+            (0..archived.len() as u32)
+                .find(|&record| archived.name(record) == name)
+                .unwrap()
+        };
+        let known = find("known-empty.bin");
+        let unknown = find("unknown.bin");
+        let root = find("root");
+        assert!(archived.size_exact(known));
+        assert!(!archived.size_exact(unknown));
+        assert!(!archived.size_exact(root));
     }
 
     /// `dfs` is built over the *remapped* parents, so the intervals have to
@@ -2074,6 +2240,7 @@ mod tests {
             parents,
             mtimes: vec![0, 0],
             sizes,
+            size_exact_bits: vec![0b11],
             trigram_index: Vec::new(),
             dfs_positions: dfs.positions,
             dfs_records: dfs.records,

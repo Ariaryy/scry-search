@@ -415,6 +415,7 @@ mod tests {
             size: 0,
             mtime: 0,
             is_dir: false,
+            size_exact: true,
         }
     }
 

@@ -17,7 +17,7 @@ fn raw_and_usn_enumeration_agree() {
     let raw_started = std::time::Instant::now();
     let report = match scry_fsevents::mft::enumerate_mft_raw_with_names(
         "C:",
-        |frn, _, _, is_dir, _, size| {
+        |frn, _, _, is_dir, _, size, _size_exact| {
             raw_frns.insert(frn);
             if !is_dir {
                 sizes_seen += 1;

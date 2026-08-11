@@ -106,7 +106,7 @@ struct PassState {
 
 pub fn enumerate_mft_raw(
     volume: &str,
-    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64, bool),
 ) -> Result<MftEnumReport, MftError> {
     enumerate_mft_raw_with_names(volume, &mut sink, |_, _, _| {})
 }
@@ -114,7 +114,7 @@ pub fn enumerate_mft_raw(
 #[doc(hidden)]
 pub fn enumerate_mft_raw_with_names(
     volume: &str,
-    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    mut sink: impl FnMut(u64, u64, &[u8], bool, u32, u64, bool),
     mut name_sink: impl FnMut(u64, &[attr::FileNameInfo], bool),
 ) -> Result<MftEnumReport, MftError> {
     let geometry = read_volume_boot(volume)?;
@@ -316,7 +316,7 @@ fn parse_and_emit(
     bytes: &mut [u8],
     geometry: VolumeGeometry,
     stream_record: u64,
-    sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64, bool),
     name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo], bool),
     state: &mut PassState,
 ) -> Result<(), MftError> {
@@ -422,6 +422,7 @@ fn parse_and_emit(
         record.is_dir(),
         mtime,
         size,
+        has_data,
     );
     note_emitted(&mut state.report, record.is_dir(), size, has_data);
     Ok(())
@@ -431,7 +432,7 @@ fn resolve_deferred(
     volume: &str,
     geometry: VolumeGeometry,
     runs: &[Run],
-    sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64),
+    sink: &mut impl FnMut(u64, u64, &[u8], bool, u32, u64, bool),
     name_sink: &mut impl FnMut(u64, &[attr::FileNameInfo], bool),
     state: &mut PassState,
 ) -> Result<(), MftError> {
@@ -543,6 +544,7 @@ fn resolve_deferred(
                 base.is_dir,
                 resolved_mtimes[base_index].unwrap_or(base.mtime),
                 size,
+                size_known,
             );
             note_emitted(&mut state.report, base.is_dir, size, size_known);
         }

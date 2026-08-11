@@ -122,7 +122,22 @@ fn parse_order(value: &str) -> Option<Order> {
 
 fn print_entry(entry: &ResultEntry) {
     let marker = if entry.is_dir { "/" } else { "" };
-    println!("{}{marker}\t{}\t{}", entry.path, entry.size, entry.mtime);
+    println!(
+        "{}{marker}\t{}\t{}",
+        entry.path,
+        display_size(entry),
+        entry.mtime
+    );
+}
+
+fn display_size(entry: &ResultEntry) -> String {
+    if entry.size_exact {
+        entry.size.to_string()
+    } else if entry.is_dir && entry.size > 0 {
+        format!(">={}", entry.size)
+    } else {
+        "?".into()
+    }
 }
 
 fn run_interactive(
@@ -284,6 +299,7 @@ mod tests {
             is_dir: false,
             size: 0,
             mtime: 0,
+            size_exact: false,
         }];
         let mut output = Vec::new();
         let mut lines = 0;
@@ -292,5 +308,20 @@ mod tests {
         assert!(rendered.contains("scry> it  searching..."));
         assert!(rendered.contains("volume\\item"));
         assert!(!rendered.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn sizes_distinguish_exact_lower_bound_and_unknown() {
+        let entry = |size, is_dir, size_exact| ResultEntry {
+            path: "item".into(),
+            size,
+            mtime: 0,
+            is_dir,
+            size_exact,
+        };
+        assert_eq!(display_size(&entry(42, false, true)), "42");
+        assert_eq!(display_size(&entry(0, false, true)), "0");
+        assert_eq!(display_size(&entry(42, true, false)), ">=42");
+        assert_eq!(display_size(&entry(0, false, false)), "?");
     }
 }

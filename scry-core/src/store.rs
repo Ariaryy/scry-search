@@ -197,6 +197,7 @@ pub struct ArenaColumns<'a> {
     pub parents: &'a [u32],
     pub mtimes: &'a [u32],
     pub sizes: &'a [u32],
+    pub size_exact_bits: &'a [u8],
     pub trigram_index: &'a [u8],
     pub dfs_positions: &'a [u32],
     pub dfs_records: &'a [u32],
@@ -211,6 +212,7 @@ pub struct ArenaColumnsResolver {
     parents: VecResolver,
     mtimes: VecResolver,
     sizes: VecResolver,
+    size_exact_bits: VecResolver,
     trigram_index: VecResolver,
     dfs_positions: VecResolver,
     dfs_records: VecResolver,
@@ -248,6 +250,13 @@ impl rkyv::Archive for ArenaColumns<'_> {
         ArchivedVec::resolve_from_len(self.mtimes.len(), pos + fp, resolver.mtimes, fo);
         let (fp, fo) = rkyv::out_field!(out.sizes);
         ArchivedVec::resolve_from_len(self.sizes.len(), pos + fp, resolver.sizes, fo);
+        let (fp, fo) = rkyv::out_field!(out.size_exact_bits);
+        ArchivedVec::resolve_from_len(
+            self.size_exact_bits.len(),
+            pos + fp,
+            resolver.size_exact_bits,
+            fo,
+        );
         let (fp, fo) = rkyv::out_field!(out.trigram_index);
         ArchivedVec::resolve_from_len(
             self.trigram_index.len(),
@@ -292,6 +301,9 @@ impl<S: rkyv::ser::Serializer + ?Sized> rkyv::Serialize<S> for ArenaColumns<'_> 
             unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.mtimes, serializer)? };
         let sizes =
             unsafe { ArchivedVec::<u32>::serialize_copy_from_slice(self.sizes, serializer)? };
+        let size_exact_bits = unsafe {
+            ArchivedVec::<u8>::serialize_copy_from_slice(self.size_exact_bits, serializer)?
+        };
         let trigram_index = unsafe {
             ArchivedVec::<u8>::serialize_copy_from_slice(self.trigram_index, serializer)?
         };
@@ -311,6 +323,7 @@ impl<S: rkyv::ser::Serializer + ?Sized> rkyv::Serialize<S> for ArenaColumns<'_> 
             parents,
             mtimes,
             sizes,
+            size_exact_bits,
             trigram_index,
             dfs_positions,
             dfs_records,
@@ -417,6 +430,8 @@ impl ArenaStore {
         let (archive, snapshot_tag) = split_header(&mmap[..])?;
         rkyv::check_archived_root::<Arena>(archive)
             .map_err(|e| StoreError::Validation(e.to_string()))?;
+        let archived = unsafe { rkyv::archived_root::<Arena>(archive) };
+        validate_column_lengths(archived)?;
         let sidecar = path.with_extension("frn");
         let frn_map = match FrnMap::open(&sidecar, snapshot_tag) {
             Ok(map) => Some(map),
@@ -457,7 +472,20 @@ pub fn archived_bytes(bytes: &[u8]) -> Result<&ArchivedArena, StoreError> {
     let (archive, _) = split_header(bytes)?;
     rkyv::check_archived_root::<Arena>(archive)
         .map_err(|e| StoreError::Validation(e.to_string()))?;
-    Ok(unsafe { rkyv::archived_root::<Arena>(archive) })
+    let archived = unsafe { rkyv::archived_root::<Arena>(archive) };
+    validate_column_lengths(archived)?;
+    Ok(archived)
+}
+
+fn validate_column_lengths(arena: &ArchivedArena) -> Result<(), StoreError> {
+    let expected = arena.parents.len().div_ceil(8);
+    if arena.size_exact_bits.len() != expected {
+        return Err(StoreError::Validation(format!(
+            "size exactness bitmap has {} bytes, expected {expected}",
+            arena.size_exact_bits.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Return the archived root after the caller has validated this exact,
@@ -507,6 +535,7 @@ mod tests {
             parents: &arena.parents,
             mtimes: &arena.mtimes,
             sizes: &arena.sizes,
+            size_exact_bits: &arena.size_exact_bits,
             trigram_index: &arena.trigram_index,
             dfs_positions: &arena.dfs_positions,
             dfs_records: &arena.dfs_records,
