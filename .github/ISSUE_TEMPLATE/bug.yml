@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Scry version or commit
-      placeholder: 0.1.0-alpha.1
+      description: Paste `scry --version`, the release tag, or the source commit.
     validations:
       required: true
   - type: input
