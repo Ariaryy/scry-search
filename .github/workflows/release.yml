@@ -25,8 +25,10 @@ jobs:
           Copy-Item scripts/install-daemon.ps1,scripts/uninstall-daemon.ps1 dist/scry/
           Copy-Item LICENSE,README.md dist/scry/
           Copy-Item docs/users dist/scry/docs -Recurse
-          Compress-Archive -Path dist/scry/* -DestinationPath dist/scry-search-windows-x86_64.zip
+          $archive = "dist/scry-search-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+          Compress-Archive -Path dist/scry/* -DestinationPath $archive
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/scry-search-windows-x86_64.zip
+          files: dist/scry-search-*-windows-x86_64.zip
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
