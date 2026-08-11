@@ -3,6 +3,8 @@
 
 use std::ffi::c_void;
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 
 type Handle = *mut c_void;
 type Bool = i32;
@@ -17,6 +19,22 @@ const ENABLE_PROCESSED_INPUT: Dword = 0x0001;
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
 
 const KEY_EVENT: u16 = 0x0001;
+const VK_BACK: u16 = 0x08;
+const VK_RETURN: u16 = 0x0D;
+const VK_ESCAPE: u16 = 0x1B;
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
+const SW_SHOWNORMAL: i32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Character(u16),
+    Backspace,
+    Enter,
+    Escape,
+    Up,
+    Down,
+}
 
 /// Layout of `_KEY_EVENT_RECORD` — matches the real Win32 struct byte for
 /// byte (including the union collapsed to its `UnicodeChar` member) so it
@@ -44,6 +62,32 @@ struct InputRecord {
     key_event: KeyEventRecord,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Coord {
+    x: i16,
+    y: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SmallRect {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ConsoleScreenBufferInfo {
+    size: Coord,
+    cursor_position: Coord,
+    attributes: u16,
+    window: SmallRect,
+    maximum_window_size: Coord,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn GetStdHandle(std_handle: Dword) -> Handle;
@@ -56,6 +100,22 @@ extern "system" {
         length: Dword,
         events_read: *mut Dword,
     ) -> Bool;
+    fn GetConsoleScreenBufferInfo(
+        console_output: Handle,
+        info: *mut ConsoleScreenBufferInfo,
+    ) -> Bool;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteW(
+        window: Handle,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show_command: i32,
+    ) -> isize;
 }
 
 /// Puts stdin into raw, unbuffered, unechoed mode and stdout into ANSI mode
@@ -97,6 +157,8 @@ impl RawMode {
             }
             SetConsoleMode(output, output_original | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 
+            let _ = std::io::stdout().write_all(b"\x1b[?1049h\x1b[H");
+
             Some(Self {
                 input,
                 input_original,
@@ -112,8 +174,8 @@ impl RawMode {
         ok != 0 && count > 0
     }
 
-    /// Returns a buffered character without waiting for console input.
-    pub fn try_read_char(&self) -> Option<u16> {
+    /// Returns a buffered key without waiting for console input.
+    pub fn try_read_key(&self) -> Option<Key> {
         while self.has_pending_input() {
             let mut record = InputRecord::default();
             let mut read = 0;
@@ -122,14 +184,32 @@ impl RawMode {
                     return None;
                 }
             }
-            if record.event_type == KEY_EVENT
-                && record.key_event.key_down != 0
-                && record.key_event.unicode_char != 0
-            {
-                return Some(record.key_event.unicode_char);
+            if record.event_type == KEY_EVENT && record.key_event.key_down != 0 {
+                let key = match record.key_event.virtual_key_code {
+                    VK_BACK => Some(Key::Backspace),
+                    VK_RETURN => Some(Key::Enter),
+                    VK_ESCAPE => Some(Key::Escape),
+                    VK_UP => Some(Key::Up),
+                    VK_DOWN => Some(Key::Down),
+                    _ if record.key_event.unicode_char != 0 => {
+                        Some(Key::Character(record.key_event.unicode_char))
+                    }
+                    _ => None,
+                };
+                if key.is_some() {
+                    return key;
+                }
             }
         }
         None
+    }
+
+    pub fn width(&self) -> usize {
+        let mut info = ConsoleScreenBufferInfo::default();
+        if unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } == 0 {
+            return 80;
+        }
+        usize::try_from(info.window.right - info.window.left + 1).unwrap_or(80)
     }
 }
 
@@ -139,7 +219,29 @@ impl Drop for RawMode {
             SetConsoleMode(self.input, self.input_original);
             SetConsoleMode(self.output, self.output_original);
         }
-        // Leave the cursor on a fresh line rather than mid-render.
-        let _ = std::io::stdout().write_all(b"\r\n");
+        let _ = std::io::stdout().write_all(b"\x1b[?1049l");
+    }
+}
+
+/// Opens a file with its registered application or a directory in Explorer.
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "Windows could not open the selected path (ShellExecuteW code {result})"
+        )))
     }
 }
