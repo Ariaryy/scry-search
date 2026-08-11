@@ -6,6 +6,16 @@
 
 Fast path search · live NTFS updates · embeddable Rust client · local-only IPC
 
+<p>
+  <a href="#install">Quick start</a> ·
+  <a href="docs/users/search-syntax.md">Query language</a> ·
+  <a href="docs/users/cli.md">CLI</a> ·
+  <a href="docs/users/rust-client.md">Rust client</a> ·
+  <a href="docs/users/ipc.md">IPC</a> ·
+  <a href="docs/internal/architecture.md">Architecture</a> ·
+  <a href="https://github.com/Ariaryy/scry-search/releases">Releases</a>
+</p>
+
 </div>
 
 Scry Search (`scry` for short) indexes fixed NTFS volumes from filesystem metadata, keeps a compact
@@ -59,6 +69,15 @@ limit all matter. No numbers below compare Scry with another product.
 | Ten-minute idle run after compaction | 236,232 records, 1 Hz sampling | 18.43–18.50 MB private commit; 1.95–3.04 MB working set; zero observed I/O/reindexes/compactions |
 | Idle Task Manager snapshot | current daemon, mapped pages mostly cold | ~3 MB private / ~7 MB total / ~4 MB shared working set |
 
+Task Manager working-set values are not a fixed idle promise. Active
+`SearchSession`s retain bounded refinement candidates, and recent searches or
+indexing touch memory-mapped snapshot pages that Windows may keep resident for
+a while. Total and shared working set can therefore rise temporarily—sometimes
+substantially—then fall as those pages become cold and the OS reclaims them.
+Private working set and process commit are more useful indicators of memory the
+daemon uniquely owns; mapped pages are shared/reclaimable but still appear in
+the displayed total.
+
 The maintained synthetic and live-snapshot probes are ignored tests so normal
 CI stays deterministic. Reproduce the portable suite with:
 
@@ -72,22 +91,34 @@ snapshot or volume; see [internal performance notes](docs/internal/query-latency
 
 ## Install
 
-Download and extract the Windows archive, then run:
+[Download the latest release](https://github.com/Ariaryy/scry-search/releases),
+extract the archive, open PowerShell inside the extracted folder, then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install-daemon.ps1
 ```
 
+Releases are not code-signed yet, so Windows SmartScreen may warn about the
+downloaded archive or executables. Verify that the download came from this
+repository's Releases page before choosing **Run anyway**.
+
 Windows shows one UAC prompt. The script registers `scryd.exe` as a
 highest-privilege **per-user scheduled task** at logon and starts it. Scry uses
 this instead of a system service because its snapshot, clients, and IPC endpoint
-are user-scoped. It installs the binaries under
+are user-scoped.
+
+The installer copies the binaries to
 `%LOCALAPPDATA%\Programs\Scry Search\bin` and adds that directory to the user
 `PATH`, so `scry` is available in new terminals. The extracted archive can then
-be deleted. Per-volume snapshots and their FRN sidecars are stored separately
-under `%LOCALAPPDATA%\scry` as `index-<volume>.rkyv` and
+be deleted.
+
+Per-volume snapshots and their FRN sidecars are stored separately under
+`%LOCALAPPDATA%\scry` as `index-<volume>.rkyv` and
 `index-<volume>.frn`. Uninstalling the binaries preserves this index data so a
 later reinstall does not require rebuilding it unnecessarily.
+
+To upgrade, download the newer release and run its installer again. It replaces
+the installed binaries and preserves existing per-volume snapshots.
 
 To remove the startup task while preserving snapshots:
 
@@ -98,12 +129,15 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Scry Search
 ### Build from source
 
 ```powershell
+git clone https://github.com/Ariaryy/scry-search.git
+cd scry-search
+
 cargo build --profile daemon-release -p scry-daemon
 cargo build --release -p scry-cli
 ```
 
 `scryd` needs elevation for complete raw NTFS indexing. `scry` and applications
-using the client SDK stay unelevated.
+using the Rust client stay unelevated.
 
 Initial indexing is the exceptional heavy phase: it reads volume metadata and
 can temporarily raise memory usage as pages are built and touched. By default,
@@ -144,7 +178,7 @@ if let Some(results) = search.poll_latest()? {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-See the [Rust SDK guide](docs/users/rust-client.md), [IPC guide](docs/users/ipc.md),
+See the [Rust client guide](docs/users/rust-client.md), [IPC guide](docs/users/ipc.md),
 and runnable [`examples/`](examples/). A stable C ABI is not available yet.
 
 ## Architecture
@@ -176,7 +210,8 @@ boundaries.
 - The fallback enumerator cannot recover every size available to the raw MFT
   reader; unknown sizes remain explicitly marked unknown.
 - Snapshot and IPC compatibility are currently release-coupled.
-- The Rust SDK is the supported embedding API today.
+- The Rust client is the supported embedding API today.
+- Linux support is planned for a future release.
 
 ## Contributing
 
