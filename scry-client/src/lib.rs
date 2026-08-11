@@ -37,6 +37,13 @@ pub struct Client {
     pending_interactive: u64,
 }
 
+/// Long-lived, latest-wins query stream for interactive applications.
+pub struct SearchSession {
+    client: Client,
+    limit: u32,
+    order: Order,
+}
+
 impl Client {
     /// A daemon creates the next named-pipe instance immediately after
     /// accepting the previous one, but there is a small interval where
@@ -77,6 +84,14 @@ impl Client {
             last_handshake: None,
             pending_interactive: 0,
         })
+    }
+
+    pub fn into_search_session(self, limit: u32) -> SearchSession {
+        SearchSession {
+            client: self,
+            limit,
+            order: Order::default(),
+        }
     }
 
     pub fn query(
@@ -120,14 +135,8 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("malformed statistics response from scryd"))
     }
 
-    /// As-you-type querying over a single pipelined connection: writes the
-    /// request immediately (even if an earlier call's response hasn't been
-    /// read yet), then reads and discards every response older than this
-    /// one before returning it. A caller that fires a request per keystroke
-    /// without waiting for each response therefore always sees the answer to
-    /// its latest keystroke, never a stale one — at the cost of a stale
-    /// (possibly empty) result briefly reaching the caller for the discarded
-    /// requests, since each still yields exactly one response frame.
+    /// Blocking convenience call for an interactive query. Use
+    /// [`SearchSession`] when input and result rendering must stay responsive.
     pub fn search_interactive(
         &mut self,
         kind: QueryKind,
@@ -138,21 +147,28 @@ impl Client {
         self.recv_interactive()
     }
 
-    /// Writes an as-you-type request without blocking for its response —
-    /// see `search_interactive`. Split out so a caller can echo the typed
-    /// pattern immediately and only block on `recv_interactive` once it has
-    /// nothing left to send, instead of round-tripping per keystroke.
+    /// Writes an as-you-type request without waiting for its response.
     pub fn send_interactive(
         &mut self,
         kind: QueryKind,
         pattern: &str,
         limit: u32,
     ) -> anyhow::Result<()> {
+        self.send_interactive_ordered(kind, pattern, limit, Order::default())
+    }
+
+    pub fn send_interactive_ordered(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+        order: Order,
+    ) -> anyhow::Result<()> {
         let req = Request {
             kind,
             pattern: pattern.to_string(),
             limit,
-            order: Order::default(),
+            order,
         };
         self.pipe.write_frame(&encode_request(&req))?;
         self.pending_interactive += 1;
@@ -175,6 +191,25 @@ impl Client {
         }
         let resp = latest.expect("pending_interactive was > 0 above");
         decode_results(&resp).ok_or_else(|| anyhow::anyhow!("malformed response from scryd"))
+    }
+
+    /// Reads completed interactive replies without waiting for an in-flight
+    /// query. Older replies are discarded; only the newest may be returned.
+    pub fn try_recv_interactive(&mut self) -> anyhow::Result<Option<Vec<ResultEntry>>> {
+        while self.pending_interactive > 0 && self.pipe.pending_bytes()? > 0 {
+            let response = self.pipe.read_frame()?;
+            self.pending_interactive -= 1;
+            if self.pending_interactive == 0 {
+                return decode_results(&response)
+                    .map(Some)
+                    .ok_or_else(|| anyhow::anyhow!("malformed response from scryd"));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn has_pending_interactive(&self) -> bool {
+        self.pending_interactive > 0
     }
 
     /// Search a coherent base+delta generation in this process, falling back
@@ -318,6 +353,33 @@ impl Client {
     }
 }
 
+impl SearchSession {
+    pub fn connect(limit: u32) -> anyhow::Result<Self> {
+        Ok(Client::connect()?.into_search_session(limit))
+    }
+
+    pub fn submit(&mut self, kind: QueryKind, pattern: &str) -> anyhow::Result<()> {
+        self.client
+            .send_interactive_ordered(kind, pattern, self.limit, self.order)
+    }
+
+    pub fn set_order(&mut self, order: Order) {
+        self.order = order;
+    }
+
+    pub fn poll_latest(&mut self) -> anyhow::Result<Option<Vec<ResultEntry>>> {
+        self.client.try_recv_interactive()
+    }
+
+    pub fn wait_latest(&mut self) -> anyhow::Result<Vec<ResultEntry>> {
+        self.client.recv_interactive()
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.client.has_pending_interactive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +459,39 @@ mod tests {
         assert_eq!(result, vec![entry("fresh")]);
 
         drop(client);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn interactive_poll_never_waits_for_an_inflight_query() {
+        let pipe_name = unique_pipe_name();
+        let server = scry_ipc::PipeServer::new(&pipe_name).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            let _request = pipe.read_frame().unwrap();
+            released.recv().unwrap();
+            pipe.write_frame(&encode_results(&[entry("ready")]))
+                .unwrap();
+        });
+
+        let mut session = connect(&pipe_name).into_search_session(50);
+        session.submit(QueryKind::Substring, "query").unwrap();
+        assert!(session.poll_latest().unwrap().is_none());
+        assert!(session.is_pending());
+        release.send(()).unwrap();
+
+        let result = (0..100)
+            .find_map(|_| {
+                let result = session.poll_latest().unwrap();
+                if result.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                result
+            })
+            .expect("response did not become readable");
+        assert_eq!(result, vec![entry("ready")]);
+        assert!(!session.is_pending());
         thread.join().unwrap();
     }
 
