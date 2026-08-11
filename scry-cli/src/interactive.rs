@@ -168,13 +168,24 @@ fn render_to(
         let first = selected.saturating_add(1).saturating_sub(visible_rows);
         for (index, entry) in results.iter().enumerate().skip(first).take(visible_rows) {
             let suffix = if entry.is_dir { "\\" } else { "" };
+            let metadata = format!(
+                "{}  ·  {}",
+                crate::display_size(entry),
+                crate::display_mtime(entry.mtime)
+            );
+            let metadata_width = metadata.chars().count();
+            let metadata_column = width.saturating_sub(metadata_width).saturating_add(1);
+            let path_width = metadata_column
+                .saturating_sub(4 + suffix.chars().count())
+                .max(1);
             let safe = visible_path(&entry.path);
-            let path = fit_path(&safe, width.saturating_sub(3 + suffix.len()));
+            let path = fit_path(&safe, path_width);
             if index == selected {
-                writeln!(out, "\x1b[36m›\x1b[0m \x1b[1m{path}{suffix}\x1b[0m")?;
+                write!(out, "\x1b[36m›\x1b[0m \x1b[1m{path}{suffix}\x1b[0m")?;
             } else {
-                writeln!(out, "  {path}{suffix}")?;
+                write!(out, "  {path}{suffix}")?;
             }
+            writeln!(out, "\x1b[{metadata_column}G\x1b[2m{metadata}\x1b[0m")?;
         }
     }
 

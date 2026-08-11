@@ -25,6 +25,7 @@ const VK_ESCAPE: u16 = 0x1B;
 const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
 const SW_SHOWNORMAL: i32 = 1;
+const FILETIME_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -88,6 +89,26 @@ struct ConsoleScreenBufferInfo {
     maximum_window_size: Coord,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn GetStdHandle(std_handle: Dword) -> Handle;
@@ -104,6 +125,8 @@ extern "system" {
         console_output: Handle,
         info: *mut ConsoleScreenBufferInfo,
     ) -> Bool;
+    fn FileTimeToLocalFileTime(file_time: *const FileTime, local_time: *mut FileTime) -> Bool;
+    fn FileTimeToSystemTime(file_time: *const FileTime, system_time: *mut SystemTime) -> Bool;
 }
 
 #[link(name = "shell32")]
@@ -255,4 +278,26 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
             "Windows could not open the selected path (ShellExecuteW code {result})"
         )))
     }
+}
+
+pub fn format_local_time(unix_seconds: u32) -> Option<String> {
+    if unix_seconds == 0 {
+        return None;
+    }
+    let ticks = (u64::from(unix_seconds) + FILETIME_UNIX_EPOCH_SECS) * 10_000_000;
+    let utc = FileTime {
+        low: ticks as u32,
+        high: (ticks >> 32) as u32,
+    };
+    let mut local = FileTime::default();
+    let mut system = SystemTime::default();
+    if unsafe { FileTimeToLocalFileTime(&utc, &mut local) } == 0
+        || unsafe { FileTimeToSystemTime(&local, &mut system) } == 0
+    {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        system.year, system.month, system.day, system.hour, system.minute
+    ))
 }

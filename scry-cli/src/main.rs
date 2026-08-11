@@ -153,16 +153,16 @@ fn print_entry(entry: &ResultEntry) {
         let path = visible_terminal_text(&entry.path);
         let color = if entry.is_dir { "36" } else { "37" };
         println!(
-            "  \x1b[1;{color}m{path}{marker}\x1b[0m  \x1b[2m{} KiB  ·  {}\x1b[0m",
+            "  \x1b[1;{color}m{path}{marker}\x1b[0m  \x1b[2m{}  ·  {}\x1b[0m",
             display_size(entry),
-            entry.mtime
+            display_mtime(entry.mtime)
         );
     } else {
         println!(
             "{}{marker}\t{}\t{}",
             entry.path,
             display_size(entry),
-            entry.mtime
+            display_mtime(entry.mtime)
         );
     }
 }
@@ -180,14 +180,34 @@ fn visible_terminal_text(value: &str) -> String {
         .collect()
 }
 
-fn display_size(entry: &ResultEntry) -> String {
-    if entry.size_exact {
-        entry.size.to_string()
-    } else if entry.is_dir && entry.size > 0 {
-        format!(">={}", entry.size)
-    } else {
-        "?".into()
+pub(crate) fn display_size(entry: &ResultEntry) -> String {
+    if !(entry.size_exact || entry.is_dir && entry.size > 0) {
+        return "—".into();
     }
+    let prefix = if entry.size_exact { "" } else { "≥" };
+    format!("{prefix}{}", human_size(entry.size))
+}
+
+fn human_size(kib: u64) -> String {
+    const UNITS: [&str; 6] = ["KB", "MB", "GB", "TB", "PB", "EB"];
+    if kib == 0 {
+        return "0 B".into();
+    }
+    let mut value = kib as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 10.0 || value.fract() < 0.05 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+pub(crate) fn display_mtime(mtime: u32) -> String {
+    console::format_local_time(mtime).unwrap_or_else(|| "unknown date".into())
 }
 
 fn infer_query_kind(explicit_kind: Option<QueryKind>, query: &str) -> QueryKind {
@@ -244,10 +264,11 @@ mod tests {
             is_dir,
             size_exact,
         };
-        assert_eq!(display_size(&entry(42, false, true)), "42");
-        assert_eq!(display_size(&entry(0, false, true)), "0");
-        assert_eq!(display_size(&entry(42, true, false)), ">=42");
-        assert_eq!(display_size(&entry(0, false, false)), "?");
+        assert_eq!(display_size(&entry(42, false, true)), "42 KB");
+        assert_eq!(display_size(&entry(0, false, true)), "0 B");
+        assert_eq!(display_size(&entry(42, true, false)), "≥42 KB");
+        assert_eq!(display_size(&entry(0, false, false)), "—");
+        assert_eq!(human_size(1_536), "1.5 MB");
     }
 
     #[test]
