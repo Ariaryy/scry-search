@@ -1,0 +1,42 @@
+name: Performance report
+description: Report latency, memory, CPU, disk, or power regressions
+title: "perf: "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: Performance is correctness here. Please sanitize all paths and filenames.
+  - type: input
+    id: version
+    attributes:
+      label: Scry version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine and storage
+      description: CPU, RAM, Windows version, storage type, volume filesystem.
+    validations:
+      required: true
+  - type: textarea
+    id: corpus
+    attributes:
+      label: Corpus and workload
+      description: Record count, volume count, query shape, result limit, churn, warm/cold state.
+    validations:
+      required: true
+  - type: textarea
+    id: measurement
+    attributes:
+      label: Measurement
+      description: Command, build profile, sample count, p50/p99 or peak, and before/after versions.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: User-visible impact
+    validations:
+      required: true
+

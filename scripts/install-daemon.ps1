@@ -1,7 +1,7 @@
 param([switch]$NoStart)
 
 $ErrorActionPreference = "Stop"
-$taskName = "Scry Daemon"
+$taskName = "Scry Search Daemon"
 $daemonPath = Join-Path $PSScriptRoot "scryd.exe"
 
 if (-not (Test-Path -LiteralPath $daemonPath)) {
@@ -27,5 +27,4 @@ if (-not $NoStart) {
     Start-ScheduledTask -TaskName $taskName
 }
 
-Write-Host "Installed the elevated per-user Scry daemon task."
-
+Write-Host "Installed the elevated per-user Scry Search daemon task."

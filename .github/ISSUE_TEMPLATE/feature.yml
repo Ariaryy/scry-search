@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a capability with its resource-budget impact
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or integration problem should Scry solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: budget
+    attributes:
+      label: CPU, memory, disk, and compatibility impact
+      description: Address idle cost, query cost, storage growth, write amplification, and format/API changes.
+    validations:
+      required: true
+

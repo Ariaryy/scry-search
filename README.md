@@ -1,6 +1,6 @@
 <div align="center">
 
-# Scry
+# Scry Search
 
 ### A tiny, realtime file index for Windows
 
@@ -8,11 +8,16 @@ Fast path search · live NTFS updates · embeddable Rust client · local-only IP
 
 </div>
 
-Scry indexes fixed NTFS volumes from filesystem metadata, keeps a compact
+Scry Search (`scry` for short) indexes fixed NTFS volumes from filesystem metadata, keeps a compact
 memory-mapped snapshot, follows the USN journal, and serves searches to CLIs or
 desktop applications. It is designed for software that needs a file-search
 backend without embedding filesystem crawling, persistence, ranking, and update
 tracking itself.
+
+Scry is intentionally engineered under a **harsh computing budget**. Idle CPU
+and disk activity should approach zero; memory growth must be bounded; broad
+queries must not allocate per match; and a speedup that quietly increases
+background work is usually a regression. Performance is part of correctness.
 
 > **Status:** `0.1.0-alpha.1`. The on-disk and wire formats may change
 > between versions; package matching client and daemon builds together.

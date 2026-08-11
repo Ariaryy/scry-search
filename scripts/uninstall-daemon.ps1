@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$taskName = "Scry Daemon"
+$taskName = "Scry Search Daemon"
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -15,5 +15,4 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
-Write-Host "Removed the Scry daemon task. Snapshot data was left intact."
-
+Write-Host "Removed the Scry Search daemon task. Snapshot data was left intact."

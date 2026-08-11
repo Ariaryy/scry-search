@@ -1,0 +1,35 @@
+name: Bug report
+description: Report incorrect behavior or a regression
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include personal paths, filenames, or raw index data. Use generic replacements.
+  - type: input
+    id: version
+    attributes:
+      label: Scry version or commit
+      placeholder: 0.1.0-alpha.1
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and filesystem
+      placeholder: Windows 11 24H2, NTFS
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include expected behavior, actual behavior, and minimal reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: text
+
