@@ -2259,7 +2259,7 @@ mod tests {
     /// Not a pass/fail test: exercises the daemon's real query path (cache,
     /// span accumulation, memory sampling) end to end over a synthetic
     /// corpus and prints a report, so the numbers in
-    /// `docs/query-latency-baseline.md` come from this code path rather than
+    /// `docs/internal/query-latency-baseline.md` come from this code path rather than
     /// from a description of it. Run with
     /// `cargo test -p scry-daemon --release -- --ignored span_report --nocapture`.
     #[test]
