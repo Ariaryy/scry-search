@@ -3,7 +3,8 @@
 ```text
 scry [OPTIONS] <QUERY>
 
---interactive       keep one realtime session and update while typing
+--interactive       realtime selectable search; Enter opens the selected path
+--limit N           maximum results (default 50; interactive 12)
 --prefix            force anchored leaf-name prefix matching
 --substring         force unanchored leaf-name substring matching
 --wildcard          force `*` / `?` wildcard matching
@@ -19,3 +20,9 @@ scry [OPTIONS] <QUERY>
 Plain input uses ancestor-aware path terms unless `*` or `?` selects wildcard
 matching. Metadata predicates are documented in [search syntax](search-syntax.md).
 The CLI process remains unelevated; only `scryd` requires elevation.
+
+Interactive mode uses a bounded persistent search session. Results update after
+each edit without blocking input, the latest query latency appears at the right
+of the input row, and the viewport is fully replaced so shorter result sets do
+not leave stale rows. Use `Up`/`Down` to select, `Enter` to open through Windows,
+and `Esc` or `Ctrl+C` to close.
