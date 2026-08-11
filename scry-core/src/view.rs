@@ -1655,6 +1655,49 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[ignore = "requires SCRY_LIVE_SNAPSHOT; prints short path-term phases"]
+    fn benchmark_live_short_path_term_phases() {
+        const SAMPLES: usize = 9;
+        let path = std::env::var_os("SCRY_LIVE_SNAPSHOT")
+            .expect("set SCRY_LIVE_SNAPSHOT to an index snapshot");
+        let view = IndexView::new(Arc::new(
+            ArenaStore::open(std::path::Path::new(&path)).unwrap(),
+        ));
+        let query = Query::PathTerms(vec!["a".to_owned()]);
+        for threads in [1usize, 8] {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                PATH_TERM_SCAN_NS.store(0, AtomicOrdering::Relaxed);
+                PATH_TERM_COALESCE_NS.store(0, AtomicOrdering::Relaxed);
+                PATH_TERM_ENUMERATE_NS.store(0, AtomicOrdering::Relaxed);
+                let started = std::time::Instant::now();
+                std::hint::black_box(view.search_hits_cancellable(
+                    &query,
+                    SearchOptions::new(200),
+                    None,
+                    threads,
+                ));
+                samples.push((
+                    started.elapsed().as_nanos() as u64,
+                    PATH_TERM_SCAN_NS.load(AtomicOrdering::Relaxed),
+                    PATH_TERM_COALESCE_NS.load(AtomicOrdering::Relaxed),
+                    PATH_TERM_ENUMERATE_NS.load(AtomicOrdering::Relaxed),
+                ));
+            }
+            samples.sort_unstable_by_key(|sample| sample.0);
+            let (total, scan, coalesce, enumerate) = samples[SAMPLES / 2];
+            eprintln!(
+                "records={} threads={threads}: total={:.3} ms scan={:.3} ms coalesce={:.3} ms enumerate={:.3} ms",
+                view.base.archived().len(),
+                total as f64 / 1e6,
+                scan as f64 / 1e6,
+                coalesce as f64 / 1e6,
+                enumerate as f64 / 1e6,
+            );
+        }
+    }
 }
 
 impl IndexView {
