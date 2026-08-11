@@ -7,6 +7,19 @@ use scry_core::protocol::{QueryKind, ResultEntry};
 
 use crate::console::{self, Key};
 
+#[derive(Clone, Copy)]
+enum UiStatus {
+    Searching,
+    Timed(Duration),
+    Copied,
+    CopyFailed,
+}
+
+enum Launch {
+    Open(PathBuf),
+    Reveal(PathBuf),
+}
+
 pub fn run(
     mut session: SearchSession,
     explicit_kind: Option<QueryKind>,
@@ -17,20 +30,17 @@ pub fn run(
     let mut pattern = initial;
     let mut results = Vec::new();
     let mut selected = 0;
-    let mut pending = true;
+    let mut status = UiStatus::Searching;
     let mut query_started = Instant::now();
-    let mut query_time = None;
-    let mut open = None;
+    let mut launch = None;
 
     session.submit(crate::infer_query_kind(explicit_kind, &pattern), &pattern)?;
     render(
         &pattern,
         &results,
         selected,
-        pending,
-        query_time,
-        raw.width(),
-        raw.height(),
+        status,
+        (raw.width(), raw.height()),
     );
 
     'search: loop {
@@ -38,11 +48,27 @@ pub fn run(
         let mut dirty = false;
         while let Some(key) = raw.try_read_key() {
             match key {
-                Key::Character(0x03) | Key::Escape => break 'search,
+                Key::Escape => break 'search,
                 Key::Enter => {
                     if let Some(result) = results.get(selected) {
-                        open = Some(PathBuf::from(&result.path));
+                        launch = Some(Launch::Open(PathBuf::from(&result.path)));
                         break 'search;
+                    }
+                }
+                Key::Reveal => {
+                    if let Some(result) = results.get(selected) {
+                        launch = Some(Launch::Reveal(PathBuf::from(&result.path)));
+                        break 'search;
+                    }
+                }
+                Key::Copy => {
+                    if let Some(result) = results.get(selected) {
+                        status = if console::copy_path(std::path::Path::new(&result.path)).is_ok() {
+                            UiStatus::Copied
+                        } else {
+                            UiStatus::CopyFailed
+                        };
+                        dirty = true;
                     }
                 }
                 Key::Backspace => {
@@ -70,7 +96,7 @@ pub fn run(
 
         if edited {
             selected = 0;
-            pending = true;
+            status = UiStatus::Searching;
             query_started = Instant::now();
             session.submit(crate::infer_query_kind(explicit_kind, &pattern), &pattern)?;
             dirty = true;
@@ -79,8 +105,7 @@ pub fn run(
         if let Some(latest) = session.poll_latest()? {
             results = latest;
             selected = selected.min(results.len().saturating_sub(1));
-            pending = false;
-            query_time = Some(query_started.elapsed());
+            status = UiStatus::Timed(query_started.elapsed());
             dirty = true;
         }
 
@@ -89,18 +114,19 @@ pub fn run(
                 &pattern,
                 &results,
                 selected,
-                pending,
-                query_time,
-                raw.width(),
-                raw.height(),
+                status,
+                (raw.width(), raw.height()),
             );
         }
         std::thread::sleep(Duration::from_millis(8));
     }
 
     drop(raw);
-    if let Some(path) = open {
-        console::open_path(&path)?;
+    if let Some(action) = launch {
+        match action {
+            Launch::Open(path) => console::open_path(&path)?,
+            Launch::Reveal(path) => console::reveal_path(&path)?,
+        }
     }
     Ok(())
 }
@@ -109,23 +135,11 @@ fn render(
     pattern: &str,
     results: &[ResultEntry],
     selected: usize,
-    pending: bool,
-    query_time: Option<Duration>,
-    width: usize,
-    height: usize,
+    status: UiStatus,
+    dimensions: (usize, usize),
 ) {
     let mut frame = Vec::with_capacity(4_096);
-    if render_to(
-        &mut frame,
-        pattern,
-        results,
-        selected,
-        pending,
-        query_time,
-        (width, height),
-    )
-    .is_err()
-    {
+    if render_to(&mut frame, pattern, results, selected, status, dimensions).is_err() {
         return;
     }
     let mut out = std::io::stdout().lock();
@@ -138,30 +152,30 @@ fn render_to(
     pattern: &str,
     results: &[ResultEntry],
     selected: usize,
-    pending: bool,
-    query_time: Option<Duration>,
+    status: UiStatus,
     dimensions: (usize, usize),
 ) -> std::io::Result<()> {
     let (width, height) = dimensions;
     write!(out, "\x1b[?2026h\x1b[H\x1b[J\x1b[1;36mScry Search\x1b[0m")?;
     write!(out, "\r\n\x1b[36m›\x1b[0m {pattern}\x1b[s")?;
 
-    let status = if pending {
-        "searching…".to_owned()
-    } else {
-        query_time.map(format_duration).unwrap_or_default()
+    let status_text = match status {
+        UiStatus::Searching => "searching…".to_owned(),
+        UiStatus::Timed(duration) => format_duration(duration),
+        UiStatus::Copied => "path copied".to_owned(),
+        UiStatus::CopyFailed => "copy failed".to_owned(),
     };
-    let status_width = status.chars().count();
+    let status_width = status_text.chars().count();
     let status_column = width.saturating_sub(status_width).saturating_add(1);
     let prompt_width = pattern.chars().count() + 2;
-    if !status.is_empty() && prompt_width + 2 < status_column {
-        write!(out, "\x1b[{status_column}G\x1b[2m{status}\x1b[0m")?;
+    if prompt_width + 2 < status_column {
+        write!(out, "\x1b[{status_column}G\x1b[2m{status_text}\x1b[0m")?;
     }
     write!(out, "\r\n\r\n")?;
 
     if pattern.is_empty() {
         writeln!(out, "  \x1b[2mStart typing to search your files.\x1b[0m")?;
-    } else if results.is_empty() && !pending {
+    } else if results.is_empty() && !matches!(status, UiStatus::Searching) {
         writeln!(out, "  \x1b[2mNo matches\x1b[0m")?;
     } else {
         let visible_rows = height.saturating_sub(5).max(1);
@@ -191,7 +205,7 @@ fn render_to(
 
     write!(
         out,
-        "\x1b[{height};1H\x1b[2K\x1b[2m↑/↓ select  •  Enter open  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
+        "\x1b[{height};1H\x1b[2K\x1b[2m↑/↓ select  •  Enter open  •  Ctrl+C copy  •  Alt+Enter reveal  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
     )
 }
 
@@ -256,8 +270,7 @@ mod tests {
             "new",
             &[result("volume\\new")],
             0,
-            false,
-            Some(Duration::from_micros(420)),
+            UiStatus::Timed(Duration::from_micros(420)),
             (100, 30),
         )
         .unwrap();
@@ -277,8 +290,7 @@ mod tests {
             "item",
             &[result("first"), result("second")],
             1,
-            false,
-            Some(Duration::from_millis(2)),
+            UiStatus::Timed(Duration::from_millis(2)),
             (100, 30),
         )
         .unwrap();

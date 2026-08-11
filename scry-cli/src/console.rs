@@ -24,8 +24,15 @@ const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
 const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
+const VK_C: u16 = 0x43;
 const SW_SHOWNORMAL: i32 = 1;
 const FILETIME_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+const RIGHT_ALT_PRESSED: u32 = 0x0001;
+const LEFT_ALT_PRESSED: u32 = 0x0002;
+const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+const LEFT_CTRL_PRESSED: u32 = 0x0008;
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -35,6 +42,8 @@ pub enum Key {
     Escape,
     Up,
     Down,
+    Copy,
+    Reveal,
 }
 
 /// Layout of `_KEY_EVENT_RECORD` — matches the real Win32 struct byte for
@@ -127,6 +136,10 @@ extern "system" {
     ) -> Bool;
     fn FileTimeToLocalFileTime(file_time: *const FileTime, local_time: *mut FileTime) -> Bool;
     fn FileTimeToSystemTime(file_time: *const FileTime, system_time: *mut SystemTime) -> Bool;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+    fn GlobalLock(memory: Handle) -> *mut c_void;
+    fn GlobalUnlock(memory: Handle) -> Bool;
+    fn GlobalFree(memory: Handle) -> Handle;
 }
 
 #[link(name = "shell32")]
@@ -139,6 +152,14 @@ extern "system" {
         directory: *const u16,
         show_command: i32,
     ) -> isize;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn OpenClipboard(window: Handle) -> Bool;
+    fn EmptyClipboard() -> Bool;
+    fn SetClipboardData(format: u32, memory: Handle) -> Handle;
+    fn CloseClipboard() -> Bool;
 }
 
 /// Puts stdin into raw, unbuffered, unechoed mode and stdout into ANSI mode
@@ -208,12 +229,17 @@ impl RawMode {
                 }
             }
             if record.event_type == KEY_EVENT && record.key_event.key_down != 0 {
+                let controls = record.key_event.control_key_state;
+                let alt = controls & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0;
+                let ctrl = controls & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
                 let key = match record.key_event.virtual_key_code {
                     VK_BACK => Some(Key::Backspace),
+                    VK_RETURN if alt => Some(Key::Reveal),
                     VK_RETURN => Some(Key::Enter),
                     VK_ESCAPE => Some(Key::Escape),
                     VK_UP => Some(Key::Up),
                     VK_DOWN => Some(Key::Down),
+                    VK_C if ctrl => Some(Key::Copy),
                     _ if record.key_event.unicode_char != 0 => {
                         Some(Key::Character(record.key_event.unicode_char))
                     }
@@ -278,6 +304,60 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
             "Windows could not open the selected path (ShellExecuteW code {result})"
         )))
     }
+}
+
+pub fn reveal_path(path: &Path) -> std::io::Result<()> {
+    let status = if path.is_dir() {
+        std::process::Command::new("explorer.exe")
+            .arg(path)
+            .status()
+    } else {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .status()
+    }?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "Explorer could not reveal the selected path",
+        ))
+    }
+}
+
+pub fn copy_path(path: &Path) -> std::io::Result<()> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let bytes = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return Err(std::io::Error::last_os_error());
+        }
+        let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if memory.is_null() {
+            CloseClipboard();
+            return Err(std::io::Error::last_os_error());
+        }
+        let target = GlobalLock(memory).cast::<u16>();
+        if target.is_null() {
+            GlobalFree(memory);
+            CloseClipboard();
+            return Err(std::io::Error::last_os_error());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+        GlobalUnlock(memory);
+        if SetClipboardData(CF_UNICODETEXT, memory).is_null() {
+            GlobalFree(memory);
+            CloseClipboard();
+            return Err(std::io::Error::last_os_error());
+        }
+        CloseClipboard();
+    }
+    Ok(())
 }
 
 pub fn format_local_time(unix_seconds: u32) -> Option<String> {

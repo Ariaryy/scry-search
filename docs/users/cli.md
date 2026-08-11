@@ -25,5 +25,6 @@ Interactive mode uses a bounded persistent search session. Results update after
 each edit without blocking input, the latest query latency appears at the right
 of the input row, and each result shows a human-readable size and local modified
 date. The viewport is fully replaced so shorter result sets do not leave stale
-rows. Use `Up`/`Down` to select, `Enter` to open through Windows, and `Esc` or
-`Ctrl+C` to close.
+rows. Use `Up`/`Down` to select, `Enter` to open through Windows, `Ctrl+C` to
+copy the selected path, `Alt+Enter` to reveal it in Explorer, and `Esc` to
+close.
