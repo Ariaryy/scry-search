@@ -1,108 +1,80 @@
-# Index format v6
+# Index format v10
 
-`scry-core::Arena` (`scry-core/src/arena.rs`):
+The snapshot is a validated, memory-mapped rkyv archive. Records are sorted by
+ASCII-case-insensitive leaf name; front coding and prefix search depend on that
+order. Tree order is stored separately.
 
-```rust
-Arena {
-    format_version: u32,     // = 6
-    names: Vec<u8>,          // front-coded name blob
-    bucket_offsets: Vec<u32>,// len = num_buckets + 1; last entry == names.len()
-    parents: Vec<u32>,       // bit 31 = is_dir; bits 0..30 = parent index (HOT)
-    mtimes: Vec<u32>,        // seconds since 1970-01-01 UTC, clamped to [0, 2^32-1] (COLD)
-    sizes: Vec<u32>,         // logical size in KiB, rounded up, saturating at u32::MAX (COLD)
-    trigram_index: Vec<u8>,  // trigram-to-1024-record-block bitmap matrix
-}
-```
+## Archive columns
 
-`parents`, `mtimes`, and `sizes` are index-parallel: entry `i` is described
-by `parents[i]`, `mtimes[i]`, and `sizes[i]`. They are kept separate (rather
-than interleaved into a struct) for a hot/cold split:
+| Field | Width | Purpose |
+|---|---:|---|
+| `format_version` | 4 bytes | Reject incompatible snapshots before reading fields. |
+| `journal_id`, `next_usn`, `volume_serial` | 24 bytes total | Resume and validate the volume journal cursor. |
+| `names` | variable | Front-coded UTF-8 name bytes. |
+| `bucket_offsets` | 4 bytes/bucket | Random entry into 32-record name buckets, plus sentinel. |
+| `parents` | 4 bytes/record | Packed raw parent and directory bit. |
+| `mtimes` | 4 bytes/record | Unix seconds. |
+| `sizes` | 4 bytes/record | Logical KiB, rounded up and saturating. |
+| `size_exact_bits` | 1 bit/record | Distinguishes measured zero from unknown/incomplete size. |
+| `trigram_index` | workload-dependent | One bit per 1,024-record block in each of 16,384 rows. |
+| `dfs_positions` | 4 bytes/record | Name record to canonical DFS position. |
+| `dfs_records` | 4 bytes/record | DFS position to name record. |
+| `dfs_ends` | 4 bytes/record | Exclusive canonical subtree end. |
+| `dfs_size_prefix` | 8 bytes/record + sentinel | Recursive-size prefix sum in DFS order. |
 
-- `parents` is the hot column, touched by `full_path` on every displayed
-  result. Packing it alone means a 64-byte cache line holds 16 useful parent
-  hops instead of 5 (as it would interleaved with mtime and size).
-- `mtimes` and `sizes` are cold columns read only by delta metadata lookup
-  and compaction, never on the query path. Kept separate so the OS can evict
-  those pages between compaction bursts.
+`parents`, `dfs_positions`, and `dfs_records` are hot query columns. Metadata,
+subtree ends, and size prefixes are separate so Windows can evict their pages
+when queries do not need them.
 
-## Changelog
+## Names and lookup
 
-- v6 — split the interleaved 12-byte record into three parallel 4-byte columns:
-  `parents` (hot), `mtimes` (cold), `sizes` (cold). No bytes added; same
-  fields, same widths, same semantics.
-- v5 — added KiB-quantised logical file sizes. The raw MFT path populates the
-  field; the USN fallback leaves it 0, so 0 means unknown rather than empty.
-- v4 — added the trigram block filter.
-- v3 — mtime_secs rebased from the 1601 FILETIME epoch to the Unix epoch (v2 saturated for all real timestamps).
+Bucket `b` covers records `[b*32, min(n, (b+1)*32))`. The first name stores
+`varint(length) + bytes`; later names store `varint(shared_prefix) +
+varint(suffix_length) + suffix`. Varints are unsigned LEB128. Prefix lookup
+binary-searches bucket heads and scans the bounded edge buckets.
 
-Serialized with rkyv (`scry_core::store::save`) to a single file: an atomic write via
-`.tmp` + rename. Reading (`ArenaStore::open`) mmaps the file and casts the bytes directly
-to `&ArchivedArena` — no deserialization step, validated once via `check_archived_root`
-(bytecheck) at open time, never again on the query path.
+Substring and literal-bearing regex/wildcard queries use the trigram block
+matrix. Hash collisions may add blocks but cannot remove a match. Short terms
+and patterns without a provable literal use a cancellable sequential or
+parallel bucket scan.
 
-## Name blob encoding
-Bucket b covers record indices [b*32, min(n, (b+1)*32)).
-At byte offset bucket_offsets[b]:
-- First name: varint(len) || bytes
-- Each subsequent name: varint(shared) || varint(suffix_len) || suffix_bytes
-  where shared = length of common prefix with PREVIOUS name in same bucket
+## Canonical tree
 
-varint = unsigned LEB128 (7 bits per byte, high bit = more follows)
+Live parent data may be cyclic, self-referential, or dangling. Iterative DFS
+assigns every record exactly one position and forms a deterministic spanning
+forest. `tree_parent` accepts a raw edge only when the child lies in the raw
+parent's stored subtree. Path reconstruction and ancestor matching must use
+that canonical edge, so materialized paths and interval queries agree even on
+corrupt input.
 
-## Sort order
-ASCII-case-insensitive byte comparison, ties broken by original insertion index.
+`dfs_positions[r]..dfs_ends[r]` is record `r`'s subtree in `dfs_records`.
+Path-term search converts every term to coalesced DFS intervals and intersects
+the smallest sets first. Recursive directory size is one prefix subtraction;
+unknown descendants contribute zero and clear the directory's exactness bit.
 
-## Parent resolution
+## Persistence and compaction
 
-`WindowsBackend::bulk_index_volume` enumerates the MFT in on-disk order, which is not
-tree order — a child can appear before its parent. Resolution is two passes:
+Full builds and delta compaction write columns through file-backed spools and
+serialize directly from them; they do not materialize a second owned arena.
+The final snapshot is atomically renamed. A sibling `.frn` sidecar stores
+sorted `(frn: u64, record: u32, padding: u32)` entries and carries the same
+snapshot-generation tag. A crash between independent renames makes a mismatched
+sidecar get ignored rather than paired with the wrong snapshot.
 
-1. Push every `RawEntry` via the `ArenaBuilder::push(name, mtime, is_dir)`.
-2. Walk again, calling `builder.set_parent(idx, p)`.
+The live delta contains tombstoned base records and additions. It is compacted
+at 5% because maintained measurements show the overlay scan is much cheaper
+than rewriting the full base more frequently.
 
-Every entry whose parent doesn't resolve is parented to a synthesized volume-root entry (e.g. named `C:`).
-This keeps `full_path()` finite (no cycles) and keeps the drive letter in
-every returned path.
+## Compatibility history
 
-## Queries
+- v10: one persisted size-provenance bit per record.
+- v9: DFS size-prefix column and current hot/cold tree layout.
+- v8–v7: DFS interval columns and streaming/tree-layout evolution.
+- v6: split packed records into parallel parent, mtime, and size columns.
+- v5: logical size column.
+- v4: trigram block filter.
+- v3: Unix timestamp epoch.
 
-`ArchivedArena::prefix_range` binary-searches bucket heads, then scans for the range — O(log n + k).
-Substring queries of at least three bytes use the trigram block filter below. Shorter
-substring queries and all regex queries scan the name blob sequentially. Regex is compiled
-once via `regex-automata`'s `meta::Regex` with case-insensitive syntax.
+`ArenaStore::open` validates the archive once, checks v10, then exposes the
+archived columns directly. Old snapshots are rebuilt, not migrated in place.
 
-## Trigram block filter
-
-The filter maps every three-byte window of every ASCII-lowercased name to one of
-16,384 rows. Blocks contain 1,024 consecutive records. Each row occupies
-`ceil(num_blocks / 8)` bytes in `trigram_index`; bit `b` is stored least-significant-bit
-first and is set when any name in block `b` contains a trigram mapped to that row.
-
-The exact hash, which is part of the format, is:
-
-```text
-k = lower(a) << 16 | lower(b) << 8 | lower(c)
-row = (k * 2654435761 >> 18) & 16383  // wrapping u32 multiplication
-```
-
-At query time, duplicate hashes are removed and their rows are bitwise-ANDed. Set bits
-identify candidate blocks, whose names are then decoded and checked for the complete
-substring. Hash collisions can add candidate blocks but cannot hide a match.
-
-## FRN sidecar
-
-Each snapshot may have a sibling `.frn` file containing a sorted array of
-16-byte `(frn: u64, record_index: u32, padding: u32)` entries. The sidecar is a
-plain native-endian POD array rather than an rkyv archive. It is mmap-backed,
-validated for entry size and alignment when opened, and consulted only while
-applying structural filesystem events. A missing or malformed sidecar disables
-incremental updates but does not prevent the snapshot itself from opening.
-
-The in-memory delta is never serialized. It contains tombstoned base indices
-and records added after the snapshot was built. It starts empty after every
-daemon restart and is merged into a new base when its change count exceeds 5%
-of the base; that merge reads the existing snapshot sequentially and does not
-enumerate the filesystem.
-
-`full_path(idx, sep)` walks the parent chain from a record up to the volume root, collecting
-names, then joins them in reverse.

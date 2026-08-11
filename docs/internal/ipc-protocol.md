@@ -1,46 +1,62 @@
-# IPC protocol
+# IPC and RPC protocol
 
-Transport: Win32 named pipe, `\\.\pipe\scry` (`scry_ipc::PIPE_NAME`), byte-mode, duplex.
-Framing (`scry-ipc/src/lib.rs`): every message is a u32 LE length prefix followed by that
-many bytes. `Pipe::read_frame`/`write_frame` handle this identically on both ends.
+Transport is a local duplex byte-mode named pipe. Every frame is `u32` little-
+endian payload length followed by that many bytes. The Rust client is the
+supported integration boundary; this document records the current internal
+wire shape, not a stable cross-version contract.
 
-This is deliberately not rkyv/flatbuffers — request/result payloads are small (a query
-string, a page of paths), so a hand-rolled cursor-based encoding (`scry-core/src/protocol.rs`)
-is simpler than schema-generated code. rkyv is reserved for the large index payload where
-zero-copy actually matters.
+## Query request
 
-## Request
-
-```
-u8      QueryKind   0 = Prefix, 1 = Substring, 2 = Wildcard
-string  pattern     u32 LE length prefix + UTF-8 bytes
-u32     limit
+```text
+u8      kind       0 prefix, 1 substring, 2 wildcard, 3 path terms,
+                   4 shared-index capability, 5 query statistics
+u32 LE  limit
+u8      order      0 relevance, 1 recent, 2 largest
+string  pattern    u32 LE byte length + UTF-8
 ```
 
-## Results
+Malformed kinds, orderings, lengths, or UTF-8 are rejected. Server-side limits
+are clamped before allocating the bounded top-k heap.
 
-```
-u32     count
+## Query result
+
+```text
+u32 LE  count
 repeated count times:
-    string  path
-    u64     size
-    u8      is_dir  (0 or 1)
+    string path
+    u64 LE size_bytes
+    u32 LE mtime_unix_seconds
+    u8     is_directory
+optional trailer:
+    "SCRE" u8(version=1) repeated count times: u8 size_exact
 ```
 
-Decoding (`decode_request`/`decode_results`) is bounds-checked throughout via a private
-`Cursor` that returns `Option` on any out-of-range read — a truncated or malformed frame
-decodes to `None` rather than panicking or reading out of bounds.
+The additive trailer lets a current client distinguish exact empty files,
+unknown file sizes, and lower-bound directory totals. A client decoding a
+legacy response applies conservative inference. Recognized malformed trailers
+are rejected.
 
-## Server-side access control
+## Shared-index capability
 
-`scryd` typically runs elevated (MFT/USN access requires it). A named pipe created by an
-elevated process inherits a DACL that blocks unelevated clients by default — silently, as
-`ERROR_ACCESS_DENIED` on `CreateFileW`. `PipeServer` works around this by building an explicit
-security descriptor from SDDL `D:(A;;GA;;;WD)` (`Everyone`: generic all) and passing it to
-every `CreateNamedPipeW` call. This only affects local access — `\\.\pipe\...` names aren't
-network-reachable regardless.
+Kind 4 returns `SCRYSHR1`, a duplicated read-only section handle, section
+length, generation, and serialized live-delta overlay. When the client's
+generation is still current, handle zero means reuse the validated mapping.
+See [shared-section.md](shared-section.md) for lifecycle and security rules.
 
-## Wire compatibility
+## Cancellation and realtime use
 
-There is no version field. `scry-client` and `scryd` are expected to be built from the same
-commit; this is not a stable cross-version protocol.
+One pipe may carry pipelined requests. The daemon associates newer interactive
+requests with a generation and abandons superseded work at bounded checkpoints.
+`SearchSession` exposes this as submit plus nonblocking poll; consumers should
+keep one session rather than reconnect per keystroke.
+
+## Security and compatibility
+
+The elevated daemon creates an explicitly local-accessible pipe so an
+unelevated same-machine client can query it. Shared handles are duplicated only
+to the PID reported by the pipe itself and receive read/query rights only.
+
+There is no overall protocol-version negotiation. Client and daemon releases
+should be packaged together. Additive trailers are individually versioned;
+unknown request discriminants and ordering values fail closed.
+
