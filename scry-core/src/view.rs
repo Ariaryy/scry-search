@@ -2675,24 +2675,75 @@ fn build_short_single_term_set(
     set: &mut crate::intervals::IntervalSet,
     own_matches: &mut Vec<u8>,
     cancel: Option<Cancellation>,
+    threads: usize,
 ) -> bool {
     own_matches.resize(arena.len().div_ceil(8), 0);
     own_matches.fill(0);
     #[cfg(test)]
     let scan_started = std::time::Instant::now();
-    let mut checked = 0u32;
-    let mut cancelled = false;
-    arena.for_each_name(|record, name| {
-        if is_cancelled_periodically(cancel, &mut checked) {
-            cancelled = true;
-            return std::ops::ControlFlow::Break(());
+    if threads <= 1 || arena.len() < crate::record::BUCKET_SIZE * 2 {
+        let mut checked = 0u32;
+        let mut cancelled = false;
+        arena.for_each_name(|record, name| {
+            if is_cancelled_periodically(cancel, &mut checked) {
+                cancelled = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
+                own_matches[record as usize / 8] |= 1 << (record % 8);
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        if cancelled {
+            return false;
         }
-        if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
-            own_matches[record as usize / 8] |= 1 << (record % 8);
+    } else {
+        let ranges: Vec<_> = crate::query::bucket_shards(arena.len(), threads).collect();
+        let locals: Vec<Vec<u8>> = ranges
+            .iter()
+            .map(|&(start, end)| vec![0; (end - start).div_ceil(8) as usize])
+            .collect();
+        let shards: Vec<(u32, Vec<u8>, bool)> = std::thread::scope(|scope| {
+            ranges
+                .into_iter()
+                .zip(locals)
+                .map(|((start, end), mut local)| {
+                    std::thread::Builder::new()
+                        .stack_size(64 * 1024)
+                        .spawn_scoped(scope, move || {
+                            let mut checked = 0u32;
+                            let mut cancelled = false;
+                            arena.for_each_name_in(start..end, |record, name| {
+                                if is_cancelled_periodically(cancel, &mut checked) {
+                                    cancelled = true;
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                if !delta.tombstones.get(record)
+                                    && ascii::contains_ci(name, term_lower)
+                                {
+                                    let local_record = record - start;
+                                    local[local_record as usize / 8] |= 1 << (local_record % 8);
+                                }
+                                std::ops::ControlFlow::Continue(())
+                            });
+                            (start, local, cancelled)
+                        })
+                        .expect("short path worker spawn failed")
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        if shards.iter().any(|(_, _, cancelled)| *cancelled) {
+            return false;
         }
-        std::ops::ControlFlow::Continue(())
-    });
-    if cancelled || cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        for (start, local, _) in shards {
+            let start_byte = start as usize / 8;
+            own_matches[start_byte..start_byte + local.len()].copy_from_slice(&local);
+        }
+    }
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         return false;
     }
     #[cfg(test)]
@@ -2830,32 +2881,41 @@ fn retain_dense_path_hits_parallel(
     cancel: Option<Cancellation>,
     threads: usize,
 ) -> Option<BinaryHeap<u64>> {
+    let ranges: Vec<_> = crate::query::bucket_shards(arena.len(), threads).collect();
+    let heaps: Vec<_> = ranges
+        .iter()
+        .map(|_| BinaryHeap::with_capacity(limit.min(4096)))
+        .collect();
     let shards: Vec<BinaryHeap<u64>> = std::thread::scope(|scope| {
-        crate::query::bucket_shards(arena.len(), threads)
-            .map(|(start, end)| {
-                scope.spawn(move || {
-                    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
-                    let mut checked = 0u32;
-                    arena.for_each_name_in(start..end, |record, name| {
-                        if is_cancelled_periodically(cancel, &mut checked) {
-                            return std::ops::ControlFlow::Break(());
-                        }
-                        if delta.tombstones.get(record)
-                            || !runs.contains(arena.dfs_position(record))
-                        {
-                            return std::ops::ControlFlow::Continue(());
-                        }
-                        let own = path_match_mask(automaton, name);
-                        let quality = (term_count as u32 - own.count_ones()) as u8;
-                        rank::retain_hit(
-                            &mut heap,
-                            sort_key(order, arena, delta, record, quality, name.len() as u32),
-                            limit,
-                        );
-                        std::ops::ControlFlow::Continue(())
-                    });
-                    heap
-                })
+        ranges
+            .into_iter()
+            .zip(heaps)
+            .map(|((start, end), mut heap)| {
+                std::thread::Builder::new()
+                    .stack_size(64 * 1024)
+                    .spawn_scoped(scope, move || {
+                        let mut checked = 0u32;
+                        arena.for_each_name_in(start..end, |record, name| {
+                            if is_cancelled_periodically(cancel, &mut checked) {
+                                return std::ops::ControlFlow::Break(());
+                            }
+                            if delta.tombstones.get(record)
+                                || !runs.contains(arena.dfs_position(record))
+                            {
+                                return std::ops::ControlFlow::Continue(());
+                            }
+                            let own = path_match_mask(automaton, name);
+                            let quality = (term_count as u32 - own.count_ones()) as u8;
+                            rank::retain_hit(
+                                &mut heap,
+                                sort_key(order, arena, delta, record, quality, name.len() as u32),
+                                limit,
+                            );
+                            std::ops::ControlFlow::Continue(())
+                        });
+                        heap
+                    })
+                    .expect("dense path worker spawn failed")
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -2923,7 +2983,15 @@ fn search_path_terms_with_scratch(
     let mut checked: u32 = 0;
     for (term_lower, term_set) in terms_lower.iter().zip(term_sets.iter_mut()) {
         let completed = if terms.len() == 1 && term_lower.len() < 3 {
-            build_short_single_term_set(arena, delta, term_lower, term_set, own_matches, cancel)
+            build_short_single_term_set(
+                arena,
+                delta,
+                term_lower,
+                term_set,
+                own_matches,
+                cancel,
+                threads,
+            )
         } else {
             build_term_interval_set(
                 arena,
