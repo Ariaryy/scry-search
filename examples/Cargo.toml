@@ -1,0 +1,10 @@
+[package]
+name = "scry-example"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+scry-client = { path = "../scry-client" }
+
