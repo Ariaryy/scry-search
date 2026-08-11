@@ -15,6 +15,38 @@ pub enum Query {
     Regex(String),
     /// AND-ed literal terms that may match the leaf or any ancestor.
     PathTerms(Vec<String>),
+    /// Path terms plus metadata predicates applied before bounded top-k retention.
+    FilteredPathTerms {
+        terms: Vec<String>,
+        filter: QueryFilter,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryFilter {
+    pub kind: Option<EntryKind>,
+    pub extensions: Vec<String>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub min_mtime: Option<u32>,
+    pub max_mtime: Option<u32>,
+}
+
+impl QueryFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none()
+            && self.extensions.is_empty()
+            && self.min_size.is_none()
+            && self.max_size.is_none()
+            && self.min_mtime.is_none()
+            && self.max_mtime.is_none()
+    }
 }
 
 impl Query {
@@ -272,7 +304,7 @@ fn search_base_impl(
             }
             results
         }
-        Query::PathTerms(_) => Vec::new(),
+        Query::PathTerms(_) | Query::FilteredPathTerms { .. } => Vec::new(),
     }
 }
 

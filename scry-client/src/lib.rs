@@ -313,21 +313,19 @@ impl Client {
             QueryKind::Prefix => scry_core::Query::Prefix(pattern.to_owned()),
             QueryKind::Substring => scry_core::Query::Substring(pattern.to_owned()),
             QueryKind::Wildcard => scry_core::Query::wildcard(pattern),
-            QueryKind::PathTerms => scry_core::Query::PathTerms(
-                scry_core::terms::parse_terms(pattern).unwrap_or_default(),
-            ),
+            QueryKind::PathTerms => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .min(u32::MAX as u64) as u32;
+                scry_core::terms::parse_query(pattern, now)
+                    .unwrap_or_else(|_| scry_core::Query::PathTerms(Vec::new()))
+            }
             QueryKind::ShareIndex => unreachable!(),
             QueryKind::QueryStats => unreachable!(),
         };
         let options = SearchOptions::ordered(limit as usize, order);
-        if let scry_core::Query::PathTerms(terms) = &query {
-            let hits = scry_core::view::search_path_terms(arena, &local.delta, terms, options);
-            return Ok(scry_core::view::materialize_hits(
-                arena,
-                &local.delta,
-                &hits,
-            ));
-        }
         Ok(scry_core::view::search_archived_with_delta(
             arena,
             &local.delta,
@@ -365,6 +363,10 @@ impl SearchSession {
 
     pub fn set_order(&mut self, order: Order) {
         self.order = order;
+    }
+
+    pub fn set_limit(&mut self, limit: u32) {
+        self.limit = limit;
     }
 
     pub fn poll_latest(&mut self) -> anyhow::Result<Option<Vec<ResultEntry>>> {

@@ -1559,7 +1559,13 @@ fn handle_request(
         QueryKind::Substring => Query::Substring(req.pattern.clone()),
         QueryKind::Wildcard => Query::wildcard(&req.pattern),
         QueryKind::PathTerms => {
-            Query::PathTerms(scry_core::terms::parse_terms(&req.pattern).unwrap_or_default())
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .min(u32::MAX as u64) as u32;
+            scry_core::terms::parse_query(&req.pattern, now)
+                .unwrap_or_else(|_| Query::PathTerms(Vec::new()))
         }
         QueryKind::ShareIndex => unreachable!(),
         QueryKind::QueryStats => unreachable!(),
@@ -1672,10 +1678,11 @@ fn hit_quality(query: &Query, name: &[u8]) -> u8 {
                 2
             }
         }
-        Query::PathTerms(terms) => terms
+        Query::PathTerms(terms) | Query::FilteredPathTerms { terms, .. } => terms
             .iter()
             .filter(|term| !scry_core::ascii::contains_ci(name, term.as_bytes()))
-            .count() as u8,
+            .count()
+            as u8,
         Query::Regex(_) => 2,
     }
 }

@@ -1,6 +1,7 @@
 //! `scry <query>` — thin CLI over scry-client.
 //!
-//! Query syntax: a bare pattern (e.g. `report`) is a name prefix search.
+//! Query syntax: bare words are path terms. Metadata predicates include
+//! `type:file`, `type:dir`, `ext:rs,txt`, `size:>10mb`, and `modified:<7d`.
 //! `*`/`?` in the pattern switch to a wildcard search automatically.
 //! `--interactive` types the query live against the daemon's pipelined
 //! as-you-type endpoint instead of running one query and exiting.

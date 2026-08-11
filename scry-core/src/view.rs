@@ -13,7 +13,7 @@ use crate::frnmap::{FrnEntry, FrnMap};
 use crate::metrics::QuerySpans;
 use crate::protocol::ResultEntry;
 use crate::query::is_cancelled_periodically;
-use crate::query::Query;
+use crate::query::{EntryKind, Query, QueryFilter};
 use crate::rank::{self, Order};
 use crate::store::{self, ArenaColumns, ArenaStore, StoreError};
 #[cfg(test)]
@@ -135,6 +135,20 @@ mod tests {
         crate::store::save(&arena, &path).unwrap();
         let base = Arc::new(ArenaStore::open(&path).unwrap());
         (dir, IndexView::new(base))
+    }
+
+    #[test]
+    fn metadata_filters_run_before_result_retention() {
+        let (_dir, view) = base_view(200);
+        let files = crate::terms::parse_query("match type:file ext:txt", 0).unwrap();
+        let file_hits = view.search_hits(&files, SearchOptions::new(3));
+        assert_eq!(file_hits.len(), 3);
+        assert!(file_hits.iter().all(|hit| !hit.is_dir));
+
+        let directories = crate::terms::parse_query("type:dir", 0).unwrap();
+        let directory_hits = view.search_hits(&directories, SearchOptions::new(10));
+        assert_eq!(directory_hits.len(), 1);
+        assert!(directory_hits[0].is_dir);
     }
 
     #[test]
@@ -342,7 +356,7 @@ mod tests {
                 Query::Regex(_) => regex
                     .as_ref()
                     .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
-                Query::PathTerms(_) => unreachable!(),
+                Query::PathTerms(_) | Query::FilteredPathTerms { .. } => unreachable!(),
             };
             if matched {
                 let combined = arena.len() as u32 + index;
@@ -1093,6 +1107,7 @@ mod tests {
             Query::Prefix("match".into()),
             Query::Substring("DELTA".into()),
             Query::wildcard("*.txt"),
+            crate::terms::parse_query("match type:file ext:txt", 0).unwrap(),
         ] {
             assert_eq!(
                 search_archived_with_delta(
@@ -1510,6 +1525,7 @@ mod tests {
             view.base.archived(),
             &view.delta,
             &terms,
+            &QueryFilter::default(),
             SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
             true,
@@ -1520,6 +1536,7 @@ mod tests {
             view.base.archived(),
             &view.delta,
             &terms,
+            &QueryFilter::default(),
             SearchOptions::new(usize::MAX),
             &mut PathSearchScratch::default(),
             false,
@@ -1544,6 +1561,7 @@ mod tests {
             large.base.archived(),
             &large.delta,
             &["match".to_owned()],
+            &QueryFilter::default(),
             SearchOptions::new(10),
             &mut scratch,
             true,
@@ -1556,6 +1574,7 @@ mod tests {
             small.base.archived(),
             &small.delta,
             &["definitely_absent_qzxv".to_owned()],
+            &QueryFilter::default(),
             SearchOptions::new(10),
             &mut scratch,
             true,
@@ -1640,6 +1659,7 @@ mod tests {
                 view.base.archived(),
                 &view.delta,
                 &terms,
+                &QueryFilter::default(),
                 SearchOptions::new(50),
                 scratch,
                 filtered,
@@ -1846,6 +1866,25 @@ impl IndexView {
                 self.base.archived(),
                 &self.delta,
                 terms,
+                options,
+                cancel,
+                threads,
+            );
+            if let (Some(spans), Some(started)) = (spans, started) {
+                spans.select_ns = spans
+                    .select_ns
+                    .saturating_add(started.elapsed().as_nanos() as u64);
+                spans.candidates = spans.candidates.saturating_add(hits.len() as u64);
+            }
+            return hits;
+        }
+        if let Query::FilteredPathTerms { terms, filter } = query {
+            let started = spans.as_ref().map(|_| std::time::Instant::now());
+            let hits = search_path_terms_filtered_cancellable(
+                self.base.archived(),
+                &self.delta,
+                terms,
+                filter,
                 options,
                 cancel,
                 threads,
@@ -2353,10 +2392,12 @@ pub fn search_archived_with_delta(
     query: &Query,
     options: SearchOptions,
 ) -> Vec<ResultEntry> {
-    let hits = if let Query::PathTerms(terms) = query {
-        search_path_terms(arena, delta, terms, options)
-    } else {
-        search_ranked(arena, delta, query, options)
+    let hits = match query {
+        Query::PathTerms(terms) => search_path_terms(arena, delta, terms, options),
+        Query::FilteredPathTerms { terms, filter } => {
+            search_path_terms_filtered_cancellable(arena, delta, terms, filter, options, None, 1)
+        }
+        _ => search_ranked(arena, delta, query, options),
     };
     materialize_hits(arena, delta, &hits)
 }
@@ -2537,7 +2578,7 @@ fn match_quality(query: &Query, name: &[u8]) -> u8 {
     let pattern = match query {
         Query::Prefix(pattern) | Query::Substring(pattern) => pattern.as_bytes(),
         Query::Regex(_) => return 2,
-        Query::PathTerms(_) => unreachable!(),
+        Query::PathTerms(_) | Query::FilteredPathTerms { .. } => unreachable!(),
     };
     if ascii::cmp_ci(name, pattern).is_eq() {
         0
@@ -2680,7 +2721,7 @@ fn search_ranked_cancellable_with_spans(
             Query::Regex(_) => regex
                 .as_ref()
                 .is_some_and(|compiled| compiled.is_match(record.name.as_bytes())),
-            Query::PathTerms(_) => unreachable!(),
+            Query::PathTerms(_) | Query::FilteredPathTerms { .. } => unreachable!(),
         };
         if matched {
             let combined = arena.len() as u32 + index;
@@ -2755,11 +2796,83 @@ fn search_path_terms_cancellable(
     cancel: Option<Cancellation>,
     threads: usize,
 ) -> Vec<Hit> {
+    search_path_terms_filtered_cancellable(
+        arena,
+        delta,
+        terms,
+        &QueryFilter::default(),
+        options,
+        cancel,
+        threads,
+    )
+}
+
+#[inline]
+fn record_is_dir(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> bool {
+    match record.checked_sub(arena.len() as u32) {
+        None => arena.is_dir(record),
+        Some(index) => delta.added[index as usize].is_dir,
+    }
+}
+
+fn record_matches_filter(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    record: u32,
+    name: &[u8],
+    filter: &QueryFilter,
+) -> bool {
+    let is_dir = record_is_dir(arena, delta, record);
+    if matches!(filter.kind, Some(EntryKind::File)) && is_dir
+        || matches!(filter.kind, Some(EntryKind::Directory)) && !is_dir
+    {
+        return false;
+    }
+    if !filter.extensions.is_empty() {
+        if is_dir {
+            return false;
+        }
+        let extension = name.rsplit(|&byte| byte == b'.').next().unwrap_or_default();
+        if extension.len() == name.len()
+            || !filter
+                .extensions
+                .iter()
+                .any(|wanted| ascii::cmp_ci(extension, wanted.as_bytes()).is_eq())
+        {
+            return false;
+        }
+    }
+    if filter.min_size.is_some() || filter.max_size.is_some() {
+        if !record_size_exact(arena, delta, record) {
+            return false;
+        }
+        let size = record_size_kib(arena, delta, record) as u64 * 1024;
+        if filter.min_size.is_some_and(|minimum| size < minimum)
+            || filter.max_size.is_some_and(|maximum| size > maximum)
+        {
+            return false;
+        }
+    }
+    let mtime = record_mtime(arena, delta, record);
+    filter.min_mtime.is_none_or(|minimum| mtime >= minimum)
+        && filter.max_mtime.is_none_or(|maximum| mtime <= maximum)
+}
+
+fn search_path_terms_filtered_cancellable(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    terms: &[String],
+    filter: &QueryFilter,
+    options: SearchOptions,
+    cancel: Option<Cancellation>,
+    threads: usize,
+) -> Vec<Hit> {
     PATH_SEARCH_SCRATCH.with(|scratch| {
         search_path_terms_with_scratch(
             arena,
             delta,
             terms,
+            filter,
             options,
             &mut scratch.borrow_mut(),
             true,
@@ -2983,6 +3096,7 @@ fn retain_dense_path_hits_parallel(
     runs: &crate::intervals::IntervalSet,
     automaton: &aho_corasick::AhoCorasick,
     term_count: usize,
+    filter: &QueryFilter,
     order: Order,
     limit: usize,
     cancel: Option<Cancellation>,
@@ -3008,6 +3122,7 @@ fn retain_dense_path_hits_parallel(
                             }
                             if delta.tombstones.get(record)
                                 || !runs.contains(arena.dfs_position(record))
+                                || !record_matches_filter(arena, delta, record, name, filter)
                             {
                                 return std::ops::ControlFlow::Continue(());
                             }
@@ -3046,6 +3161,7 @@ fn search_path_terms_with_scratch(
     arena: &crate::ArchivedArena,
     delta: &Delta,
     terms: &[String],
+    filter: &QueryFilter,
     options: SearchOptions,
     scratch: &mut PathSearchScratch,
     use_filter: bool,
@@ -3063,7 +3179,7 @@ fn search_path_terms_with_scratch(
     // The name-decode-and-rank step below is skipped entirely for orderings
     // that don't need it: `sort_key` only reads `quality`/`name_len` for
     // `Order::Relevance`.
-    let needs_name = !order.needs_metadata();
+    let needs_name = !order.needs_metadata() || !filter.extensions.is_empty();
     let automaton = match aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
         .build(terms)
@@ -3199,6 +3315,7 @@ fn search_path_terms_with_scratch(
             final_set,
             &automaton,
             terms.len(),
+            filter,
             order,
             limit,
             cancel,
@@ -3218,8 +3335,13 @@ fn search_path_terms_with_scratch(
                 if delta.tombstones.get(record) {
                     continue;
                 }
-                let (quality, name_len) = if needs_name {
+                if needs_name {
                     arena.name_into(record, name);
+                }
+                if !record_matches_filter(arena, delta, record, name, filter) {
+                    continue;
+                }
+                let (quality, name_len) = if !order.needs_metadata() {
                     let mask = mask_for(name);
                     (
                         (terms.len() as u32 - mask.count_ones()) as u8,
@@ -3257,6 +3379,9 @@ fn search_path_terms_with_scratch(
             return Vec::new();
         }
         let combined = base_len + index as u32;
+        if !record_matches_filter(arena, delta, combined, record.name.as_bytes(), filter) {
+            continue;
+        }
         let own = mask_for(record.name.as_bytes());
         let mut inherited = 0u16;
         let mut current_parent = record.parent;
