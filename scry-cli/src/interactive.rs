@@ -111,10 +111,16 @@ fn render(
     query_time: Option<Duration>,
     width: usize,
 ) {
+    let mut frame = Vec::with_capacity(4_096);
+    if render_to(
+        &mut frame, pattern, results, selected, pending, query_time, width,
+    )
+    .is_err()
+    {
+        return;
+    }
     let mut out = std::io::stdout().lock();
-    let _ = render_to(
-        &mut out, pattern, results, selected, pending, query_time, width,
-    );
+    let _ = out.write_all(&frame);
     let _ = out.flush();
 }
 
@@ -127,7 +133,7 @@ fn render_to(
     query_time: Option<Duration>,
     width: usize,
 ) -> std::io::Result<()> {
-    write!(out, "\x1b[H\x1b[J\x1b[1;36mScry Search\x1b[0m")?;
+    write!(out, "\x1b[?2026h\x1b[H\x1b[J\x1b[1;36mScry Search\x1b[0m")?;
     write!(out, "\r\n\x1b[36m›\x1b[0m {pattern}\x1b[s")?;
 
     let status = if pending {
@@ -162,7 +168,7 @@ fn render_to(
 
     write!(
         out,
-        "\r\n\x1b[2m↑/↓ select  •  Enter open  •  Esc close\x1b[0m\x1b[u"
+        "\r\n\x1b[2m↑/↓ select  •  Enter open  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
     )
 }
 
@@ -233,10 +239,10 @@ mod tests {
         )
         .unwrap();
         let rendered = String::from_utf8(output).unwrap();
-        assert!(rendered.starts_with("\x1b[H\x1b[J"));
+        assert!(rendered.starts_with("\x1b[?2026h\x1b[H\x1b[J"));
         assert!(rendered.contains("volume\\new"));
         assert!(rendered.contains("420 µs"));
-        assert!(rendered.ends_with("\x1b[u"));
+        assert!(rendered.ends_with("\x1b[u\x1b[?2026l"));
     }
 
     #[test]
