@@ -36,4 +36,5 @@ Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
     ) | Out-Null
 }
 
-Write-Host "Removed Scry Search and its startup task. Snapshot data was left intact."
+Write-Host "Removed Scry Search from $installRoot, its PATH entry, and its startup task."
+Write-Host "Index data was preserved under $(Join-Path $env:LOCALAPPDATA 'scry')."

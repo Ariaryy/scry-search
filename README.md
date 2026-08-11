@@ -84,7 +84,10 @@ this instead of a system service because its snapshot, clients, and IPC endpoint
 are user-scoped. It installs the binaries under
 `%LOCALAPPDATA%\Programs\Scry Search\bin` and adds that directory to the user
 `PATH`, so `scry` is available in new terminals. The extracted archive can then
-be deleted.
+be deleted. Per-volume snapshots and their FRN sidecars are stored separately
+under `%LOCALAPPDATA%\scry` as `index-<volume>.rkyv` and
+`index-<volume>.frn`. Uninstalling the binaries preserves this index data so a
+later reinstall does not require rebuilding it unnecessarily.
 
 To remove the startup task while preserving snapshots:
 

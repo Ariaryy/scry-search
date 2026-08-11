@@ -70,8 +70,12 @@ if (-not $NoStart) {
     Start-ScheduledTask -TaskName $taskName
 }
 
-Write-Host "Installed Scry Search to $installRoot."
-Write-Host "The CLI is available as 'scry' in new terminals."
+Write-Host "Copied scryd.exe and scry.exe to $binPath."
+Write-Host "Copied the uninstaller to $(Join-Path $installRoot 'uninstall.ps1')."
+Write-Host "Added $binPath to the user PATH; 'scry' is available in new terminals."
+Write-Host "Indexes are stored separately under $(Join-Path $env:LOCALAPPDATA 'scry')."
 if (-not $NoStart) {
     Write-Host "The elevated daemon has been started in the background."
+} else {
+    Write-Host "The daemon was not started because -NoStart was supplied."
 }

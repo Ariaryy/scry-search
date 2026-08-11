@@ -55,4 +55,18 @@ background. Use `-NoStart` only when the daemon should wait until the next
 logon or a manual task start. Open a new terminal before invoking `scry` by
 name.
 
+## Data location
+
+The daemon stores per-user index data under `%LOCALAPPDATA%\scry`:
+
+- `index-<volume>.rkyv` is the memory-mapped snapshot for one volume.
+- `index-<volume>.frn` maps filesystem record numbers for incremental updates.
+- Temporary compaction files may appear briefly in a per-volume scratch
+  directory beneath the same location. The files are removed when compaction
+  ends; the empty scratch directory may remain for reuse.
+
+This directory is separate from `%LOCALAPPDATA%\Programs\Scry Search`, which
+contains the installed executables. The uninstaller removes the executables,
+PATH entry, and scheduled task but deliberately preserves the index directory.
+
 

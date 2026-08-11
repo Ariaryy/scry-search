@@ -56,7 +56,9 @@ unknown descendants contribute zero and clear the directory's exactness bit.
 
 Full builds and delta compaction write columns through file-backed spools and
 serialize directly from them; they do not materialize a second owned arena.
-The final snapshot is atomically renamed. A sibling `.frn` sidecar stores
+In a normal daemon installation, these files live under `%LOCALAPPDATA%\scry`
+as `index-<volume>.rkyv` and `index-<volume>.frn`. The final snapshot is
+atomically renamed. A sibling `.frn` sidecar stores
 sorted `(frn: u64, record: u32, padding: u32)` entries and carries the same
 snapshot-generation tag. A crash between independent renames makes a mismatched
 sidecar get ignored rather than paired with the wrong snapshot.
