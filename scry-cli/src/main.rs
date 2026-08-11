@@ -188,12 +188,12 @@ pub(crate) fn display_size(entry: &ResultEntry) -> String {
     format!("{prefix}{}", human_size(entry.size))
 }
 
-fn human_size(kib: u64) -> String {
-    const UNITS: [&str; 6] = ["KB", "MB", "GB", "TB", "PB", "EB"];
-    if kib == 0 {
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes == 0 {
         return "0 B".into();
     }
-    let mut value = kib as f64;
+    let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() {
         value /= 1024.0;
@@ -264,11 +264,13 @@ mod tests {
             is_dir,
             size_exact,
         };
-        assert_eq!(display_size(&entry(42, false, true)), "42 KB");
+        assert_eq!(display_size(&entry(42, false, true)), "42 B");
         assert_eq!(display_size(&entry(0, false, true)), "0 B");
-        assert_eq!(display_size(&entry(42, true, false)), "≥42 KB");
+        assert_eq!(display_size(&entry(42, true, false)), "≥42 B");
         assert_eq!(display_size(&entry(0, false, false)), "—");
-        assert_eq!(human_size(1_536), "1.5 MB");
+        assert_eq!(human_size(1_023), "1023 B");
+        assert_eq!(human_size(1_024), "1 KB");
+        assert_eq!(human_size(1_572_864), "1.5 MB");
     }
 
     #[test]
