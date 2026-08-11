@@ -1,5 +1,9 @@
 # Query latency baseline
 
+**Document version:** updated for Scry Search `0.1.0-alpha.1`. Historical
+captures retain their original commit/context below; the final acceptance
+reruns in this document describe the code shipped in `0.1.0-alpha.1`.
+
 > Historical note: this capture predates the truthful span rename. Its
 > `match_ns` column corresponds to today's fused `select_ns`, and `rank_ns`
 > corresponds to today's delta-merge-and-drain `finalize_ns`.
@@ -94,10 +98,10 @@ pass, and printed aggregates only—never sampled names.
 | 5 | 1,245 | 0.00% | 0.00% | 0.17% | 6.98% | 25.19% |
 
 Median selectivity across all sampled 3–5 byte needles was **0.02%**, far
-below M2's 5% threshold. M2 therefore passes. This does **not** authorize plan
-023 as written: its static rank permutations accelerate Recent/Largest, while
-the default Relevance key depends on the current query and must stay on the
-filtered scan. Under the harsh storage/compaction budget, the XL design remains
+below the 5% selectivity decision threshold. This does **not** justify static
+rank permutations: they accelerate Recent/Largest, while the default Relevance
+key depends on the current query and must stay on the filtered scan. Under the
+harsh storage/compaction budget, that design remains
 a no-go unless rewritten around default relevance or supported by workload
 evidence that non-default orderings dominate.
 
@@ -137,9 +141,11 @@ Corpus: 440,001 records, 40,001 directories, mean depth 5.8, max depth 7.
 materialized entry costing one bounded parent-chain walk regardless of how
 many candidates were scanned to find it.
 
-### Post-017/018 acceptance rerun
+### Bounded-materialization and streaming top-k acceptance rerun
 
-The maintained Criterion suite was rerun after all later plans, on the same
+**Recorded in:** Scry Search `0.1.0-alpha.1`.
+
+The maintained Criterion suite was rerun for `0.1.0-alpha.1` on the same
 440,001-record deterministic corpus:
 
 | benchmark | recorded baseline | current median | speedup |
@@ -151,20 +157,19 @@ The maintained Criterion suite was rerun after all later plans, on the same
 | `substring/medium` | 11.07 ms | 3.274 ms | 3.38× |
 | `substring/low` | 1.97 ms | 1.258 ms | 1.57× |
 
-Plan 018's streaming/top-k substring work is a large, meaningful win, but its
-separate **3× materialization target was missed**. At the normal result limit,
+Streaming top-k substring search is a large, meaningful win, but the earlier
+aspirational **3× materialization target was missed**. At the normal result limit,
 the remaining materialization cost is about 125 µs for 50 paths; further work
 there is not justified by the harsh compute budget without a new profile.
 
-The plan's real `scry --verbose a <250 ms` gate also remains missed. Ten queries
-against the running two-volume daemon measured 1.19–1.25 s warm (1.55 s first
-run). Plain CLI input is a PathTerms query, and a one-byte, extremely common
-term is the interval algorithm's pathological full-scan/double-decode case—not
-the now-fast streaming substring path. Fixing it requires a new decision about
-single-term CLI semantics or parallel interval construction; it is not a safe
-extension of plan 018.
+The original one-byte `scry --verbose a <250 ms` gate initially missed at
+1.19–1.25 s warm. Parallel short-term interval construction, shipped before
+`0.1.0-alpha.1`, later measured **125.33 ms p50 / 246.19 ms p99** on the same
+two-volume workload and closed that gate. It remains the pathological query
+shape, so changes to it still require explicit memory and thread-scaling checks.
 
-Plan 017 has an attributable direct comparison. The same release-mode
+The bounded-refinement work has an attributable direct comparison, recorded in
+`0.1.0-alpha.1`. The same release-mode
 30,000-record test timed only the second keystroke that overscans 20,000
 candidates: the pre-017 parent took 12.753 ms p50 / 19.597 ms p99; current code
 took 4.625 ms / 5.198 ms. The **2.76× p50 and 3.77× p99 improvements** clear its

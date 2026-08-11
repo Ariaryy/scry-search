@@ -39,6 +39,8 @@ background work is usually a regression. Performance is part of correctness.
 
 ## Measured behavior
 
+**Measurement set:** recorded for Scry Search `0.1.0-alpha.1`.
+
 These are diagnostic measurements from one Windows development machine, not
 universal promises. Corpus shape, storage, CPU, cache warmth, query, and result
 limit all matter. No numbers below compare Scry with another product.
