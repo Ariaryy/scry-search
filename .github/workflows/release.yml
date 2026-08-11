@@ -27,8 +27,14 @@ jobs:
           Copy-Item docs/users dist/scry/docs -Recurse
           $archive = "dist/scry-search-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Compress-Archive -Path dist/scry/* -DestinationPath $archive
+      - name: Format release version
+        id: release
+        shell: pwsh
+        run: |
+          "version=$($env:GITHUB_REF_NAME.TrimStart('v'))" >> $env:GITHUB_OUTPUT
       - uses: softprops/action-gh-release@v2
         with:
+          name: Scry Search ${{ steps.release.outputs.version }}
           files: dist/scry-search-*-windows-x86_64.zip
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
