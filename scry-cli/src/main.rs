@@ -9,7 +9,7 @@
 
 mod console;
 
-use scry_client::Client;
+use scry_client::{Client, SearchSession};
 use scry_core::protocol::{Order, QueryKind, ResultEntry};
 
 const INTERACTIVE_LIMIT: u32 = 20;
@@ -52,7 +52,9 @@ fn main() -> anyhow::Result<()> {
     let t_connect = t0.elapsed();
 
     if interactive {
-        return run_interactive(&mut client, explicit_kind, query);
+        let mut session = client.into_search_session(INTERACTIVE_LIMIT);
+        session.set_order(order);
+        return run_interactive(session, explicit_kind, query);
     }
 
     if stats {
@@ -123,17 +125,8 @@ fn print_entry(entry: &ResultEntry) {
     println!("{}{marker}\t{}\t{}", entry.path, entry.size, entry.mtime);
 }
 
-/// Redraws the query line and its current results as the user types, using
-/// the daemon's pipelined `search_interactive` endpoint so a fast typist
-/// always sees the answer to their latest keystroke rather than a queued
-/// stale one. Each round of the outer loop blocks for one keystroke, then
-/// drains any more that have already landed in the console's input buffer
-/// (typed while the previous search was still in flight) into the same
-/// pattern edit before searching again and echoes the pattern immediately,
-/// before the round trip — a slow search must never stall the on-screen
-/// text, only how soon the result list underneath it catches up.
 fn run_interactive(
-    client: &mut Client,
+    mut session: SearchSession,
     explicit_kind: Option<QueryKind>,
     initial: String,
 ) -> anyhow::Result<()> {
@@ -141,21 +134,20 @@ fn run_interactive(
         .ok_or_else(|| anyhow::anyhow!("--interactive requires a real console"))?;
 
     let mut pattern = initial;
-    let mut results = fetch(client, explicit_kind, &pattern)?;
-    render(&pattern, &results);
+    let mut results = Vec::new();
+    let mut rendered_lines = 0;
+    let mut print_results = false;
+    session.submit(infer_query_kind(explicit_kind, &pattern), &pattern)?;
+    render(&pattern, &results, true, &mut rendered_lines);
 
     'outer: loop {
         let mut edited = false;
-        let mut submit = false;
-        loop {
-            let Some(unit) = raw.read_char() else {
-                break 'outer;
-            };
+        while let Some(unit) = raw.try_read_char() {
             match unit {
                 0x03 | 0x1B => break 'outer, // Ctrl+C / Escape: quit without printing
                 0x0D | 0x0A => {
-                    submit = true; // Enter: stop editing, print current results below
-                    break;
+                    print_results = true;
+                    break 'outer;
                 }
                 0x08 | 0x7F => {
                     pattern.pop();
@@ -170,52 +162,73 @@ fn run_interactive(
                     }
                 }
             }
-            if !raw.has_pending_input() {
-                break;
-            }
         }
+
         if edited {
-            render(&pattern, &results);
-            results = fetch(client, explicit_kind, &pattern)?;
-            render(&pattern, &results);
+            session.submit(infer_query_kind(explicit_kind, &pattern), &pattern)?;
+            render(&pattern, &results, true, &mut rendered_lines);
         }
-        if submit {
-            break;
+
+        if let Some(latest) = session.poll_latest()? {
+            results = latest;
+            render(&pattern, &results, false, &mut rendered_lines);
         }
+
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
+
+    if print_results && session.is_pending() {
+        results = session.wait_latest()?;
+    }
+    clear_interactive();
     drop(raw);
 
-    for entry in &results {
-        print_entry(entry);
+    if print_results {
+        for entry in &results {
+            print_entry(entry);
+        }
     }
     Ok(())
 }
 
-fn fetch(
-    client: &mut Client,
-    explicit_kind: Option<QueryKind>,
-    pattern: &str,
-) -> anyhow::Result<Vec<ResultEntry>> {
-    if pattern.is_empty() {
-        return Ok(Vec::new());
-    }
-    let kind = infer_query_kind(explicit_kind, pattern);
-    client.search_interactive(kind, pattern, INTERACTIVE_LIMIT)
-}
-
-fn render(pattern: &str, results: &[ResultEntry]) {
+fn render(pattern: &str, results: &[ResultEntry], pending: bool, previous_lines: &mut usize) {
     use std::io::Write;
     let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b[2J\x1b[H");
-    let _ = writeln!(out, "scry> {pattern}");
+    render_to(&mut out, pattern, results, pending, previous_lines);
+    let _ = out.flush();
+}
+
+fn render_to(
+    out: &mut impl std::io::Write,
+    pattern: &str,
+    results: &[ResultEntry],
+    pending: bool,
+    previous_lines: &mut usize,
+) {
+    let _ = write!(out, "\x1b[H\x1b[2K\rscry> {pattern}");
+    if pending {
+        let _ = write!(out, "  searching...");
+    }
+    let _ = writeln!(out);
     if results.is_empty() {
-        let _ = writeln!(out, "  no matches");
+        let _ = writeln!(out, "\x1b[2K\r  no matches");
     } else {
-        for entry in results {
+        for (index, entry) in results.iter().enumerate() {
             let marker = if entry.is_dir { "/" } else { "" };
-            let _ = writeln!(out, "  {}{marker}", entry.path);
+            let _ = writeln!(out, "\x1b[2K\r  {:>2}  {}{marker}", index + 1, entry.path);
         }
     }
+    let lines = results.len().max(1) + 1;
+    for _ in lines..*previous_lines {
+        let _ = writeln!(out, "\x1b[2K\r");
+    }
+    *previous_lines = lines;
+}
+
+fn clear_interactive() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[2J\x1b[H");
     let _ = out.flush();
 }
 
@@ -262,5 +275,22 @@ mod tests {
             infer_query_kind(Some(QueryKind::Prefix), "*.pdf"),
             QueryKind::Prefix
         );
+    }
+
+    #[test]
+    fn redraw_keeps_results_while_searching_and_avoids_full_clear() {
+        let results = vec![ResultEntry {
+            path: "volume\\item".into(),
+            is_dir: false,
+            size: 0,
+            mtime: 0,
+        }];
+        let mut output = Vec::new();
+        let mut lines = 0;
+        render_to(&mut output, "it", &results, true, &mut lines);
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("scry> it  searching..."));
+        assert!(rendered.contains("volume\\item"));
+        assert!(!rendered.contains("\x1b[2J"));
     }
 }

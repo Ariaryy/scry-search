@@ -1,6 +1,5 @@
 //! Hand-rolled kernel32 console FFI for interactive mode, matching the style
-//! used in `scry-ipc`/`scry-fsevents`: raw keystroke input (no line editing,
-//! no echo) plus ANSI escape rendering, restored on drop.
+//! used in `scry-ipc`/`scry-fsevents`: raw keystroke input and ANSI output.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -107,21 +106,15 @@ impl RawMode {
         }
     }
 
-    /// Non-blocking: true if the console has at least one buffered input
-    /// record (key up/down, resize, focus, ...) waiting to be consumed.
-    /// Used to drain a burst of keystrokes typed while a search is in
-    /// flight without blocking on the next one that hasn't arrived yet.
-    pub fn has_pending_input(&self) -> bool {
+    fn has_pending_input(&self) -> bool {
         let mut count = 0;
         let ok = unsafe { GetNumberOfConsoleInputEvents(self.input, &mut count) };
         ok != 0 && count > 0
     }
 
-    /// Blocks until the console produces the next character, skipping
-    /// non-character records (key-up, modifier-only key-down, resize,
-    /// focus, ...) along the way.
-    pub fn read_char(&self) -> Option<u16> {
-        loop {
+    /// Returns a buffered character without waiting for console input.
+    pub fn try_read_char(&self) -> Option<u16> {
+        while self.has_pending_input() {
             let mut record = InputRecord::default();
             let mut read = 0;
             unsafe {
@@ -136,6 +129,7 @@ impl RawMode {
                 return Some(record.key_event.unicode_char);
             }
         }
+        None
     }
 }
 
