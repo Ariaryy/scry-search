@@ -6,10 +6,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $taskName = "Scry Search Daemon"
-$daemonPath = Join-Path $PSScriptRoot "scryd.exe"
+$sourceDaemonPath = Join-Path $PSScriptRoot "scryd.exe"
+$sourceCliPath = Join-Path $PSScriptRoot "scry.exe"
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\Scry Search"
+$binPath = Join-Path $installRoot "bin"
+$daemonPath = Join-Path $binPath "scryd.exe"
 
-if (-not (Test-Path -LiteralPath $daemonPath)) {
+if (-not (Test-Path -LiteralPath $sourceDaemonPath)) {
     throw "scryd.exe must be beside this installer script"
+}
+if (-not (Test-Path -LiteralPath $sourceCliPath)) {
+    throw "scry.exe must be beside this installer script"
 }
 if ($Unbounded -and $IndexMbps) {
     throw "Use either -Unbounded or -IndexMbps, not both"
@@ -36,6 +43,23 @@ $daemonArguments = if ($Unbounded) {
 } else {
     ""
 }
+
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+
+New-Item -ItemType Directory -Path $binPath -Force | Out-Null
+Copy-Item -LiteralPath $sourceDaemonPath -Destination $daemonPath -Force
+Copy-Item -LiteralPath $sourceCliPath -Destination (Join-Path $binPath "scry.exe") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall-daemon.ps1") -Destination (Join-Path $installRoot "uninstall.ps1") -Force
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $binPath.TrimEnd('\') })) {
+    $newUserPath = (($pathEntries + $binPath) -join ';')
+    [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+}
+
 $action = New-ScheduledTaskAction -Execute $daemonPath -Argument $daemonArguments
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
@@ -46,4 +70,8 @@ if (-not $NoStart) {
     Start-ScheduledTask -TaskName $taskName
 }
 
-Write-Host "Installed the elevated per-user Scry Search daemon task."
+Write-Host "Installed Scry Search to $installRoot."
+Write-Host "The CLI is available as 'scry' in new terminals."
+if (-not $NoStart) {
+    Write-Host "The elevated daemon has been started in the background."
+}

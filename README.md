@@ -67,8 +67,7 @@ snapshot or volume; see [internal performance notes](docs/internal/query-latency
 
 ## Install
 
-Download the Windows archive from GitHub Releases, extract it to a stable
-location, then run:
+Download and extract the Windows archive, then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install-daemon.ps1
@@ -77,12 +76,15 @@ powershell -ExecutionPolicy Bypass -File .\install-daemon.ps1
 Windows shows one UAC prompt. The script registers `scryd.exe` as a
 highest-privilege **per-user scheduled task** at logon and starts it. Scry uses
 this instead of a system service because its snapshot, clients, and IPC endpoint
-are user-scoped.
+are user-scoped. It installs the binaries under
+`%LOCALAPPDATA%\Programs\Scry Search\bin` and adds that directory to the user
+`PATH`, so `scry` is available in new terminals. The extracted archive can then
+be deleted.
 
 To remove the startup task while preserving snapshots:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\uninstall-daemon.ps1
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Scry Search\uninstall.ps1"
 ```
 
 ### Build from source

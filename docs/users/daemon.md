@@ -48,4 +48,11 @@ The release installer accepts matching task settings:
 .\install-daemon.ps1 -Unbounded      # maximum indexing throughput
 ```
 
+The installer copies `scryd.exe` and `scry.exe` to
+`%LOCALAPPDATA%\Programs\Scry Search\bin`, adds that directory to the user
+`PATH`, registers the elevated logon task, and starts the daemon in the
+background. Use `-NoStart` only when the daemon should wait until the next
+logon or a manual task start. Open a new terminal before invoking `scry` by
+name.
+
 
