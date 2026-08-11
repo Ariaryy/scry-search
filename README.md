@@ -49,7 +49,8 @@ limit all matter. No numbers below compare Scry with another product.
 | Selective two-term query, fresh process/connection | ~2.7M records, 200 samples | 21.449 ms p50 / 24.197 ms p99 |
 | Pathological one-byte path term | ~2.7M records, 10 warm samples | 125.33 ms p50 / 246.19 ms p99 |
 | Streaming compaction | 224,231-record base → 236,232-record snapshot | 0.846 s; 29.23 MB peak private commit |
-| Ten-minute idle run after compaction | 236,232 records, 1 Hz sampling | zero observed read/write bytes, reindexes, or compactions |
+| Ten-minute idle run after compaction | 236,232 records, 1 Hz sampling | 18.43–18.50 MB private commit; 1.95–3.04 MB working set; zero observed I/O/reindexes/compactions |
+| Idle Task Manager snapshot | current daemon, mapped pages mostly cold | ~3 MB private / ~7 MB total / ~4 MB shared working set |
 
 The maintained synthetic and live-snapshot probes are ignored tests so normal
 CI stays deterministic. Reproduce the portable suite with:
@@ -92,6 +93,12 @@ cargo build --release -p scry-cli
 `scryd` needs elevation for complete raw NTFS indexing. `scry` and applications
 using the client SDK stay unelevated.
 
+Initial indexing is the exceptional heavy phase: it reads volume metadata and
+can temporarily raise memory usage as pages are built and touched. By default,
+the daemon caps aggregate indexing reads at **128 MiB/s** to protect foreground
+disk latency. Use `scryd --index-mbps N` for a custom cap or `scryd --unbounded`
+when finishing as quickly as possible matters more than competing I/O.
+
 ## Search
 
 ```powershell
@@ -105,6 +112,8 @@ scry --interactive
 
 Bare words are case-insensitive path terms: each may match the leaf or an
 ancestor directory. See the full [search syntax](docs/users/search-syntax.md).
+All daemon and CLI switches are listed in the [daemon guide](docs/users/daemon.md)
+and [CLI reference](docs/users/cli.md).
 
 ## Embed it
 

@@ -27,6 +27,14 @@ fn main() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("scry {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--shared-index" => shared = true,
             "--no-shared-index" => shared = false,
             "--verbose" => verbose = true,
@@ -108,6 +116,13 @@ fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "scry {}\n\nUsage: scry [OPTIONS] <QUERY>\n\n  --interactive       Search while typing\n  --prefix            Force prefix matching\n  --substring         Force substring matching\n  --wildcard          Force wildcard matching\n  --sort VALUE        relevance, recent, or size\n  --shared-index      Prefer validated local execution\n  --no-shared-index   Force daemon RPC\n  --verbose           Print client phase timings\n  --stats             Print daemon query statistics\n  -h, --help          Print help\n  -V, --version       Print version",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// The ordering names accepted by `--sort`. `size` rather than `largest`

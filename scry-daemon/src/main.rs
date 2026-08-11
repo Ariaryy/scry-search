@@ -263,6 +263,17 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "scryd {}\n\nUsage: scryd [OPTIONS] [VOLUME ...]\n\n  --index-mbps N  Cap aggregate index reads in MiB/s\n  --unbounded     Disable the index read cap\n  -h, --help      Print help\n  -V, --version   Print version",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("scryd {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--unbounded" => index_mbps = Some(0),
             "--index-mbps" => {
                 let value = args
