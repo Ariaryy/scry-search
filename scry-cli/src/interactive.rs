@@ -205,7 +205,7 @@ fn render_to(
 
     write!(
         out,
-        "\x1b[{height};1H\x1b[2K\x1b[2m↑/↓ select  •  Enter open  •  Ctrl+C copy  •  Alt+Enter reveal  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
+        "\x1b[{height};1H\x1b[2K\x1b[2m↑/↓ select  •  Enter open  •  Ctrl+C copy  •  Ctrl+Enter reveal  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
     )
 }
 

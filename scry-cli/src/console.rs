@@ -27,8 +27,6 @@ const VK_DOWN: u16 = 0x28;
 const VK_C: u16 = 0x43;
 const SW_SHOWNORMAL: i32 = 1;
 const FILETIME_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
-const RIGHT_ALT_PRESSED: u32 = 0x0001;
-const LEFT_ALT_PRESSED: u32 = 0x0002;
 const RIGHT_CTRL_PRESSED: u32 = 0x0004;
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
 const CF_UNICODETEXT: u32 = 13;
@@ -230,11 +228,10 @@ impl RawMode {
             }
             if record.event_type == KEY_EVENT && record.key_event.key_down != 0 {
                 let controls = record.key_event.control_key_state;
-                let alt = controls & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0;
                 let ctrl = controls & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
                 let key = match record.key_event.virtual_key_code {
                     VK_BACK => Some(Key::Backspace),
-                    VK_RETURN if alt => Some(Key::Reveal),
+                    VK_RETURN if ctrl => Some(Key::Reveal),
                     VK_RETURN => Some(Key::Enter),
                     VK_ESCAPE => Some(Key::Escape),
                     VK_UP => Some(Key::Up),
