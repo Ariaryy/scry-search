@@ -2510,7 +2510,11 @@ fn hit_for(arena: &crate::ArchivedArena, delta: &Delta, record: u32, rank_bits: 
         None => Hit {
             record,
             rank_bits,
-            size: arena.recursive_size_kib(record) as u64 * 1024,
+            size: if arena.is_dir(record) {
+                arena.recursive_size_kib(record) as u64 * 1024
+            } else {
+                arena.size_bytes(record)
+            },
             mtime: arena.mtime(record),
             is_dir: arena.is_dir(record),
             size_exact: arena.size_exact(record),
