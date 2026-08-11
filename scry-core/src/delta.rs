@@ -560,6 +560,14 @@ mod tests {
         let decoded = Delta::decode_query_overlay(&encoded, base.archived().len()).unwrap();
         assert_eq!(decoded.added[0].name, "new.txt");
         assert_eq!(decoded.added[0].mtime_secs, 7);
+        assert!(!decoded.added[0].size_exact);
+        let legacy = &encoded[..encoded.len() - 6];
+        assert!(
+            !Delta::decode_query_overlay(legacy, base.archived().len())
+                .unwrap()
+                .added[0]
+                .size_exact
+        );
         assert!(
             Delta::decode_query_overlay(&encoded[..encoded.len() - 1], base.archived().len())
                 .is_none()

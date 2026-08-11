@@ -62,8 +62,8 @@ pub struct Arena {
     /// query. Kept out of `parents` so it can stay paged out between bursts.
     pub mtimes: Vec<u32>,
     /// File size in KiB, rounded up and saturating at u32::MAX.
-    /// Cold: same eviction rationale as `mtimes`. 0 means unknown (USN path),
-    /// not empty — see the `size` limitation note in CLAUDE.md.
+    /// Cold: same eviction rationale as `mtimes`. Consult `size_exact` to
+    /// distinguish a measured empty file from an unknown size.
     pub sizes: Vec<u32>,
     /// One LSB-first exactness bit per name-sorted record.
     pub size_exact_bits: Vec<u8>,
@@ -140,7 +140,7 @@ fn canonical_tree_parent(
         return PARENT_NONE;
     }
     // Empty DFS columns are retained only as a defensive legacy fallback.
-    // A current v9 snapshot always has them when it has records.
+    // A current v10 snapshot always has them when it has records.
     if dfs_positions.is_empty() || dfs_ends.is_empty() {
         return parent;
     }

@@ -172,7 +172,7 @@ where
     Ok(())
 }
 
-/// Stand-in for `&Arena` that lets compaction emit the v9 archive without
+/// Stand-in for `&Arena` that lets compaction emit the v10 archive without
 /// ever materializing an owned `Arena`: scalar header fields plus a `&[T]`
 /// view into each column, which — unlike a real `Arena`'s fields — can be
 /// backed by a [`crate::spool::Spool`]'s mmap rather than a `Vec`.

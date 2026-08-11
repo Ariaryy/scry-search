@@ -810,6 +810,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compaction_rederives_directory_size_exactness() {
+        let (_dir, mut view) = base_view(20);
+        let root = view.base.archived().prefix_range("C:").start;
+        let mut delta = Delta::new(view.base.archived().len());
+        delta.added.push(DeltaRecord {
+            name: "unknown-added.bin".into(),
+            parent: ParentRef::Base(root),
+            mtime_secs: 0,
+            is_dir: false,
+            size_bytes: 64 * 1024,
+            size_exact: false,
+            live: true,
+        });
+        view.delta = Arc::new(delta);
+
+        let (_compacted_dir, compacted) = open_compacted(&view);
+        let arena = compacted.base.archived();
+        let root = arena.prefix_range("C:").start;
+        let unknown = arena.prefix_range("unknown-added.bin").start;
+        assert!(!arena.size_exact(unknown));
+        assert!(!arena.size_exact(root));
+        assert!(arena.recursive_size_kib(root) >= 64);
+    }
+
     /// Brute-force check of the two formulas `compact`'s second pass uses to
     /// recompute a record's final post-merge index without ever storing an
     /// `old -> new` map: a base record's final index is
