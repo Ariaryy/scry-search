@@ -22,6 +22,11 @@ background work is usually a regression. Performance is part of correctness.
 > **Status:** `0.1.0-alpha.1`. The on-disk and wire formats may change
 > between versions; package matching client and daemon builds together.
 
+## Built with Scry Search
+
+- [Hayai](https://github.com/Ariaryy/hayai) uses the Rust client and elevated
+  daemon to provide realtime file search inside a Windows application launcher.
+
 ## Why Scry?
 
 - **Realtime:** a persistent `SearchSession` cancels superseded keystrokes and
