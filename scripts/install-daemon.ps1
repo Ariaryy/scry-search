@@ -13,8 +13,8 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
     if ($NoStart) { $arguments += "-NoStart" }
-    Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $arguments -Wait
-    exit $LASTEXITCODE
+    $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $arguments -Wait -PassThru
+    exit $elevated.ExitCode
 }
 
 $action = New-ScheduledTaskAction -Execute $daemonPath
