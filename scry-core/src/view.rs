@@ -21,6 +21,8 @@ use crate::Arena;
 use crate::PARENT_NONE;
 use std::fs::File;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 /// Ceiling on any caller-supplied result limit. The bounded top-k heap is the
 /// only thing standing between a one-character query and an allocation
@@ -359,13 +361,18 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(1);
         let cancel = Cancellation::new(&generation, 0); // already stale
         for threads in [1, 4] {
-            let hits = view.search_hits_cancellable(
-                &Query::Substring("needle".into()),
-                SearchOptions::ordered(50, Order::Relevance),
-                Some(cancel),
-                threads,
-            );
-            assert!(hits.is_empty(), "threads={threads}");
+            for query in [
+                Query::Substring("needle".into()),
+                Query::PathTerms(vec!["e".into()]),
+            ] {
+                let hits = view.search_hits_cancellable(
+                    &query,
+                    SearchOptions::ordered(50, Order::Relevance),
+                    Some(cancel),
+                    threads,
+                );
+                assert!(hits.is_empty(), "query={query:?}, threads={threads}");
+            }
         }
     }
 
@@ -376,17 +383,23 @@ mod tests {
     #[test]
     fn parallel_and_single_threaded_agree() {
         let (_dir, view) = streaming_corpus();
-        let query = Query::Substring("e".into());
-        for order in [Order::Relevance, Order::Recent, Order::Largest] {
-            for limit in [3usize, 50] {
-                let options = SearchOptions::ordered(limit, order);
-                let single = view.search_hits_cancellable(&query, options, None, 1);
-                for threads in [2, 4, 8] {
-                    let parallel = view.search_hits_cancellable(&query, options, None, threads);
-                    assert_eq!(
-                        single, parallel,
-                        "order={order:?}, limit={limit}, threads={threads}"
-                    );
+        for query in [
+            Query::Substring("e".into()),
+            Query::PathTerms(vec!["e".into()]),
+            Query::PathTerms(vec!["ne".into()]),
+            Query::PathTerms(vec!["needle".into()]),
+        ] {
+            for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                for limit in [0usize, 1, 50] {
+                    let options = SearchOptions::ordered(limit, order);
+                    let single = view.search_hits_cancellable(&query, options, None, 1);
+                    for threads in [2, 4, 8] {
+                        let parallel = view.search_hits_cancellable(&query, options, None, threads);
+                        assert_eq!(
+                            single, parallel,
+                            "query={query:?}, order={order:?}, limit={limit}, threads={threads}"
+                        );
+                    }
                 }
             }
         }
@@ -1342,15 +1355,25 @@ mod tests {
                 }
                 expected.sort_unstable();
                 let expected: Vec<_> = expected.into_iter().map(rank::key_record).collect();
-                let actual: Vec<_> = view
-                    .search_hits(
-                        &Query::PathTerms(terms.clone()),
-                        SearchOptions::ordered(usize::MAX, order),
-                    )
-                    .into_iter()
-                    .map(|hit| hit.record)
-                    .collect();
-                assert_eq!(actual, expected, "terms={terms:?}, order={order:?}");
+                for limit in [0usize, 1, 50, usize::MAX] {
+                    let expected = &expected[..expected.len().min(limit)];
+                    for threads in [1usize, 2, 4, 8] {
+                        let actual: Vec<_> = view
+                            .search_hits_cancellable(
+                                &Query::PathTerms(terms.clone()),
+                                SearchOptions::ordered(limit, order),
+                                None,
+                                threads,
+                            )
+                            .into_iter()
+                            .map(|hit| hit.record)
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "terms={terms:?}, order={order:?}, limit={limit}, threads={threads}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1416,6 +1439,7 @@ mod tests {
             &mut PathSearchScratch::default(),
             true,
             None,
+            1,
         );
         let full = search_path_terms_with_scratch(
             view.base.archived(),
@@ -1425,6 +1449,7 @@ mod tests {
             &mut PathSearchScratch::default(),
             false,
             None,
+            1,
         );
 
         assert_eq!(filtered, full);
@@ -1448,6 +1473,7 @@ mod tests {
             &mut scratch,
             true,
             None,
+            1,
         );
         assert_eq!(absent.len(), 10);
 
@@ -1459,6 +1485,7 @@ mod tests {
             &mut scratch,
             true,
             None,
+            1,
         );
         assert!(results.is_empty());
         // A single-term query leaves exactly one term set behind, sized to
@@ -1542,6 +1569,7 @@ mod tests {
                 scratch,
                 filtered,
                 None,
+                1,
             );
             (start.elapsed(), results)
         };
@@ -1567,6 +1595,65 @@ mod tests {
             selected.len(),
             selected.len() as f64 * 100.0 / total_blocks as f64,
         );
+    }
+
+    #[test]
+    #[ignore = "release-mode short path-term phase probe"]
+    fn benchmark_short_path_term_phases() {
+        const RECORDS: usize = 400_000;
+        const SAMPLES: usize = 7;
+        let mut builder = crate::ArenaBuilder::with_capacity(RECORDS + 1, RECORDS * 24);
+        let root = builder.push("root", 0, true);
+        for index in 0..RECORDS {
+            let record = builder.push(&format!("archive_component_{index:06}.dat"), 0, false);
+            builder.set_parent(record, root);
+        }
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short-path-term-phases.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+
+        for (label, term) in [
+            ("one_byte", "a"),
+            ("two_byte", "ar"),
+            ("three_byte", "arc"),
+            ("rare", "component_399999"),
+            ("absent", "not_present_qzxv"),
+        ] {
+            for threads in [1usize, 8] {
+                let query = Query::PathTerms(vec![term.to_owned()]);
+                let mut samples = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
+                    PATH_TERM_SCAN_NS.store(0, AtomicOrdering::Relaxed);
+                    PATH_TERM_COALESCE_NS.store(0, AtomicOrdering::Relaxed);
+                    PATH_TERM_ENUMERATE_NS.store(0, AtomicOrdering::Relaxed);
+                    let started = std::time::Instant::now();
+                    std::hint::black_box(view.search_hits_cancellable(
+                        &query,
+                        SearchOptions::new(50),
+                        None,
+                        threads,
+                    ));
+                    samples.push((
+                        started.elapsed().as_nanos() as u64,
+                        PATH_TERM_SCAN_NS.load(AtomicOrdering::Relaxed),
+                        PATH_TERM_COALESCE_NS.load(AtomicOrdering::Relaxed),
+                        PATH_TERM_ENUMERATE_NS.load(AtomicOrdering::Relaxed),
+                    ));
+                }
+                samples.sort_unstable_by_key(|sample| sample.0);
+                let (total, scan, coalesce, enumerate) = samples[SAMPLES / 2];
+                eprintln!(
+                    "{label} threads={threads}: total={:.3} ms scan={:.3} ms ({:.1}%) coalesce={:.3} ms enumerate={:.3} ms",
+                    total as f64 / 1e6,
+                    scan as f64 / 1e6,
+                    scan as f64 * 100.0 / total as f64,
+                    coalesce as f64 / 1e6,
+                    enumerate as f64 / 1e6,
+                );
+            }
+        }
     }
 }
 
@@ -1643,6 +1730,7 @@ impl IndexView {
                 terms,
                 options,
                 cancel,
+                threads,
             );
             if let (Some(spans), Some(started)) = (spans, started) {
                 spans.select_ns = spans
@@ -2205,6 +2293,13 @@ thread_local! {
     static TERM_INTERVAL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+static PATH_TERM_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static PATH_TERM_COALESCE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static PATH_TERM_ENUMERATE_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Modification time of a record in the combined base-then-delta space.
 #[inline]
 fn record_mtime(arena: &crate::ArchivedArena, delta: &Delta, record: u32) -> u32 {
@@ -2497,7 +2592,7 @@ pub fn search_path_terms(
     terms: &[String],
     options: SearchOptions,
 ) -> Vec<Hit> {
-    search_path_terms_cancellable(arena, delta, terms, options, None)
+    search_path_terms_cancellable(arena, delta, terms, options, None, 1)
 }
 
 fn search_path_terms_cancellable(
@@ -2506,6 +2601,7 @@ fn search_path_terms_cancellable(
     terms: &[String],
     options: SearchOptions,
     cancel: Option<Cancellation>,
+    threads: usize,
 ) -> Vec<Hit> {
     PATH_SEARCH_SCRATCH.with(|scratch| {
         search_path_terms_with_scratch(
@@ -2516,6 +2612,7 @@ fn search_path_terms_cancellable(
             &mut scratch.borrow_mut(),
             true,
             cancel,
+            threads,
         )
     })
 }
@@ -2541,6 +2638,8 @@ fn build_term_interval_set(
 ) -> bool {
     #[cfg(test)]
     TERM_INTERVAL_BUILDS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    let scan_started = std::time::Instant::now();
     let filtered = use_filter
         && arena.candidate_blocks_into(
             term_lower,
@@ -2593,8 +2692,84 @@ fn build_term_interval_set(
             return false;
         }
     }
+    #[cfg(test)]
+    PATH_TERM_SCAN_NS.fetch_add(
+        scan_started.elapsed().as_nanos() as u64,
+        AtomicOrdering::Relaxed,
+    );
+    #[cfg(test)]
+    let coalesce_started = std::time::Instant::now();
     set.coalesce();
+    #[cfg(test)]
+    PATH_TERM_COALESCE_NS.fetch_add(
+        coalesce_started.elapsed().as_nanos() as u64,
+        AtomicOrdering::Relaxed,
+    );
     true
+}
+
+fn path_match_mask(automaton: &aho_corasick::AhoCorasick, name: &[u8]) -> u16 {
+    automaton
+        .find_overlapping_iter(name)
+        .fold(0u16, |mask, found| {
+            mask | (1u16 << found.pattern().as_usize())
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_dense_path_hits_parallel(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    runs: &crate::intervals::IntervalSet,
+    automaton: &aho_corasick::AhoCorasick,
+    term_count: usize,
+    order: Order,
+    limit: usize,
+    cancel: Option<Cancellation>,
+    threads: usize,
+) -> Option<BinaryHeap<u64>> {
+    let shards: Vec<BinaryHeap<u64>> = std::thread::scope(|scope| {
+        crate::query::bucket_shards(arena.len(), threads)
+            .map(|(start, end)| {
+                scope.spawn(move || {
+                    let mut heap = BinaryHeap::with_capacity(limit.min(4096));
+                    let mut checked = 0u32;
+                    arena.for_each_name_in(start..end, |record, name| {
+                        if is_cancelled_periodically(cancel, &mut checked) {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        if delta.tombstones.get(record)
+                            || !runs.contains(arena.dfs_position(record))
+                        {
+                            return std::ops::ControlFlow::Continue(());
+                        }
+                        let own = path_match_mask(automaton, name);
+                        let quality = (term_count as u32 - own.count_ones()) as u8;
+                        rank::retain_hit(
+                            &mut heap,
+                            sort_key(order, arena, delta, record, quality, name.len() as u32),
+                            limit,
+                        );
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    heap
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return None;
+    }
+    let mut merged = BinaryHeap::with_capacity(limit.min(4096));
+    for shard in shards {
+        for key in shard {
+            rank::retain_hit(&mut merged, key, limit);
+        }
+    }
+    Some(merged)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2606,6 +2781,7 @@ fn search_path_terms_with_scratch(
     scratch: &mut PathSearchScratch,
     use_filter: bool,
     cancel: Option<Cancellation>,
+    threads: usize,
 ) -> Vec<Hit> {
     let SearchOptions { limit, order } = options;
     if terms.is_empty() || terms.len() > crate::terms::MAX_TERMS || limit == 0 {
@@ -2626,13 +2802,7 @@ fn search_path_terms_with_scratch(
         Ok(automaton) => automaton,
         Err(_) => return Vec::new(),
     };
-    let mask_for = |name: &[u8]| {
-        automaton
-            .find_overlapping_iter(name)
-            .fold(0u16, |mask, found| {
-                mask | (1u16 << found.pattern().as_usize())
-            })
-    };
+    let mask_for = |name: &[u8]| path_match_mask(&automaton, name);
     // `contains_ci`/`candidate_blocks_into` only lowercase the haystack, so
     // terms are lowered once up front.
     let terms_lower: Vec<Vec<u8>> = terms
@@ -2696,63 +2866,99 @@ fn search_path_terms_with_scratch(
             scratch.term_sets[index].runs().len(),
         )
     });
-    let any_term_empty = scratch.term_sets[term_order[0]].is_empty();
-    let mut final_runs: Vec<(u32, u32)> = Vec::new();
-    if !any_term_empty {
-        scratch.fold_a = scratch.term_sets[term_order[0]].clone();
+    let PathSearchScratch {
+        term_sets,
+        fold_a,
+        fold_b,
+        heap,
+        name,
+        ..
+    } = scratch;
+    let final_set: &crate::intervals::IntervalSet = if terms.len() == 1 {
+        &term_sets[0]
+    } else if term_sets[term_order[0]].is_empty() {
+        fold_a.clear();
+        fold_a
+    } else {
+        *fold_a = term_sets[term_order[0]].clone();
         let mut current_in_a = true;
         for &term_index in &term_order[1..terms.len()] {
             if current_in_a {
-                scratch.term_sets[term_index].intersect_into(&scratch.fold_a, &mut scratch.fold_b);
+                term_sets[term_index].intersect_into(fold_a, fold_b);
                 current_in_a = false;
             } else {
-                scratch.term_sets[term_index].intersect_into(&scratch.fold_b, &mut scratch.fold_a);
+                term_sets[term_index].intersect_into(fold_b, fold_a);
                 current_in_a = true;
             }
             let now_empty = if current_in_a {
-                scratch.fold_a.is_empty()
+                fold_a.is_empty()
             } else {
-                scratch.fold_b.is_empty()
+                fold_b.is_empty()
             };
             if now_empty {
                 break;
             }
         }
-        let final_set = if current_in_a {
-            &scratch.fold_a
+        if current_in_a {
+            fold_a
         } else {
-            &scratch.fold_b
-        };
-        final_runs.extend_from_slice(final_set.runs());
-    }
+            fold_b
+        }
+    };
 
-    let mut checked: u32 = 0;
-    for &(start, end) in &final_runs {
-        for position in start..end {
-            if is_cancelled_periodically(cancel, &mut checked) {
-                return Vec::new();
+    #[cfg(test)]
+    let enumerate_started = std::time::Instant::now();
+    let dense_parallel =
+        needs_name && threads > 1 && final_set.len_positions() >= (arena.len() as u64).div_ceil(4);
+    if dense_parallel {
+        let Some(parallel_heap) = retain_dense_path_hits_parallel(
+            arena,
+            delta,
+            final_set,
+            &automaton,
+            terms.len(),
+            order,
+            limit,
+            cancel,
+            threads,
+        ) else {
+            return Vec::new();
+        };
+        *heap = parallel_heap;
+    } else {
+        let mut checked: u32 = 0;
+        for &(start, end) in final_set.runs() {
+            for position in start..end {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    return Vec::new();
+                }
+                let record = arena.dfs_record(position);
+                if delta.tombstones.get(record) {
+                    continue;
+                }
+                let (quality, name_len) = if needs_name {
+                    arena.name_into(record, name);
+                    let mask = mask_for(name);
+                    (
+                        (terms.len() as u32 - mask.count_ones()) as u8,
+                        name.len() as u32,
+                    )
+                } else {
+                    (0, 0)
+                };
+                rank::retain_hit(
+                    heap,
+                    sort_key(order, arena, delta, record, quality, name_len),
+                    limit,
+                );
             }
-            let record = arena.dfs_record(position);
-            if delta.tombstones.get(record) {
-                continue;
-            }
-            let (quality, name_len) = if needs_name {
-                arena.name_into(record, &mut scratch.name);
-                let mask = mask_for(&scratch.name);
-                (
-                    (terms.len() as u32 - mask.count_ones()) as u8,
-                    scratch.name.len() as u32,
-                )
-            } else {
-                (0, 0)
-            };
-            rank::retain_hit(
-                &mut scratch.heap,
-                sort_key(order, arena, delta, record, quality, name_len),
-                limit,
-            );
         }
     }
+    #[cfg(test)]
+    PATH_TERM_ENUMERATE_NS.fetch_add(
+        enumerate_started.elapsed().as_nanos() as u64,
+        AtomicOrdering::Relaxed,
+    );
 
     // The delta overlay is bounded and independent of the base pass above —
     // it always runs, even when a base term set came up empty, since a
@@ -2776,9 +2982,7 @@ fn search_path_terms_with_scratch(
             match current_parent {
                 ParentRef::Base(parent) => {
                     let position = arena.dfs_position(parent);
-                    for (term_index, term_set) in
-                        scratch.term_sets[..terms.len()].iter().enumerate()
-                    {
+                    for (term_index, term_set) in term_sets[..terms.len()].iter().enumerate() {
                         if term_set.contains(position) {
                             inherited |= 1 << term_index;
                         }
@@ -2808,14 +3012,14 @@ fn search_path_terms_with_scratch(
                 (0, 0)
             };
             rank::retain_hit(
-                &mut scratch.heap,
+                heap,
                 sort_key(order, arena, delta, combined, quality, name_len),
                 limit,
             );
         }
     }
 
-    drain_heap(arena, delta, &mut scratch.heap)
+    drain_heap(arena, delta, heap)
 }
 
 fn delta_path(arena: &crate::ArchivedArena, delta: &Delta, mut index: u32) -> String {

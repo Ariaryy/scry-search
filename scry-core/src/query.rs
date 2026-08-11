@@ -110,7 +110,7 @@ pub fn search_base_parallel_with_spans(
 /// same shard unit `scan_full_parallel`/`scan_full_parallel_ranked` scan
 /// independently: a front-coded bucket decodes from nothing outside itself,
 /// so a shard boundary never needs synchronization with its neighbors.
-fn bucket_shards(n: usize, threads: usize) -> impl Iterator<Item = (u32, u32)> {
+pub(crate) fn bucket_shards(n: usize, threads: usize) -> impl Iterator<Item = (u32, u32)> {
     let num_buckets = n.div_ceil(crate::record::BUCKET_SIZE);
     let shard_buckets = num_buckets.div_ceil(threads.max(1)).max(1);
     (0..num_buckets)
