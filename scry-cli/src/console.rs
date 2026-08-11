@@ -205,11 +205,22 @@ impl RawMode {
     }
 
     pub fn width(&self) -> usize {
+        self.dimensions().0
+    }
+
+    pub fn height(&self) -> usize {
+        self.dimensions().1
+    }
+
+    fn dimensions(&self) -> (usize, usize) {
         let mut info = ConsoleScreenBufferInfo::default();
         if unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } == 0 {
-            return 80;
+            return (80, 24);
         }
-        usize::try_from(info.window.right - info.window.left + 1).unwrap_or(80)
+        (
+            usize::try_from(info.window.right - info.window.left + 1).unwrap_or(80),
+            usize::try_from(info.window.bottom - info.window.top + 1).unwrap_or(24),
+        )
     }
 }
 

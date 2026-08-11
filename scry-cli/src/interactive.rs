@@ -30,6 +30,7 @@ pub fn run(
         pending,
         query_time,
         raw.width(),
+        raw.height(),
     );
 
     'search: loop {
@@ -91,6 +92,7 @@ pub fn run(
                 pending,
                 query_time,
                 raw.width(),
+                raw.height(),
             );
         }
         std::thread::sleep(Duration::from_millis(8));
@@ -110,10 +112,17 @@ fn render(
     pending: bool,
     query_time: Option<Duration>,
     width: usize,
+    height: usize,
 ) {
     let mut frame = Vec::with_capacity(4_096);
     if render_to(
-        &mut frame, pattern, results, selected, pending, query_time, width,
+        &mut frame,
+        pattern,
+        results,
+        selected,
+        pending,
+        query_time,
+        (width, height),
     )
     .is_err()
     {
@@ -131,8 +140,9 @@ fn render_to(
     selected: usize,
     pending: bool,
     query_time: Option<Duration>,
-    width: usize,
+    dimensions: (usize, usize),
 ) -> std::io::Result<()> {
+    let (width, height) = dimensions;
     write!(out, "\x1b[?2026h\x1b[H\x1b[J\x1b[1;36mScry Search\x1b[0m")?;
     write!(out, "\r\n\x1b[36m›\x1b[0m {pattern}\x1b[s")?;
 
@@ -154,7 +164,9 @@ fn render_to(
     } else if results.is_empty() && !pending {
         writeln!(out, "  \x1b[2mNo matches\x1b[0m")?;
     } else {
-        for (index, entry) in results.iter().enumerate() {
+        let visible_rows = height.saturating_sub(5).max(1);
+        let first = selected.saturating_add(1).saturating_sub(visible_rows);
+        for (index, entry) in results.iter().enumerate().skip(first).take(visible_rows) {
             let suffix = if entry.is_dir { "\\" } else { "" };
             let safe = visible_path(&entry.path);
             let path = fit_path(&safe, width.saturating_sub(3 + suffix.len()));
@@ -168,7 +180,7 @@ fn render_to(
 
     write!(
         out,
-        "\r\n\x1b[2m↑/↓ select  •  Enter open  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
+        "\x1b[{height};1H\x1b[2K\x1b[2m↑/↓ select  •  Enter open  •  Esc close\x1b[0m\x1b[u\x1b[?2026l"
     )
 }
 
@@ -235,13 +247,14 @@ mod tests {
             0,
             false,
             Some(Duration::from_micros(420)),
-            100,
+            (100, 30),
         )
         .unwrap();
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.starts_with("\x1b[?2026h\x1b[H\x1b[J"));
         assert!(rendered.contains("volume\\new"));
         assert!(rendered.contains("420 µs"));
+        assert!(rendered.contains("\x1b[30;1H\x1b[2K"));
         assert!(rendered.ends_with("\x1b[u\x1b[?2026l"));
     }
 
@@ -255,7 +268,7 @@ mod tests {
             1,
             false,
             Some(Duration::from_millis(2)),
-            100,
+            (100, 30),
         )
         .unwrap();
         let rendered = String::from_utf8(output).unwrap();
