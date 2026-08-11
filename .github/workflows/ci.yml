@@ -5,6 +5,7 @@ on:
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
   workflow_dispatch:
 
 concurrency:
