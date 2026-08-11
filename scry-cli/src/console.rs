@@ -304,21 +304,26 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn reveal_path(path: &Path) -> std::io::Result<()> {
-    let status = if path.is_dir() {
-        std::process::Command::new("explorer.exe")
-            .arg(path)
-            .status()
-    } else {
-        std::process::Command::new("explorer.exe")
-            .arg(format!("/select,{}", path.display()))
-            .status()
-    }?;
-    if status.success() {
+    let executable: Vec<u16> = "explorer.exe\0".encode_utf16().collect();
+    let parameters: Vec<u16> = format!("/select,\"{}\"\0", path.display())
+        .encode_utf16()
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            executable.as_ptr(),
+            parameters.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result > 32 {
         Ok(())
     } else {
-        Err(std::io::Error::other(
-            "Explorer could not reveal the selected path",
-        ))
+        Err(std::io::Error::other(format!(
+            "Explorer could not reveal the selected path (ShellExecuteW code {result})"
+        )))
     }
 }
 
