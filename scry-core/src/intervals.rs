@@ -44,6 +44,17 @@ impl IntervalSet {
         self.push_span(position, position + 1);
     }
 
+    pub(crate) fn push_ordered_point(&mut self, position: u32) {
+        debug_assert!(self.pending.is_empty());
+        if let Some((_, end)) = self.runs.last_mut() {
+            if *end == position {
+                *end += 1;
+                return;
+            }
+        }
+        self.runs.push((position, position + 1));
+    }
+
     /// Sort and merge every queued span (plus any already-coalesced runs)
     /// into the minimal non-touching run list.
     pub fn coalesce(&mut self) {
@@ -166,6 +177,15 @@ mod tests {
         assert!(set.contains(7));
         assert!(!set.contains(6));
         assert!(!set.contains(8));
+    }
+
+    #[test]
+    fn ordered_points_form_runs_without_coalescing() {
+        let mut set = IntervalSet::default();
+        for point in [1, 2, 4, 7, 8, 9] {
+            set.push_ordered_point(point);
+        }
+        assert_eq!(set.runs(), &[(1, 3), (4, 5), (7, 10)]);
     }
 
     #[test]

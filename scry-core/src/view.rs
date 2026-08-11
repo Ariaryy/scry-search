@@ -2305,6 +2305,7 @@ struct PathSearchScratch {
     candidate_blocks: Vec<u32>,
     candidate_bitmap: Vec<u8>,
     trigram_hashes: Vec<usize>,
+    own_matches: Vec<u8>,
     heap: BinaryHeap<u64>,
     name: Vec<u8>,
 }
@@ -2320,6 +2321,7 @@ impl PathSearchScratch {
         self.candidate_blocks.clear();
         self.candidate_bitmap.clear();
         self.trigram_hashes.clear();
+        self.own_matches.clear();
         self.heap.clear();
         self.name.clear();
         let target = limit.min(4096);
@@ -2666,6 +2668,63 @@ fn search_path_terms_cancellable(
 /// interval containment), a single point for a file match. Returns `false`
 /// if the scan was cancelled partway through, in which case `set` must be
 /// discarded by the caller.
+fn build_short_single_term_set(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    term_lower: &[u8],
+    set: &mut crate::intervals::IntervalSet,
+    own_matches: &mut Vec<u8>,
+    cancel: Option<Cancellation>,
+) -> bool {
+    own_matches.resize(arena.len().div_ceil(8), 0);
+    own_matches.fill(0);
+    #[cfg(test)]
+    let scan_started = std::time::Instant::now();
+    let mut checked = 0u32;
+    let mut cancelled = false;
+    arena.for_each_name(|record, name| {
+        if is_cancelled_periodically(cancel, &mut checked) {
+            cancelled = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
+            own_matches[record as usize / 8] |= 1 << (record % 8);
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if cancelled || cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return false;
+    }
+    #[cfg(test)]
+    PATH_TERM_SCAN_NS.fetch_add(
+        scan_started.elapsed().as_nanos() as u64,
+        AtomicOrdering::Relaxed,
+    );
+    #[cfg(test)]
+    let coalesce_started = std::time::Instant::now();
+    let mut inherited_end = 0u32;
+    let mut checked = 0u32;
+    for position in 0..arena.len() as u32 {
+        if is_cancelled_periodically(cancel, &mut checked) {
+            return false;
+        }
+        let record = arena.dfs_record(position);
+        let own = own_matches[record as usize / 8] & (1 << (record % 8)) != 0;
+        if own && arena.is_dir(record) {
+            inherited_end = inherited_end.max(arena.subtree(record).end);
+        }
+        if own || position < inherited_end {
+            set.push_ordered_point(position);
+        }
+    }
+    #[cfg(test)]
+    PATH_TERM_COALESCE_NS.fetch_add(
+        coalesce_started.elapsed().as_nanos() as u64,
+        AtomicOrdering::Relaxed,
+    );
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_term_interval_set(
     arena: &crate::ArchivedArena,
@@ -2858,22 +2917,27 @@ fn search_path_terms_with_scratch(
         candidate_blocks,
         candidate_bitmap,
         trigram_hashes,
+        own_matches,
         ..
     } = &mut *scratch;
     let mut checked: u32 = 0;
     for (term_lower, term_set) in terms_lower.iter().zip(term_sets.iter_mut()) {
-        let completed = build_term_interval_set(
-            arena,
-            delta,
-            term_lower,
-            use_filter,
-            term_set,
-            candidate_blocks,
-            candidate_bitmap,
-            trigram_hashes,
-            cancel,
-            &mut checked,
-        );
+        let completed = if terms.len() == 1 && term_lower.len() < 3 {
+            build_short_single_term_set(arena, delta, term_lower, term_set, own_matches, cancel)
+        } else {
+            build_term_interval_set(
+                arena,
+                delta,
+                term_lower,
+                use_filter,
+                term_set,
+                candidate_blocks,
+                candidate_bitmap,
+                trigram_hashes,
+                cancel,
+                &mut checked,
+            )
+        };
         if !completed {
             return Vec::new();
         }
