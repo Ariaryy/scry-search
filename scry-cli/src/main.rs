@@ -13,6 +13,7 @@ mod interactive;
 
 use scry_client::Client;
 use scry_core::protocol::{Order, QueryKind, ResultEntry};
+use std::io::IsTerminal;
 
 const DEFAULT_LIMIT: u32 = 50;
 const DEFAULT_INTERACTIVE_LIMIT: u32 = 12;
@@ -148,12 +149,35 @@ fn parse_order(value: &str) -> Option<Order> {
 
 fn print_entry(entry: &ResultEntry) {
     let marker = if entry.is_dir { "/" } else { "" };
-    println!(
-        "{}{marker}\t{}\t{}",
-        entry.path,
-        display_size(entry),
-        entry.mtime
-    );
+    if std::io::stdout().is_terminal() {
+        let path = visible_terminal_text(&entry.path);
+        let color = if entry.is_dir { "36" } else { "37" };
+        println!(
+            "  \x1b[1;{color}m{path}{marker}\x1b[0m  \x1b[2m{} KiB  ·  {}\x1b[0m",
+            display_size(entry),
+            entry.mtime
+        );
+    } else {
+        println!(
+            "{}{marker}\t{}\t{}",
+            entry.path,
+            display_size(entry),
+            entry.mtime
+        );
+    }
+}
+
+fn visible_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn display_size(entry: &ResultEntry) -> String {
@@ -224,5 +248,10 @@ mod tests {
         assert_eq!(display_size(&entry(0, false, true)), "0");
         assert_eq!(display_size(&entry(42, true, false)), ">=42");
         assert_eq!(display_size(&entry(0, false, false)), "?");
+    }
+
+    #[test]
+    fn terminal_text_cannot_inject_control_sequences() {
+        assert_eq!(visible_terminal_text("safe\u{1b}[2J"), "safe�[2J");
     }
 }
