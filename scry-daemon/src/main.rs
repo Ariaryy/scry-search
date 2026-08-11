@@ -169,18 +169,6 @@ fn add_spans(target: &mut QuerySpans, source: QuerySpans) {
         field.saturating_add(value));
 }
 
-fn add_parallel_spans(target: &mut QuerySpans, source: QuerySpans) {
-    target.select_ns = target.select_ns.max(source.select_ns);
-    target.finalize_ns = target.finalize_ns.max(source.finalize_ns);
-    target.merge_ns = target.merge_ns.max(source.merge_ns);
-    target.materialize_ns = target.materialize_ns.max(source.materialize_ns);
-    target.encode_ns = target.encode_ns.max(source.encode_ns);
-    target.candidates = target.candidates.saturating_add(source.candidates);
-    target.emitted = target.emitted.saturating_add(source.emitted);
-    target.blocks_scanned = target.blocks_scanned.saturating_add(source.blocks_scanned);
-    target.blocks_total = target.blocks_total.saturating_add(source.blocks_total);
-}
-
 fn max_spans(target: &mut QuerySpans, source: QuerySpans) {
     span_fields!(target, source, |field: &mut u64, value| *field =
         (*field).max(value));
@@ -1225,11 +1213,6 @@ fn query_thread_count() -> usize {
     })
 }
 
-fn parallel_volume_fanout(query: &Query, volume_count: usize) -> bool {
-    volume_count > 1
-        && matches!(query, Query::PathTerms(terms) if terms.iter().any(|term| term.len() < 3))
-}
-
 /// Measurement-only override: `SCRY_NO_REFINEMENT_CACHE=1` makes every query
 /// rescan from scratch, for an as-you-type latency comparison against the
 /// cached path without a separate build.
@@ -1380,16 +1363,18 @@ fn search_indexes_with_cache_with_spans(
         limit
     };
 
-    let views: Vec<_> = indexes
-        .iter()
-        .map(|index| index.store.load_full())
-        .collect();
-    let search_volume = |i: usize, view: &Arc<IndexView>| {
+    let mut views = Vec::with_capacity(indexes.len());
+    let mut merged = Vec::new();
+    let mut next_per_volume = Vec::with_capacity(indexes.len());
+    for (i, index) in indexes.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let view = index.store.load_full();
         let reused = refine
             .then(|| cache.per_volume[i].as_ref())
             .flatten()
             .filter(|cached| cached.generation == view.generation);
-        let mut local_spans = QuerySpans::default();
         let mut name = Vec::new();
         let hits = if let Some(cached) = reused {
             cached
@@ -1397,10 +1382,13 @@ fn search_indexes_with_cache_with_spans(
                 .iter()
                 .copied()
                 .filter_map(|mut hit| {
-                    if !matches_refined(view, hit, kind, &terms_lower, &mut name) {
+                    if !matches_refined(&view, hit, kind, &terms_lower, &mut name) {
                         return None;
                     }
                     if order == Order::Relevance {
+                        // Prefix/substring refinement leaves the leaf name
+                        // in `name`; path matching walks ancestors, so load
+                        // the leaf once here before rebuilding its rank.
                         if kind == QueryKind::PathTerms {
                             view.name_into(hit.record, &mut name);
                         }
@@ -1413,45 +1401,19 @@ fn search_indexes_with_cache_with_spans(
                     }
                     Some(hit)
                 })
-                .collect()
+                .collect::<Vec<_>>()
         } else {
             view.search_hits_cancellable_with_spans(
                 query,
                 SearchOptions::ordered(scan_limit, order),
                 Some(cancel),
                 query_thread_count(),
-                Some(&mut local_spans),
+                Some(&mut *spans),
             )
         };
-        (hits, local_spans)
-    };
-    let per_volume: Vec<(Vec<Hit>, QuerySpans)> = if parallel_volume_fanout(query, views.len()) {
-        std::thread::scope(|scope| {
-            let search_volume = &search_volume;
-            views
-                .iter()
-                .enumerate()
-                .map(|(i, view)| scope.spawn(move || search_volume(i, view)))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect()
-        })
-    } else {
-        views
-            .iter()
-            .enumerate()
-            .map(|(i, view)| search_volume(i, view))
-            .collect()
-    };
-
-    let mut merged = Vec::new();
-    let mut next_per_volume = Vec::with_capacity(indexes.len());
-    for (i, (hits, local_spans)) in per_volume.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return Vec::new();
         }
-        add_parallel_spans(spans, local_spans);
         merged.extend(hits.iter().copied().map(|hit| (i, hit)));
         // Only a set scanned at the full cap is known to be a superset of what
         // a refined query could match. A set truncated at `limit` is not, and
@@ -1459,11 +1421,12 @@ fn search_indexes_with_cache_with_spans(
         next_per_volume.push(
             (scan_limit == REFINEMENT_CACHE_CAP && hits.len() < REFINEMENT_CACHE_CAP).then(|| {
                 VolumeCandidates {
-                    generation: views[i].generation,
+                    generation: view.generation,
                     hits,
                 }
             }),
         );
+        views.push(view);
     }
     cache.kind = Some(kind);
     cache.order = order;
@@ -1644,42 +1607,25 @@ fn search_indexes_cancellable_with_spans(
     if options.limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
-    let views: Vec<_> = indexes
-        .iter()
-        .map(|index| index.store.load_full())
-        .collect();
-    let search_volume = |view: &Arc<IndexView>| {
-        let mut local_spans = QuerySpans::default();
+    let mut views = Vec::with_capacity(indexes.len());
+    let mut hits_by_volume = Vec::new();
+    for (volume, index) in indexes.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let view = index.store.load_full();
         let hits = view.search_hits_cancellable_with_spans(
             query,
             options,
             Some(cancel),
             query_thread_count(),
-            Some(&mut local_spans),
+            Some(&mut *spans),
         );
-        (hits, local_spans)
-    };
-    let per_volume: Vec<(Vec<Hit>, QuerySpans)> = if parallel_volume_fanout(query, views.len()) {
-        std::thread::scope(|scope| {
-            let search_volume = &search_volume;
-            views
-                .iter()
-                .map(|view| scope.spawn(move || search_volume(view)))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect()
-        })
-    } else {
-        views.iter().map(search_volume).collect()
-    };
+        hits_by_volume.extend(hits.into_iter().map(|hit| (volume, hit)));
+        views.push(view);
+    }
     if cancel.is_cancelled() {
         return Vec::new();
-    }
-    let mut hits_by_volume = Vec::new();
-    for (volume, (hits, local_spans)) in per_volume.into_iter().enumerate() {
-        add_parallel_spans(spans, local_spans);
-        hits_by_volume.extend(hits.into_iter().map(|hit| (volume, hit)));
     }
     let merge_started = std::time::Instant::now();
     rank_sort_truncate_hits(&mut hits_by_volume, options.limit);
