@@ -240,13 +240,20 @@
   exit is valid only when neither the base nor a live delta name can supply the
   empty term. Treat these as diagnostic local measurements, not a regression
   benchmark.
-- **A one-byte, high-selectivity PathTerms query remains pathological.** Ten
-  real two-volume `scry --verbose a` samples measured 1.19–1.25 s warm, so plan
-  018's `<250 ms` acceptance gate is not met even though streaming substring
-  benchmarks improved 1.57–3.71×. Plain CLI queries intentionally use
-  PathTerms; changing a single term to Substring would change ancestor-match
-  semantics. Treat this as a separate parallel-interval/product decision, not
-  unfinished streaming-top-k cleanup.
+- **Single short PathTerms use a bounded bitmap/DFS path.** Profiling a common
+  one-byte term showed final DFS-order name decoding consumed ~91% of wall time,
+  so merely sharding interval construction was rejected. A single one- or
+  two-byte term instead records own-name matches in a one-bit-per-record bitmap,
+  walks DFS once to emit inherited runs already in order, then ranks dense runs
+  with bucket-sequential workers. Worker bitmaps and top-k heaps are allocated
+  by the caller before launch and each scoped worker has a 64 KiB stack; this
+  avoids persistent per-worker allocator arenas. Multi-term and filtered sparse
+  queries retain the independent interval-set path and never intersect trigram
+  blocks. On the live three-snapshot corpus, 50 warmed process-per-query samples
+  of a generic one-byte term measured 125.33 ms p50 / 246.19 ms p99, down from
+  1.19–1.25 s. Retained `PrivateUsage` growth was ~18.87 MB versus ~16.02 MB for
+  one thread, a ~2.85 MB parallel increment; daemon CPU averaged ~595 ms/query,
+  effectively unchanged from the one-thread control.
 - **The refinement cache is keyed on the ordering as well as the terms.** A cached candidate
   set is only a superset of a refined query's matches under the *same* ordering; the scan
   keeps the best `REFINEMENT_CACHE_CAP` by that ordering and a different one would have kept
