@@ -1,7 +1,8 @@
 param(
     [switch]$NoStart,
     [switch]$Unbounded,
-    [string]$IndexMbps = ""
+    [string]$IndexMbps = "",
+    [switch]$PauseOnExit
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +36,28 @@ function Clear-SetupDisplay {
     }
 }
 
+function Wait-BeforeExit {
+    if (-not $PauseOnExit -or [Console]::IsInputRedirected) {
+        return
+    }
+
+    Write-Host ""
+    $null = Read-Host "Press Enter to close this window"
+}
+
+function Get-InstalledDaemonProcess {
+    Get-Process -Name "scryd" -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            if ($_.Path -and $_.Path -ieq $daemonPath) {
+                $_
+            }
+        }
+        catch {
+            # The process may exit between enumeration and reading its path.
+        }
+    }
+}
+
 function Stop-Setup {
     param(
         [Parameter(Mandatory = $true)][string]$Problem,
@@ -47,6 +70,7 @@ function Stop-Setup {
     Write-Host ""
     Write-Host "What to do next:" -ForegroundColor Yellow
     Write-Host "  $NextStep"
+    Wait-BeforeExit
     exit 1
 }
 
@@ -58,6 +82,7 @@ trap {
     Write-Host ""
     Write-Host "Setup may be partially complete. It is safe to run this installer again" -ForegroundColor Yellow
     Write-Host "after correcting the problem. Existing index data is not removed."
+    Wait-BeforeExit
     exit 1
 }
 
@@ -94,7 +119,9 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $currentStep = "Requesting administrator permission"
     Write-Step "Requesting administrator permission for raw NTFS indexing"
-    $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+    $arguments = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-PauseOnExit"
+    )
     if ($NoStart) { $arguments += "-NoStart" }
     if ($Unbounded) { $arguments += "-Unbounded" }
     if ($IndexMbps) { $arguments += @("-IndexMbps", $IndexMbps) }
@@ -114,6 +141,26 @@ $currentStep = "Stopping the previous daemon task"
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Write-Step "Stopping the existing startup task"
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+
+# Task Scheduler stops asynchronously. Wait for the installed daemon to release
+# its executable before replacing it; if it remains alive, terminate only the
+# process running from Scry's install directory, never a development build.
+$runningDaemon = @(Get-InstalledDaemonProcess)
+if ($runningDaemon.Count -gt 0) {
+    Write-Step "Waiting for the existing daemon to close"
+    for ($attempt = 0; $attempt -lt 25 -and $runningDaemon.Count -gt 0; $attempt++) {
+        Start-Sleep -Milliseconds 200
+        $runningDaemon = @(Get-InstalledDaemonProcess)
+    }
+}
+if ($runningDaemon.Count -gt 0) {
+    Write-Step "Closing the existing installed daemon"
+    $runningDaemon | Stop-Process -Force
+    $runningDaemon | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+}
+if (@(Get-InstalledDaemonProcess).Count -gt 0) {
+    throw "The installed Scry daemon did not close. End '$daemonPath' in Task Manager, then run setup again."
 }
 
 $currentStep = "Copying Scry Search files"
@@ -166,5 +213,4 @@ if (-not $NoStart) {
 } else {
     Write-Host "  Daemon:      Not started (-NoStart was supplied)"
 }
-Write-Host ""
-Write-Host "Open a new terminal and run 'scry report' to check indexing progress."
+Wait-BeforeExit

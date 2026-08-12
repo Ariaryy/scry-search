@@ -148,7 +148,7 @@ when finishing as quickly as possible matters more than competing I/O.
 ## Search
 
 ```powershell
-scry report
+scry notes
 scry 'projects "annual report" type:file ext:pdf,docx'
 scry 'type:dir modified:<7d'
 scry '*.toml'
