@@ -60,7 +60,14 @@ if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $binPath.TrimEnd('\
     [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
 }
 
-$action = New-ScheduledTaskAction -Execute $daemonPath -Argument $daemonArguments
+# `New-ScheduledTaskAction` rejects an explicitly empty `-Argument`. Omit the
+# parameter for the default configuration so installation reaches task
+# registration instead of stopping after the binaries and PATH are updated.
+$action = if ($daemonArguments) {
+    New-ScheduledTaskAction -Execute $daemonPath -Argument $daemonArguments
+} else {
+    New-ScheduledTaskAction -Execute $daemonPath
+}
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
