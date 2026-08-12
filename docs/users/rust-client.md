@@ -8,7 +8,7 @@ scry-client = { git = "https://github.com/Ariaryy/scry-search" }
 ```
 
 For reproducible builds, pin a release tag matching the installed daemon, for
-example `tag = "v0.1.0-alpha.2"`. Without a tag, `Cargo.lock` pins the resolved
+example `tag = "v0.1.0-alpha.3"`. Without a tag, `Cargo.lock` pins the resolved
 commit until dependencies are updated.
 
 Add `scry-client` to the application and connect to the daemon:
