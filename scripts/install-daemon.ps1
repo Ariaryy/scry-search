@@ -58,6 +58,21 @@ function Get-InstalledDaemonProcess {
     }
 }
 
+function Get-ScryVersion {
+    param([Parameter(Mandatory = $true)][string]$ExecutablePath)
+
+    try {
+        $output = & $ExecutablePath --version 2>$null | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0 -and $output -match '^scryd\s+(.+)$') {
+            return $Matches[1].Trim()
+        }
+    }
+    catch {
+        # Older or damaged installations may not be able to report a version.
+    }
+    return "unknown"
+}
+
 function Stop-Setup {
     param(
         [Parameter(Mandatory = $true)][string]$Problem,
@@ -112,6 +127,23 @@ if ($IndexMbps -and $IndexMbps -notmatch '^\d+$') {
     Stop-Setup `
         -Problem "The -IndexMbps value '$IndexMbps' is not a non-negative whole number." `
         -NextStep "Use a value such as -IndexMbps 64, or omit the option to use the default 128 MiB/s limit."
+}
+
+$newVersion = Get-ScryVersion -ExecutablePath $sourceDaemonPath
+$installedVersion = if (Test-Path -LiteralPath $daemonPath) {
+    Get-ScryVersion -ExecutablePath $daemonPath
+} else {
+    $null
+}
+
+if ($installedVersion) {
+    if ($installedVersion -eq $newVersion) {
+        Write-Step "Reinstalling Scry Search $newVersion"
+    } else {
+        Write-Step "Updating Scry Search: $installedVersion -> $newVersion"
+    }
+} else {
+    Write-Step "Installing Scry Search $newVersion"
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -204,6 +236,11 @@ if (-not $NoStart) {
 
 Write-Host ""
 Write-Host "Scry Search is ready." -ForegroundColor Green
+if ($installedVersion -and $installedVersion -ne $newVersion) {
+    Write-Host "  Version:     $installedVersion -> $newVersion"
+} else {
+    Write-Host "  Version:     $newVersion"
+}
 Write-Host "  Programs:    $binPath"
 Write-Host "  Uninstaller: $(Join-Path $installRoot 'uninstall.ps1')"
 Write-Host "  Index data:  $(Join-Path $env:LOCALAPPDATA 'scry')"
