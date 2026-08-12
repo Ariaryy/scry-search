@@ -8,6 +8,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Changes limited to `scripts/*.ps1` use the focused Installer workflow instead
+of rebuilding the Rust workspace. It checks PowerShell syntax, actionable
+failure output, and scheduled-task action construction on Windows.
+
 Keep changes focused and explain correctness or performance tradeoffs. New
 benchmarks must use generic generated vocabulary, state the corpus and machine
 conditions, and avoid presenting local measurements as universal results.

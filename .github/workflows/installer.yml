@@ -1,0 +1,62 @@
+name: Installer
+
+on:
+  pull_request:
+    paths:
+      - "scripts/*.ps1"
+      - ".github/workflows/installer.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: installer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate PowerShell syntax and installer behavior
+        shell: pwsh
+        run: |
+          foreach ($script in Get-ChildItem scripts/*.ps1) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $script.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count) {
+              $errors | Format-List
+              throw "$($script.Name) has PowerShell syntax errors"
+            }
+          }
+
+          $missingOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File scripts/install-daemon.ps1 2>&1
+          if ($LASTEXITCODE -ne 1) {
+            throw "Incomplete-package validation should exit with code 1"
+          }
+          $missingText = $missingOutput | Out-String
+          if ($missingText -match "CategoryInfo|FullyQualifiedErrorId") {
+            throw "Installer exposed a raw PowerShell error"
+          }
+          if ($missingText -notmatch "What to do next") {
+            throw "Installer did not provide recovery guidance"
+          }
+
+          $daemonPath = Join-Path $env:RUNNER_TEMP "scryd.exe"
+          foreach ($arguments in @("", "--unbounded", "--index-mbps 64")) {
+            $action = if ($arguments) {
+              New-ScheduledTaskAction -Execute $daemonPath -Argument $arguments
+            } else {
+              New-ScheduledTaskAction -Execute $daemonPath
+            }
+            if (-not $action) {
+              throw "Unable to construct scheduled-task action for '$arguments'"
+            }
+          }
