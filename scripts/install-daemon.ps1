@@ -11,23 +11,89 @@ $sourceCliPath = Join-Path $PSScriptRoot "scry.exe"
 $installRoot = Join-Path $env:LOCALAPPDATA "Programs\Scry Search"
 $binPath = Join-Path $installRoot "bin"
 $daemonPath = Join-Path $binPath "scryd.exe"
+$currentStep = "Checking the installation package"
+
+function Write-Step {
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    Write-Host "  -> $Message" -ForegroundColor Cyan
+}
+
+function Clear-SetupDisplay {
+    # `Clear-Host` can leave parts of the old viewport behind in some Windows
+    # terminal hosts. Clearing the console buffer produces a clean setup screen.
+    # Skip it when output is redirected so CI logs remain plain text.
+    if ([Console]::IsOutputRedirected) {
+        return
+    }
+
+    try {
+        [Console]::Clear()
+    }
+    catch {
+        Clear-Host
+    }
+}
+
+function Stop-Setup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Problem,
+        [Parameter(Mandatory = $true)][string]$NextStep
+    )
+
+    Write-Host ""
+    Write-Host "Scry Search setup could not continue." -ForegroundColor Red
+    Write-Host $Problem
+    Write-Host ""
+    Write-Host "What to do next:" -ForegroundColor Yellow
+    Write-Host "  $NextStep"
+    exit 1
+}
+
+trap {
+    Write-Host ""
+    Write-Host "Scry Search setup failed." -ForegroundColor Red
+    Write-Host "  Step: $currentStep"
+    Write-Host "  Reason: $($_.Exception.Message)"
+    Write-Host ""
+    Write-Host "Setup may be partially complete. It is safe to run this installer again" -ForegroundColor Yellow
+    Write-Host "after correcting the problem. Existing index data is not removed."
+    exit 1
+}
+
+Clear-SetupDisplay
+Write-Host "Scry Search setup" -ForegroundColor Cyan
+Write-Host "=================" -ForegroundColor DarkGray
+Write-Host "Installs the Scry daemon and CLI for the current Windows user."
+Write-Host ""
+Write-Step "Checking the release package"
 
 if (-not (Test-Path -LiteralPath $sourceDaemonPath)) {
-    throw "scryd.exe must be beside this installer script"
+    Stop-Setup `
+        -Problem "The release package is incomplete: scryd.exe was not found at '$sourceDaemonPath'." `
+        -NextStep "Download and fully extract the Scry Search release ZIP, then run install-daemon.ps1 from that extracted folder. The source-repository script does not contain prebuilt executables."
 }
 if (-not (Test-Path -LiteralPath $sourceCliPath)) {
-    throw "scry.exe must be beside this installer script"
+    Stop-Setup `
+        -Problem "The release package is incomplete: scry.exe was not found at '$sourceCliPath'." `
+        -NextStep "Download and fully extract the Scry Search release ZIP, then run install-daemon.ps1 from that extracted folder. Keep scry.exe, scryd.exe, and both setup scripts together."
 }
 if ($Unbounded -and $IndexMbps) {
-    throw "Use either -Unbounded or -IndexMbps, not both"
+    Stop-Setup `
+        -Problem "The options -Unbounded and -IndexMbps cannot be used together." `
+        -NextStep "Run the installer with either -Unbounded or -IndexMbps <number>, or omit both to use the default 128 MiB/s indexing limit."
 }
 if ($IndexMbps -and $IndexMbps -notmatch '^\d+$') {
-    throw "-IndexMbps expects a non-negative integer"
+    Stop-Setup `
+        -Problem "The -IndexMbps value '$IndexMbps' is not a non-negative whole number." `
+        -NextStep "Use a value such as -IndexMbps 64, or omit the option to use the default 128 MiB/s limit."
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $currentStep = "Requesting administrator permission"
+    Write-Step "Requesting administrator permission for raw NTFS indexing"
     $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
     if ($NoStart) { $arguments += "-NoStart" }
     if ($Unbounded) { $arguments += "-Unbounded" }
@@ -44,10 +110,14 @@ $daemonArguments = if ($Unbounded) {
     ""
 }
 
+$currentStep = "Stopping the previous daemon task"
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Write-Step "Stopping the existing startup task"
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 }
 
+$currentStep = "Copying Scry Search files"
+Write-Step "Installing the daemon and CLI to '$binPath'"
 New-Item -ItemType Directory -Path $binPath -Force | Out-Null
 Copy-Item -LiteralPath $sourceDaemonPath -Destination $daemonPath -Force
 Copy-Item -LiteralPath $sourceCliPath -Destination (Join-Path $binPath "scry.exe") -Force
@@ -56,8 +126,12 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall-daemon.ps1") -Destina
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathEntries = @($userPath -split ';' | Where-Object { $_ })
 if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $binPath.TrimEnd('\') })) {
+    $currentStep = "Updating the user PATH"
+    Write-Step "Adding the Scry CLI directory to the user PATH"
     $newUserPath = (($pathEntries + $binPath) -join ';')
     [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+} else {
+    Write-Step "The Scry CLI directory is already on the user PATH"
 }
 
 # `New-ScheduledTaskAction` rejects an explicitly empty `-Argument`. Omit the
@@ -71,18 +145,26 @@ $action = if ($daemonArguments) {
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+$currentStep = "Registering the startup task"
+Write-Step "Registering the elevated per-user startup task"
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 
 if (-not $NoStart) {
+    $currentStep = "Starting the Scry daemon"
+    Write-Step "Starting the daemon"
     Start-ScheduledTask -TaskName $taskName
 }
 
-Write-Host "Copied scryd.exe and scry.exe to $binPath."
-Write-Host "Copied the uninstaller to $(Join-Path $installRoot 'uninstall.ps1')."
-Write-Host "Added $binPath to the user PATH; 'scry' is available in new terminals."
-Write-Host "Indexes are stored separately under $(Join-Path $env:LOCALAPPDATA 'scry')."
+Write-Host ""
+Write-Host "Scry Search is ready." -ForegroundColor Green
+Write-Host "  Programs:    $binPath"
+Write-Host "  Uninstaller: $(Join-Path $installRoot 'uninstall.ps1')"
+Write-Host "  Index data:  $(Join-Path $env:LOCALAPPDATA 'scry')"
+Write-Host "  Startup:     Per-user scheduled task '$taskName'"
 if (-not $NoStart) {
-    Write-Host "The elevated daemon has been started in the background."
+    Write-Host "  Daemon:      Started in the background"
 } else {
-    Write-Host "The daemon was not started because -NoStart was supplied."
+    Write-Host "  Daemon:      Not started (-NoStart was supplied)"
 }
+Write-Host ""
+Write-Host "Open a new terminal and run 'scry report' to check indexing progress."
