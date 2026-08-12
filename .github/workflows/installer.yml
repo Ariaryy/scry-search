@@ -36,9 +36,16 @@ jobs:
             }
           }
 
-          $missingOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File scripts/install-daemon.ps1 2>&1
-          if ($LASTEXITCODE -ne 1) {
+          $nativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            $missingOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File scripts/install-daemon.ps1 2>&1
+            $missingExitCode = $LASTEXITCODE
+          } finally {
+            $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
+          }
+          if ($missingExitCode -ne 1) {
             throw "Incomplete-package validation should exit with code 1"
           }
           $missingText = $missingOutput | Out-String
