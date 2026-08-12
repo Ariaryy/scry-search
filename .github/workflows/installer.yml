@@ -42,6 +42,7 @@ jobs:
             $missingOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
               -File scripts/install-daemon.ps1 2>&1
             $missingExitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
           } finally {
             $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
           }
