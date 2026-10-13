@@ -48,10 +48,9 @@ impl<'a> RankSelect<'a> {
         // Whole `u64`s first: at a 256-bit sampling rate the span between a
         // sample and the query position is up to 32 bytes, which is four
         // popcounts this way versus thirty-two byte-wise.
-        let (words, tail) = bytes.split_at(bytes.len() & !7);
-        for word in words.chunks_exact(8) {
-            count += u64::from_le_bytes(word.try_into().expect("chunks_exact(8) yields 8 bytes"))
-                .count_ones() as usize;
+        let (words, tail) = bytes.as_chunks::<8>();
+        for word in words {
+            count += u64::from_le_bytes(*word).count_ones() as usize;
         }
         count += tail
             .iter()
