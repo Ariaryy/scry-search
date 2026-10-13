@@ -1468,6 +1468,157 @@ mod tests {
         }
     }
 
+    /// Enough matching positions to take the bucket-ordered bitmap
+    /// enumeration (above `SPARSE_PATH_HITS`) on one thread, checked against
+    /// a full-path brute force across orders, filters, limits, and threads.
+    #[test]
+    fn dense_path_term_enumeration_matches_bruteforce() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("C:", 0, true);
+        let mut file = 0u64;
+        for group in 0..24u32 {
+            let group_name = if group % 3 == 0 {
+                format!("zonegroup_{group:02}")
+            } else {
+                format!("plaingroup_{group:02}")
+            };
+            let group_dir =
+                builder.push_bytes_with_metadata(group_name.as_bytes(), group, true, None, 0);
+            builder.set_parent(group_dir, root);
+            for sub in 0..4u32 {
+                let sub_name = format!("bucket_{group:02}_{sub}");
+                let sub_dir = builder.push_bytes_with_metadata(
+                    sub_name.as_bytes(),
+                    group * 10 + sub,
+                    true,
+                    None,
+                    0,
+                );
+                builder.set_parent(sub_dir, group_dir);
+                for leaf in 0..40u32 {
+                    file += 1;
+                    let extension = if leaf % 2 == 0 { "txt" } else { "bin" };
+                    let leaf_name = if leaf % 5 == 0 {
+                        format!("zone_leaf_{group:02}_{sub}_{leaf:02}.{extension}")
+                    } else {
+                        format!("leaf_{group:02}_{sub}_{leaf:02}.{extension}")
+                    };
+                    let record = builder.push_bytes_with_metadata(
+                        leaf_name.as_bytes(),
+                        (file * 7_919 % 100_000) as u32,
+                        false,
+                        None,
+                        file * 1_543 % 9_000_000,
+                    );
+                    builder.set_parent(record, sub_dir);
+                }
+            }
+        }
+        let (arena, _) = builder.build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dense-path-terms.rkyv");
+        crate::store::save(&arena, &path).unwrap();
+        let base = Arc::new(ArenaStore::open(&path).unwrap());
+        let mut view = IndexView::new(base);
+        let base_len = view.base.archived().len() as u32;
+        let mut delta = Delta::new(base_len as usize);
+        // Deleted files only: a tombstoned directory intentionally stops
+        // passing its name to descendants, which a full-path oracle can't see.
+        for record in (0..base_len).step_by(7) {
+            if !view.base.archived().is_dir(record) {
+                delta.tombstones.set(record);
+            }
+        }
+        view.delta = Arc::new(delta);
+        let arena = view.base.archived();
+
+        let filters = [
+            QueryFilter::default(),
+            QueryFilter {
+                kind: Some(EntryKind::File),
+                ..QueryFilter::default()
+            },
+            QueryFilter {
+                extensions: vec!["TXT".to_owned()],
+                ..QueryFilter::default()
+            },
+            QueryFilter {
+                min_size: Some(2_000_000),
+                max_mtime: Some(60_000),
+                ..QueryFilter::default()
+            },
+        ];
+        for terms in [
+            vec!["zone".to_owned()],
+            vec!["ZONE".to_owned(), "bucket".to_owned()],
+        ] {
+            let terms_lower: Vec<_> = terms
+                .iter()
+                .map(|term| term.as_bytes().to_ascii_lowercase())
+                .collect();
+            for filter in &filters {
+                for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                    let mut expected = Vec::new();
+                    let mut name = Vec::new();
+                    for record in 0..base_len {
+                        if view.delta.tombstones.get(record) {
+                            continue;
+                        }
+                        let path_lower = view.path_of(record).to_ascii_lowercase();
+                        if !terms_lower
+                            .iter()
+                            .all(|term| path_lower.contains(std::str::from_utf8(term).unwrap()))
+                        {
+                            continue;
+                        }
+                        view.name_into(record, &mut name);
+                        if !record_matches_filter(arena, &view.delta, record, &name, filter) {
+                            continue;
+                        }
+                        let own = terms_lower
+                            .iter()
+                            .filter(|term| crate::ascii::contains_ci(&name, term))
+                            .count();
+                        expected.push(sort_key(
+                            order,
+                            arena,
+                            &view.delta,
+                            record,
+                            (terms.len() - own) as u8,
+                            name.len() as u32,
+                        ));
+                    }
+                    if filter.is_empty() {
+                        assert!(expected.len() as u64 > SPARSE_PATH_HITS);
+                    }
+                    expected.sort_unstable();
+                    let expected: Vec<_> = expected.into_iter().map(rank::key_record).collect();
+                    for limit in [1usize, 50, usize::MAX] {
+                        let expected = &expected[..expected.len().min(limit)];
+                        for threads in [1usize, 4] {
+                            let actual: Vec<_> = search_path_terms_filtered_cancellable(
+                                arena,
+                                &view.delta,
+                                &terms,
+                                filter,
+                                SearchOptions::ordered(limit, order),
+                                None,
+                                threads,
+                            )
+                            .into_iter()
+                            .map(|hit| hit.record)
+                            .collect();
+                            assert_eq!(
+                                actual, expected,
+                                "terms={terms:?}, filter={filter:?}, order={order:?},                                  limit={limit}, threads={threads}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn search_allocates_no_path_for_a_non_result() {
         let (_dir, view) = base_view(20_000);
@@ -2419,6 +2570,10 @@ pub fn materialize_hits(
         .collect()
 }
 
+/// Below this many final DFS positions, random per-hit name decoding is
+/// cheaper than allocating and sweeping a whole-index record bitmap.
+const SPARSE_PATH_HITS: u64 = 1024;
+
 #[derive(Default)]
 struct PathSearchScratch {
     /// One coalesced [`crate::intervals::IntervalSet`] of DFS positions per
@@ -3324,6 +3479,57 @@ fn search_path_terms_with_scratch(
             return Vec::new();
         };
         *heap = parallel_heap;
+    } else if needs_name && final_set.len_positions() > SPARSE_PATH_HITS {
+        // Mark surviving records in an n/8-byte bitmap, then decode each
+        // touched front-coded bucket once in name order, instead of
+        // re-decoding a bucket from its head for every DFS-ordered hit.
+        // Local rather than scratch: `vec![0; n]` takes pre-zeroed pages and
+        // is freed on return, so a dense query never leaves index-sized
+        // private memory behind on a long-lived connection thread.
+        let mut checked: u32 = 0;
+        let mut own_matches = vec![0u8; arena.len().div_ceil(8)];
+        for &(start, end) in final_set.runs() {
+            for position in start..end {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    return Vec::new();
+                }
+                let record = arena.dfs_record(position);
+                own_matches[record as usize / 8] |= 1 << (record % 8);
+            }
+        }
+        const BUCKET_BYTES: usize = crate::record::BUCKET_SIZE / 8;
+        for (bucket, bits) in own_matches.chunks(BUCKET_BYTES).enumerate() {
+            if bits.iter().all(|&byte| byte == 0) {
+                continue;
+            }
+            if is_cancelled_periodically(cancel, &mut checked) {
+                return Vec::new();
+            }
+            let start = (bucket * crate::record::BUCKET_SIZE) as u32;
+            let end = start + crate::record::BUCKET_SIZE as u32;
+            arena.for_each_name_in_buf(start..end, name, |record, record_name| {
+                let offset = (record - start) as usize;
+                if bits[offset / 8] & (1 << (offset % 8)) != 0
+                    && !delta.tombstones.get(record)
+                    && record_matches_filter(arena, delta, record, record_name, filter)
+                {
+                    let mask = mask_for(record_name);
+                    rank::retain_hit(
+                        heap,
+                        sort_key(
+                            order,
+                            arena,
+                            delta,
+                            record,
+                            (terms.len() as u32 - mask.count_ones()) as u8,
+                            record_name.len() as u32,
+                        ),
+                        limit,
+                    );
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+        }
     } else {
         let mut checked: u32 = 0;
         for &(start, end) in final_set.runs() {
