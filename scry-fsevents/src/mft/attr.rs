@@ -91,8 +91,10 @@ pub fn parse_file_name(attribute: &AttributeRef<'_>) -> Result<FileNameInfo, Mft
         .get(0x42..end)
         .ok_or(MftError::Invalid("truncated FILE_NAME value"))?;
     let utf16: Vec<u16> = name_bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .collect();
     Ok(FileNameInfo {
         parent_frn,
@@ -163,8 +165,8 @@ mod tests {
         value[0..8].copy_from_slice(&0x0007_0000_0000_1234u64.to_le_bytes());
         value[0x40] = name.len() as u8;
         value[0x41] = 1;
-        for (slot, unit) in value[0x42..].chunks_exact_mut(2).zip(name) {
-            slot.copy_from_slice(&unit.to_le_bytes());
+        for (slot, unit) in value[0x42..].as_chunks_mut::<2>().0.iter_mut().zip(name) {
+            *slot = unit.to_le_bytes();
         }
         let attribute = resident(FILE_NAME, &value);
         let parsed = parse_file_name(&reference(&attribute)).unwrap();

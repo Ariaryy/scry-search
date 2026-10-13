@@ -575,8 +575,10 @@ fn for_each_usn_record(
 fn decode_name_into(name_bytes: &[u8], out: &mut String) {
     out.clear();
     let utf16: Vec<u16> = name_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_ne_bytes(c))
         .collect();
     out.push_str(&String::from_utf16_lossy(&utf16));
 }

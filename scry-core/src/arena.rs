@@ -386,18 +386,12 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 /// same in-memory representation, and the result is never persisted or sent
 /// across a byte-order boundary — it only ever feeds the bit-scan below.
 fn and_into(dst: &mut [u8], src: &[u8]) {
-    let mut dst_chunks = dst.chunks_exact_mut(8);
-    let mut src_chunks = src.chunks_exact(8);
-    for (d, s) in (&mut dst_chunks).zip(&mut src_chunks) {
-        let word = u64::from_ne_bytes(d[..8].try_into().unwrap())
-            & u64::from_ne_bytes(s[..8].try_into().unwrap());
-        d.copy_from_slice(&word.to_ne_bytes());
+    let (dst_words, dst_tail) = dst.as_chunks_mut::<8>();
+    let (src_words, src_tail) = src.as_chunks::<8>();
+    for (d, s) in dst_words.iter_mut().zip(src_words) {
+        *d = (u64::from_ne_bytes(*d) & u64::from_ne_bytes(*s)).to_ne_bytes();
     }
-    for (d, &s) in dst_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(src_chunks.remainder())
-    {
+    for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
         *d &= s;
     }
 }
@@ -405,18 +399,12 @@ fn and_into(dst: &mut [u8], src: &[u8]) {
 /// Bitwise-OR `src` into `dst` (same length). See [`and_into`] for the
 /// native-endian rationale, which applies identically here.
 fn or_into(dst: &mut [u8], src: &[u8]) {
-    let mut dst_chunks = dst.chunks_exact_mut(8);
-    let mut src_chunks = src.chunks_exact(8);
-    for (d, s) in (&mut dst_chunks).zip(&mut src_chunks) {
-        let word = u64::from_ne_bytes(d[..8].try_into().unwrap())
-            | u64::from_ne_bytes(s[..8].try_into().unwrap());
-        d.copy_from_slice(&word.to_ne_bytes());
+    let (dst_words, dst_tail) = dst.as_chunks_mut::<8>();
+    let (src_words, src_tail) = src.as_chunks::<8>();
+    for (d, s) in dst_words.iter_mut().zip(src_words) {
+        *d = (u64::from_ne_bytes(*d) | u64::from_ne_bytes(*s)).to_ne_bytes();
     }
-    for (d, &s) in dst_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(src_chunks.remainder())
-    {
+    for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
         *d |= s;
     }
 }
