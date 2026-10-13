@@ -1407,7 +1407,7 @@ fn search_indexes_with_cache_with_spans(
                             view.name_into(hit.record, &mut name);
                         }
                         let key = scry_core::rank::relevance_key(
-                            hit_quality(query, &name),
+                            hit_quality(query, &terms_lower, &name),
                             name.len() as u32,
                             hit.record,
                         );
@@ -1676,7 +1676,9 @@ fn rank_sort_truncate_hits(hits: &mut Vec<(usize, Hit)>, limit: usize) {
     hits.truncate(limit);
 }
 
-fn hit_quality(query: &Query, name: &[u8]) -> u8 {
+/// `terms_lower` is the request's once-normalized term list: typed terms keep
+/// their case, and `contains_ci` folds only the haystack.
+fn hit_quality(query: &Query, terms_lower: &[Vec<u8>], name: &[u8]) -> u8 {
     match query {
         Query::Prefix(pattern) | Query::Substring(pattern) => {
             if name.eq_ignore_ascii_case(pattern.as_bytes()) {
@@ -1689,11 +1691,10 @@ fn hit_quality(query: &Query, name: &[u8]) -> u8 {
                 2
             }
         }
-        Query::PathTerms(terms) | Query::FilteredPathTerms { terms, .. } => terms
+        Query::PathTerms(_) | Query::FilteredPathTerms { .. } => terms_lower
             .iter()
-            .filter(|term| !scry_core::ascii::contains_ci(name, term.as_bytes()))
-            .count()
-            as u8,
+            .filter(|term| !scry_core::ascii::contains_ci(name, term))
+            .count() as u8,
         Query::Regex(_) => 2,
     }
 }
@@ -2082,6 +2083,41 @@ mod tests {
                     &mut uncached,
                 );
                 assert_eq!(cached, fresh, "diverged at pattern {pattern:?}");
+            }
+        }
+    }
+
+    /// Relevance ranks own-name term matches ahead of ancestor-only ones.
+    /// Typed terms keep their case, so the refined re-rank must fold them the
+    /// same way the fresh scan does, or an uppercase keystroke sequence
+    /// reorders results relative to a rescan.
+    #[test]
+    fn refined_path_terms_rank_like_a_full_rescan_for_uppercase_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = build_refinement_store(&dir);
+        let indexes = single_volume(view);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        for word in ["PROJECT", "Photo", "DOCUMENTS"] {
+            let mut cache = RefinementCache::default();
+            for step in 1..=word.len() {
+                let terms = vec![word[..step].to_string()];
+                let cached = search_indexes_with_cache(
+                    &indexes,
+                    QueryKind::PathTerms,
+                    &Query::PathTerms(terms.clone()),
+                    SearchOptions::new(50),
+                    scry_core::Cancellation::new(&generation, 0),
+                    &mut cache,
+                );
+                let fresh = search_indexes_with_cache(
+                    &indexes,
+                    QueryKind::PathTerms,
+                    &Query::PathTerms(terms.clone()),
+                    SearchOptions::new(50),
+                    scry_core::Cancellation::new(&generation, 0),
+                    &mut RefinementCache::default(),
+                );
+                assert_eq!(cached, fresh, "diverged at terms {terms:?}");
             }
         }
     }
