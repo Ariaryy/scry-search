@@ -633,6 +633,17 @@ impl ArchivedArena {
     pub fn for_each_name_in(
         &self,
         range: std::ops::Range<u32>,
+        f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+    ) {
+        self.for_each_name_in_buf(range, &mut Vec::new(), f);
+    }
+
+    /// As [`Self::for_each_name_in`], decoding into a caller-owned buffer so
+    /// repeated small-range walks do not allocate.
+    pub fn for_each_name_in_buf(
+        &self,
+        range: std::ops::Range<u32>,
+        name: &mut Vec<u8>,
         mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
     ) {
         let end = range.end.min(self.parents.len() as u32);
@@ -641,7 +652,6 @@ impl ArchivedArena {
         }
         let first_bucket = range.start as usize / BUCKET_SIZE;
         let last_bucket = (end as usize - 1) / BUCKET_SIZE;
-        let mut name = Vec::new();
         'outer: for bucket in first_bucket..=last_bucket {
             let bucket_start = bucket * BUCKET_SIZE;
             let bucket_end = (bucket_start + BUCKET_SIZE).min(self.parents.len());
@@ -663,7 +673,7 @@ impl ArchivedArena {
                 }
                 if idx >= range.start as usize
                     && idx < end as usize
-                    && f(idx as u32, &name).is_break()
+                    && f(idx as u32, name).is_break()
                 {
                     break 'outer;
                 }
