@@ -57,6 +57,10 @@ Larger sparse sets stage at most 4,096 record IDs (16 KiB), sort each batch,
 and decode only its touched front-coded buckets. Dense sets use a temporary
 record bitmap; the choice compares four bytes per survivor with one bit per
 base record. This staging is query-local and does not change the archive.
+Dense parallel ranking builds one such bitmap and shares it read-only across
+workers, avoiding a binary search over DFS intervals for each decoded record.
+The bitmap uses `ceil(base_records / 8)` bytes in total, independent of worker
+count, and is released on completion or cancellation.
 
 Each term's interval set coalesces queued spans in the same allocation as its
 settled runs. Reusable path-search scratch has an aggregate 1 MiB capacity
