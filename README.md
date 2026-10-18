@@ -6,8 +6,6 @@
 
 ### A tiny, realtime file index for Windows
 
-Fast path search · live NTFS updates · embeddable Rust client · local-only IPC
-
 <p>
   <a href="https://github.com/Ariaryy/scry-search/releases"><img src="https://img.shields.io/github/v/release/Ariaryy/scry-search?include_prereleases&amp;label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4" alt="Windows 10 and 11">
