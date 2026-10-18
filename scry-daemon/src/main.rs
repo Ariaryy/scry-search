@@ -139,6 +139,12 @@ impl QueryMetrics {
             self.memory.peak_working_set,
             self.memory.page_faults,
         ));
+        out.push_str(&format!(
+            "\nquery_threads={} refinement_cache={} benchmark_frozen={}",
+            query_thread_count(),
+            refinement_cache_enabled(),
+            BENCHMARK_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         out
     }
 }
@@ -252,14 +258,20 @@ fn is_shutdown_signal(ctrl_type: ffi::Dword) -> bool {
     )
 }
 
+static BENCHMARK_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct StartupOptions {
     volumes: Vec<String>,
     index_mbps: Option<u64>,
+    benchmark_snapshot: Option<std::path::PathBuf>,
+    benchmark_pipe: Option<String>,
 }
 
 fn startup_options() -> anyhow::Result<StartupOptions> {
     let mut volumes = Vec::new();
     let mut index_mbps = None;
+    let mut benchmark_snapshot = None;
+    let mut benchmark_pipe = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -275,6 +287,19 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
                 std::process::exit(0);
             }
             "--unbounded" => index_mbps = Some(0),
+            "--benchmark-snapshot" => {
+                benchmark_snapshot = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--benchmark-snapshot needs a file"))?
+                        .into(),
+                );
+            }
+            "--benchmark-pipe" => {
+                benchmark_pipe = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--benchmark-pipe needs a pipe name"))?,
+                );
+            }
             "--index-mbps" => {
                 let value = args
                     .next()
@@ -295,9 +320,25 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
             _ => volumes.push(arg),
         }
     }
+    anyhow::ensure!(
+        benchmark_snapshot.is_some() == benchmark_pipe.is_some(),
+        "benchmark snapshot and pipe must be supplied together"
+    );
+    anyhow::ensure!(
+        benchmark_snapshot.is_none() || (volumes.is_empty() && index_mbps.is_none()),
+        "frozen benchmark mode cannot ingest volumes"
+    );
+    if let Some(pipe) = &benchmark_pipe {
+        anyhow::ensure!(
+            pipe.starts_with(r"\\.\pipe\scry-bench-") && pipe.len() <= 200,
+            "benchmark mode requires a distinct local scry-bench- pipe"
+        );
+    }
     Ok(StartupOptions {
         volumes,
         index_mbps,
+        benchmark_snapshot,
+        benchmark_pipe,
     })
 }
 
@@ -315,6 +356,21 @@ fn main() -> anyhow::Result<()> {
 
     configure_background_qos();
     configure_index_read_cap(options.index_mbps);
+
+    // Read-only experiment: use the production RPC/refinement/section paths,
+    // but never replay, watch, compact, persist, or open a raw volume. This
+    // needs no elevation and cannot take the installed daemon's pipe name.
+    if let Some(path) = options.benchmark_snapshot {
+        BENCHMARK_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        let base = Arc::new(ArenaStore::open(&path)?);
+        let indexes = Arc::new(vec![VolumeIndex {
+            volume: "benchmark".into(),
+            store: Arc::new(arc_swap::ArcSwap::from_pointee(IndexView::new(base))),
+            cursor: None,
+        }]);
+        return serve_indexes(indexes, options.benchmark_pipe.as_deref().unwrap())
+            .map_err(Into::into);
+    }
 
     let requested_volumes = options.volumes;
     let volume_names = if requested_volumes.is_empty() {
@@ -417,8 +473,12 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    eprintln!("scryd: listening on {}", scry_ipc::PIPE_NAME);
-    let server = scry_ipc::PipeServer::new(scry_ipc::PIPE_NAME)?;
+    serve_indexes(indexes, scry_ipc::PIPE_NAME).map_err(Into::into)
+}
+
+fn serve_indexes(indexes: VolumeIndexes, pipe_name: &str) -> std::io::Result<()> {
+    eprintln!("scryd: listening on {pipe_name}");
+    let server = scry_ipc::PipeServer::new(pipe_name)?;
     loop {
         match server.accept() {
             Ok(pipe) => {
@@ -1474,22 +1534,49 @@ fn search_indexes_with_cache_with_spans(
 /// already arrived, while this thread still writes exactly one response
 /// frame per request, so framing stays 1:1 even for a superseded (empty)
 /// result.
+#[derive(Default)]
+struct ConnectionCancellation {
+    generation: std::sync::atomic::AtomicU64,
+    // A pending-byte observation and its publication are one operation with
+    // respect to starting a request. Otherwise a peek of this request's own
+    // bytes can publish after its generation snapshot and cancel it spuriously.
+    observation: std::sync::Mutex<()>,
+}
+
+impl ConnectionCancellation {
+    fn observe_pending(&self, peek: impl FnOnce() -> std::io::Result<u32>) -> std::io::Result<()> {
+        let _observation = self.observation.lock().unwrap();
+        if peek()? != 0 {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn begin_request(&self) -> scry_core::Cancellation<'_> {
+        let _observation = self.observation.lock().unwrap();
+        scry_core::Cancellation::new(
+            &self.generation,
+            self.generation.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::Result<()> {
     let pipe = Arc::new(pipe);
-    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cancellation = Arc::new(ConnectionCancellation::default());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let peek_pipe = Arc::clone(&pipe);
-    let peek_generation = Arc::clone(&generation);
+    let peek_cancellation = Arc::clone(&cancellation);
     let peek_stop = Arc::clone(&stop);
     let peeker = std::thread::spawn(move || {
         while !peek_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            match peek_pipe.pending_bytes() {
-                Ok(0) => {}
-                Ok(_) => {
-                    peek_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(_) => return, // client disconnected
+            if peek_cancellation
+                .observe_pending(|| peek_pipe.pending_bytes())
+                .is_err()
+            {
+                return; // client disconnected
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1505,8 +1592,7 @@ fn handle_connection(pipe: scry_ipc::Pipe, indexes: &VolumeIndexes) -> std::io::
             let Some(req) = decode_request(&req_bytes) else {
                 continue;
             };
-            let gen = generation.load(std::sync::atomic::Ordering::Relaxed);
-            let cancel = scry_core::Cancellation::new(&generation, gen);
+            let cancel = cancellation.begin_request();
             let mut spans = QuerySpans::default();
             let response = handle_request(&req, indexes, &pipe, cancel, &mut cache, &mut spans)?;
             let write_started = (req.kind != QueryKind::QueryStats).then(std::time::Instant::now);
@@ -1749,6 +1835,48 @@ fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_pending_observation_cannot_cancel_the_request_that_consumed_it() {
+        let state = Arc::new(ConnectionCancellation::default());
+        let (observed, seen) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let observer_state = state.clone();
+        let observer = std::thread::spawn(move || {
+            observer_state
+                .observe_pending(|| {
+                    // Simulate a peek of the current request, delayed before the
+                    // generation increment while the server consumes its frame.
+                    observed.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(1)
+                })
+                .unwrap();
+        });
+        seen.recv().unwrap();
+        assert!(state.observation.try_lock().is_err());
+        let (started, start) = std::sync::mpsc::channel();
+        let request_state = state.clone();
+        let request = std::thread::spawn(move || {
+            let cancel = request_state.begin_request();
+            started.send(cancel.is_cancelled()).unwrap();
+        });
+        assert!(start
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        release.send(()).unwrap();
+        observer.join().unwrap();
+        assert!(!start.recv().unwrap());
+        request.join().unwrap();
+        let cancel = state.begin_request();
+        state.observe_pending(|| Ok(0)).unwrap();
+        assert!(!cancel.is_cancelled());
+        state.observe_pending(|| Ok(1)).unwrap();
+        assert!(
+            cancel.is_cancelled(),
+            "a genuinely newer request must still cancel"
+        );
+    }
 
     #[test]
     fn search_local_matches_search_rpc() {

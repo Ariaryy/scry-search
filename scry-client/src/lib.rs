@@ -44,6 +44,13 @@ pub struct SearchSession {
     order: Order,
 }
 
+/// Where a local-first search actually executed, including automatic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchExecution {
+    SharedIndex,
+    RpcFallback,
+}
+
 impl Client {
     /// A daemon creates the next named-pipe instance immediately after
     /// accepting the previous one, but there is a small interval where
@@ -231,6 +238,20 @@ impl Client {
         limit: u32,
         order: Order,
     ) -> anyhow::Result<Vec<ResultEntry>> {
+        self.search_local_ordered_with_execution(kind, pattern, limit, order)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Local-first search with the actual execution route. The route describes
+    /// this call, not whether a mapping was available on an earlier request.
+    /// Sharing, validation, and fallback follow [`Self::search_local_ordered`].
+    pub fn search_local_ordered_with_execution(
+        &mut self,
+        kind: QueryKind,
+        pattern: &str,
+        limit: u32,
+        order: Order,
+    ) -> anyhow::Result<(Vec<ResultEntry>, SearchExecution)> {
         if matches!(kind, QueryKind::ShareIndex | QueryKind::QueryStats) {
             return Err(anyhow::anyhow!("invalid search kind"));
         }
@@ -264,7 +285,9 @@ impl Client {
                 Ok(shared) => shared,
                 Err(_) => {
                     self.reconnect_for_rpc_fallback()?;
-                    return self.query_ordered(kind, pattern, limit, order);
+                    return self
+                        .query_ordered(kind, pattern, limit, order)
+                        .map(|entries| (entries, SearchExecution::RpcFallback));
                 }
             };
             if shared.handle != 0 {
@@ -288,7 +311,9 @@ impl Client {
                         // the previously cached generation during the retry
                         // window; fall back and retry sharing next call.
                         self.local = None;
-                        return self.query_ordered(kind, pattern, limit, order);
+                        return self
+                            .query_ordered(kind, pattern, limit, order)
+                            .map(|entries| (entries, SearchExecution::RpcFallback));
                     }
                 }
             } else if self
@@ -297,7 +322,9 @@ impl Client {
                 .is_none_or(|local| local.generation != shared.generation)
             {
                 self.local = None;
-                return self.query_ordered(kind, pattern, limit, order);
+                return self
+                    .query_ordered(kind, pattern, limit, order)
+                    .map(|entries| (entries, SearchExecution::RpcFallback));
             }
             self.last_handshake = Some(std::time::Instant::now());
         }
@@ -326,12 +353,9 @@ impl Client {
             QueryKind::QueryStats => unreachable!(),
         };
         let options = SearchOptions::ordered(limit as usize, order);
-        Ok(scry_core::view::search_archived_with_delta(
-            arena,
-            &local.delta,
-            &query,
-            options,
-        ))
+        let entries =
+            scry_core::view::search_archived_with_delta(arena, &local.delta, &query, options);
+        Ok((entries, SearchExecution::SharedIndex))
     }
 
     pub fn prefix(&self, pattern: &str, limit: u32) -> anyhow::Result<Vec<ResultEntry>> {
@@ -547,9 +571,15 @@ mod tests {
 
         let mut client = connect(&pipe_name);
         for _ in 0..5 {
-            let result = client
-                .search_local(QueryKind::Substring, "file", 50)
+            let (result, execution) = client
+                .search_local_ordered_with_execution(
+                    QueryKind::Substring,
+                    "file",
+                    50,
+                    Order::Relevance,
+                )
                 .unwrap();
+            assert_eq!(execution, SearchExecution::SharedIndex);
             assert_eq!(result.len(), 1);
         }
         drop(client);
@@ -588,9 +618,10 @@ mod tests {
         });
 
         let mut client = connect(&pipe_name);
-        let result = client
-            .search_local(QueryKind::Substring, "file", 50)
+        let (result, execution) = client
+            .search_local_ordered_with_execution(QueryKind::Substring, "file", 50, Order::Relevance)
             .unwrap();
+        assert_eq!(execution, SearchExecution::RpcFallback);
         assert_eq!(result, vec![entry("file.txt")]);
 
         drop(client);
@@ -639,9 +670,10 @@ mod tests {
         );
         client.last_handshake = Some(std::time::Instant::now() - LOCAL_HANDSHAKE_STALENESS_WINDOW);
 
-        let result = client
-            .search_local(QueryKind::Substring, "file", 50)
+        let (result, execution) = client
+            .search_local_ordered_with_execution(QueryKind::Substring, "file", 50, Order::Relevance)
             .unwrap();
+        assert_eq!(execution, SearchExecution::RpcFallback);
         assert_eq!(result, vec![entry("rpc-result")]);
         assert!(client.local.is_none());
         assert!(client.last_handshake.unwrap().elapsed() >= LOCAL_HANDSHAKE_STALENESS_WINDOW);

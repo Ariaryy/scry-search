@@ -8,6 +8,7 @@ members = [
     "scry-client",
     "scry-cli",
     "examples",
+    "scry-bench",
 ]
 
 [workspace.package]

@@ -50,6 +50,11 @@ requests with a generation and abandons superseded work at bounded checkpoints.
 `SearchSession` exposes this as submit plus nonblocking poll; consumers should
 keep one session rather than reconnect per keystroke.
 
+The daemon serializes a pending-input observation and its generation increment
+with the generation snapshot taken after consuming a request. A delayed peek of
+that same request must not cancel it. Observations of newer input can still
+cancel in-flight work. This synchronization adds no wire fields.
+
 ## Security and compatibility
 
 The elevated daemon creates an explicitly local-accessible pipe so an
