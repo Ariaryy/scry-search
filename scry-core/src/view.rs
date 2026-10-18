@@ -1468,13 +1468,90 @@ mod tests {
         }
     }
 
-    /// Enough matching positions to take the bucket-ordered bitmap
-    /// enumeration (above `SPARSE_PATH_HITS`) on one thread, checked against
-    /// a full-path brute force across orders, filters, limits, and threads.
     #[test]
     fn dense_path_term_enumeration_matches_bruteforce() {
+        check_path_term_enumeration(0);
+    }
+
+    #[test]
+    fn sparse_path_term_batches_match_bruteforce() {
+        check_path_term_enumeration(60_000);
+    }
+
+    #[test]
+    fn path_candidate_visits_cover_batch_density_and_bucket_boundaries() {
+        let (_dir, view) = base_view(150_000);
+        let arena = view.base.archived();
+        let boundary = arena.len() / 32;
+        let mut name = Vec::new();
+        for count in [
+            0,
+            1,
+            31,
+            32,
+            33,
+            1024,
+            1025,
+            4096,
+            4097,
+            boundary,
+            boundary + 1,
+        ] {
+            let mut runs = crate::intervals::IntervalSet::default();
+            let mut expected = Vec::new();
+            for position in (0..arena.len() as u32).step_by(31).take(count) {
+                runs.push_point(position);
+                expected.push(arena.dfs_record(position));
+            }
+            runs.coalesce();
+            let mut actual = Vec::new();
+            assert!(visit_path_candidate_names(
+                arena,
+                &runs,
+                &mut name,
+                None,
+                |record, name| {
+                    let mut expected_name = Vec::new();
+                    arena.name_into(record, &mut expected_name);
+                    assert_eq!(name, expected_name);
+                    actual.push(record);
+                }
+            ));
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "count={count}");
+        }
+
+        let mut runs = crate::intervals::IntervalSet::default();
+        runs.push_span(1, PATH_RECORD_BATCH as u32 + 2);
+        runs.coalesce();
+        assert!(use_path_record_batches(arena.len(), runs.len_positions()));
+        let generation = AtomicU64::new(0);
+        let cancel = Cancellation::new(&generation, 0);
+        let mut visited = 0;
+        assert!(!visit_path_candidate_names(
+            arena,
+            &runs,
+            &mut name,
+            Some(cancel),
+            |_, _| {
+                visited += 1;
+                generation.store(1, AtomicOrdering::Relaxed);
+            }
+        ));
+        assert!((1..=crate::record::BUCKET_SIZE).contains(&visited));
+    }
+
+    /// The same matches take the bitmap route in the compact corpus and
+    /// bounded batches with unrelated padding. Check both against full paths,
+    /// across orders, metadata filters, limits, threads and live overlays.
+    fn check_path_term_enumeration(padding: usize) {
         let mut builder = crate::ArenaBuilder::default();
         let root = builder.push("C:", 0, true);
+        for index in 0..padding {
+            let record = builder.push(&format!("padding_{index:06}.bin"), 0, false);
+            builder.set_parent(record, root);
+        }
         let mut file = 0u64;
         for group in 0..24u32 {
             let group_name = if group % 3 == 0 {
@@ -1529,6 +1606,21 @@ mod tests {
                 delta.tombstones.set(record);
             }
         }
+        let parent = view.base.archived().prefix_range("zonegroup_").start;
+        for (name, live) in [
+            ("zone_bucket_delta.txt", true),
+            ("zone_bucket_deleted.txt", false),
+        ] {
+            delta.added.push(DeltaRecord {
+                name: name.to_owned(),
+                parent: ParentRef::Base(parent),
+                mtime_secs: 55_000,
+                is_dir: false,
+                size_bytes: 3_000_000,
+                size_exact: true,
+                live,
+            });
+        }
         view.delta = Arc::new(delta);
         let arena = view.base.archived();
 
@@ -1560,8 +1652,11 @@ mod tests {
                 for order in [Order::Relevance, Order::Recent, Order::Largest] {
                     let mut expected = Vec::new();
                     let mut name = Vec::new();
-                    for record in 0..base_len {
-                        if view.delta.tombstones.get(record) {
+                    for record in 0..base_len + view.delta.added.len() as u32 {
+                        if view.delta.tombstones.get(record)
+                            || (record >= base_len
+                                && !view.delta.added[(record - base_len) as usize].live)
+                        {
                             continue;
                         }
                         let path_lower = view.path_of(record).to_ascii_lowercase();
@@ -1590,6 +1685,10 @@ mod tests {
                     }
                     if filter.is_empty() {
                         assert!(expected.len() as u64 > SPARSE_PATH_HITS);
+                        assert_eq!(
+                            use_path_record_batches(arena.len(), expected.len() as u64),
+                            padding != 0
+                        );
                     }
                     expected.sort_unstable();
                     let expected: Vec<_> = expected.into_iter().map(rank::key_record).collect();
@@ -2570,9 +2669,118 @@ pub fn materialize_hits(
         .collect()
 }
 
-/// Below this many final DFS positions, random per-hit name decoding is
-/// cheaper than allocating and sweeping a whole-index record bitmap.
+/// Tiny final DFS sets use direct name decoding without candidate staging.
 const SPARSE_PATH_HITS: u64 = 1024;
+
+/// Sparse enumeration stages only record IDs, in bounded batches. No paths,
+/// names, or per-match objects survive a bucket visit.
+const PATH_RECORD_BATCH: usize = 4096;
+
+/// Prefer bounded batches when staging all IDs would use less space than a
+/// whole-index bit per record. Batching caps the actual staging at 16 KiB even
+/// when a selective query has more survivors than fit in one batch.
+fn use_path_record_batches(records: usize, positions: u64) -> bool {
+    positions <= (records / (8 * std::mem::size_of::<u32>())) as u64
+}
+
+fn visit_path_record_batch(
+    arena: &crate::ArchivedArena,
+    records: &mut [u32],
+    name: &mut Vec<u8>,
+    cancel: Option<Cancellation>,
+    visit: &mut impl FnMut(u32, &[u8]),
+) -> bool {
+    records.sort_unstable();
+    let mut remaining = &*records;
+    while let Some(&first) = remaining.first() {
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return false;
+        }
+        let start = first / crate::record::BUCKET_SIZE as u32 * crate::record::BUCKET_SIZE as u32;
+        let count =
+            remaining.partition_point(|&record| record - start < crate::record::BUCKET_SIZE as u32);
+        let (bucket, rest) = remaining.split_at(count);
+        let last = *bucket.last().unwrap();
+        let mask = bucket
+            .iter()
+            .fold(0u32, |mask, &record| mask | (1 << (record - start)));
+        arena.for_each_name_in_buf(first..last + 1, name, |record, record_name| {
+            if mask & (1 << (record - start)) != 0 {
+                visit(record, record_name);
+            }
+            if record == last {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        remaining = rest;
+    }
+    true
+}
+
+/// Visit exactly the final DFS set in bucket order (within a bounded batch for
+/// sparse results). Candidate staging is separate from bounded top-k retention.
+fn visit_path_candidate_names(
+    arena: &crate::ArchivedArena,
+    runs: &crate::intervals::IntervalSet,
+    name: &mut Vec<u8>,
+    cancel: Option<Cancellation>,
+    mut visit: impl FnMut(u32, &[u8]),
+) -> bool {
+    let mut checked = 0;
+    if use_path_record_batches(arena.len(), runs.len_positions()) {
+        let mut records =
+            Vec::with_capacity((runs.len_positions() as usize).min(PATH_RECORD_BATCH));
+        for &(start, end) in runs.runs() {
+            for position in start..end {
+                if is_cancelled_periodically(cancel, &mut checked) {
+                    return false;
+                }
+                records.push(arena.dfs_record(position));
+                if records.len() == PATH_RECORD_BATCH {
+                    if !visit_path_record_batch(arena, &mut records, name, cancel, &mut visit) {
+                        return false;
+                    }
+                    records.clear();
+                }
+            }
+        }
+        return visit_path_record_batch(arena, &mut records, name, cancel, &mut visit);
+    }
+
+    // Dense results retain the linear bitmap walk. Keep this local so index-
+    // sized storage never remains in a long-lived connection's scratch.
+    let mut matches = vec![0u8; arena.len().div_ceil(8)];
+    for &(start, end) in runs.runs() {
+        for position in start..end {
+            if is_cancelled_periodically(cancel, &mut checked) {
+                return false;
+            }
+            let record = arena.dfs_record(position);
+            matches[record as usize / 8] |= 1 << (record % 8);
+        }
+    }
+    const BUCKET_BYTES: usize = crate::record::BUCKET_SIZE / 8;
+    for (bucket, bits) in matches.chunks(BUCKET_BYTES).enumerate() {
+        if bits.iter().all(|&byte| byte == 0) {
+            continue;
+        }
+        if is_cancelled_periodically(cancel, &mut checked) {
+            return false;
+        }
+        let start = (bucket * crate::record::BUCKET_SIZE) as u32;
+        let end = start + crate::record::BUCKET_SIZE as u32;
+        arena.for_each_name_in_buf(start..end, name, |record, record_name| {
+            let offset = (record - start) as usize;
+            if bits[offset / 8] & (1 << (offset % 8)) != 0 {
+                visit(record, record_name);
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+    true
+}
 
 #[derive(Default)]
 struct PathSearchScratch {
@@ -3480,37 +3688,9 @@ fn search_path_terms_with_scratch(
         };
         *heap = parallel_heap;
     } else if needs_name && final_set.len_positions() > SPARSE_PATH_HITS {
-        // Mark surviving records in an n/8-byte bitmap, then decode each
-        // touched front-coded bucket once in name order, instead of
-        // re-decoding a bucket from its head for every DFS-ordered hit.
-        // Local rather than scratch: `vec![0; n]` takes pre-zeroed pages and
-        // is freed on return, so a dense query never leaves index-sized
-        // private memory behind on a long-lived connection thread.
-        let mut checked: u32 = 0;
-        let mut own_matches = vec![0u8; arena.len().div_ceil(8)];
-        for &(start, end) in final_set.runs() {
-            for position in start..end {
-                if is_cancelled_periodically(cancel, &mut checked) {
-                    return Vec::new();
-                }
-                let record = arena.dfs_record(position);
-                own_matches[record as usize / 8] |= 1 << (record % 8);
-            }
-        }
-        const BUCKET_BYTES: usize = crate::record::BUCKET_SIZE / 8;
-        for (bucket, bits) in own_matches.chunks(BUCKET_BYTES).enumerate() {
-            if bits.iter().all(|&byte| byte == 0) {
-                continue;
-            }
-            if is_cancelled_periodically(cancel, &mut checked) {
-                return Vec::new();
-            }
-            let start = (bucket * crate::record::BUCKET_SIZE) as u32;
-            let end = start + crate::record::BUCKET_SIZE as u32;
-            arena.for_each_name_in_buf(start..end, name, |record, record_name| {
-                let offset = (record - start) as usize;
-                if bits[offset / 8] & (1 << (offset % 8)) != 0
-                    && !delta.tombstones.get(record)
+        let completed =
+            visit_path_candidate_names(arena, final_set, name, cancel, |record, record_name| {
+                if !delta.tombstones.get(record)
                     && record_matches_filter(arena, delta, record, record_name, filter)
                 {
                     let mask = mask_for(record_name);
@@ -3527,8 +3707,9 @@ fn search_path_terms_with_scratch(
                         limit,
                     );
                 }
-                std::ops::ControlFlow::Continue(())
             });
+        if !completed {
+            return Vec::new();
         }
     } else {
         let mut checked: u32 = 0;

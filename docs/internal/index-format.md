@@ -52,6 +52,12 @@ Path-term search converts every term to coalesced DFS intervals and intersects
 the smallest sets first. Recursive directory size is one prefix subtraction;
 unknown descendants contribute zero and clear the directory's exactness bit.
 
+Final path-term candidates needing names use direct decoding for tiny sets.
+Larger sparse sets stage at most 4,096 record IDs (16 KiB), sort each batch,
+and decode only its touched front-coded buckets. Dense sets use a temporary
+record bitmap; the choice compares four bytes per survivor with one bit per
+base record. This staging is query-local and does not change the archive.
+
 ## Persistence and compaction
 
 Full builds and delta compaction write columns through file-backed spools and
