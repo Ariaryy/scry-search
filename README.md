@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/scry.svg" alt="Scry Search icon" width="112" height="112">
+
 # Scry Search
 
 ### A tiny, realtime file index for Windows
@@ -7,11 +9,18 @@
 Fast path search · live NTFS updates · embeddable Rust client · local-only IPC
 
 <p>
+  <a href="https://github.com/Ariaryy/scry-search/releases"><img src="https://img.shields.io/github/v/release/Ariaryy/scry-search?include_prereleases&amp;label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4" alt="Windows 10 and 11">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
+
+<p>
   <a href="#install">Quick start</a> ·
   <a href="docs/users/search-syntax.md">Query language</a> ·
   <a href="docs/users/cli.md">CLI</a> ·
   <a href="docs/users/rust-client.md">Rust client</a> ·
   <a href="docs/users/ipc.md">IPC</a> ·
+  <a href="#performance">Performance</a> ·
   <a href="docs/internal/architecture.md">Architecture</a> ·
   <a href="https://github.com/Ariaryy/scry-search/releases">Releases</a>
 </p>

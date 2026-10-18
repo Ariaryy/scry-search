@@ -10,6 +10,7 @@ on:
       - "scripts/benchmark-*.py"
       - "scripts/benchmark-*.ps1"
       - "scripts/tests/**"
+      - "assets/**"
       - ".github/workflows/ci.yml"
   workflow_dispatch:
 
