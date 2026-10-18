@@ -1971,6 +1971,27 @@ fn shared_section(view: &IndexView) -> std::io::Result<Arc<scry_ipc::Section>> {
 mod tests {
     use super::*;
 
+    mod query_probe {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scry-core/tests/support/query_probe.rs"
+        ));
+    }
+
+    #[test]
+    #[ignore = "release-mode mimalloc query memory/latency probe; requires SCRY_BENCH_SNAPSHOT"]
+    fn benchmark_query_scratch_memory() {
+        let path = std::env::var_os("SCRY_BENCH_SNAPSHOT")
+            .expect("set SCRY_BENCH_SNAPSHOT to a synthetic benchmark snapshot");
+        let view = IndexView::new(Arc::new(
+            scry_core::store::ArenaStore::open(std::path::Path::new(&path)).unwrap(),
+        ));
+        let query = Query::PathTerms(vec!["one".to_owned()]);
+        query_probe::run("mimalloc", view.base.archived().len(), || {
+            view.search(&query, 200)
+        });
+    }
+
     #[test]
     fn an_old_pending_observation_cannot_cancel_the_request_that_consumed_it() {
         let state = Arc::new(ConnectionCancellation::default());

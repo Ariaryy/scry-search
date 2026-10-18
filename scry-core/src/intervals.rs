@@ -11,32 +11,34 @@
 /// ranges.
 #[derive(Debug, Default, Clone)]
 pub struct IntervalSet {
+    /// Coalesced runs occupy the prefix; newly queued spans share the tail.
+    /// Keeping both in one allocation avoids copying an entire match set into
+    /// a second vector just to sort and merge it.
     runs: Vec<(u32, u32)>,
-    /// Runs pushed since the last [`Self::coalesce`] — `push_span`/
-    /// `push_point` append here in whatever order the caller matches
-    /// records, so a scan never pays sorting cost until it actually needs
-    /// the coalesced form.
-    pending: Vec<(u32, u32)>,
+    coalesced_len: usize,
 }
 
 impl IntervalSet {
-    pub fn clear(&mut self) {
-        self.runs.clear();
-        self.pending.clear();
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.runs.capacity() * std::mem::size_of::<(u32, u32)>()
     }
 
-    /// True once coalesced. Before `coalesce`, `pending` may hold entries
-    /// even when `runs` is empty, so this only reflects the caller's own
-    /// bookkeeping after a `coalesce` call.
+    pub fn clear(&mut self) {
+        self.runs.clear();
+        self.coalesced_len = 0;
+    }
+
+    /// Before `coalesce`, queued spans may exist even when the coalesced
+    /// prefix is empty. This checks both the prefix and the queued tail.
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.pending.is_empty()
+        self.runs.is_empty()
     }
 
     /// Queue a half-open span for the next [`Self::coalesce`]. `start >= end`
     /// is silently ignored (an empty span contributes nothing).
     pub fn push_span(&mut self, start: u32, end: u32) {
         if start < end {
-            self.pending.push((start, end));
+            self.runs.push((start, end));
         }
     }
 
@@ -45,7 +47,7 @@ impl IntervalSet {
     }
 
     pub(crate) fn push_ordered_point(&mut self, position: u32) {
-        debug_assert!(self.pending.is_empty());
+        debug_assert_eq!(self.coalesced_len, self.runs.len());
         if let Some((_, end)) = self.runs.last_mut() {
             if *end == position {
                 *end += 1;
@@ -53,15 +55,15 @@ impl IntervalSet {
             }
         }
         self.runs.push((position, position + 1));
+        self.coalesced_len = self.runs.len();
     }
 
     /// Sort and merge every queued span (plus any already-coalesced runs)
     /// into the minimal non-touching run list.
     pub fn coalesce(&mut self) {
-        if self.pending.is_empty() {
+        if self.coalesced_len == self.runs.len() {
             return;
         }
-        self.runs.append(&mut self.pending);
         self.runs.sort_unstable();
         let mut write = 0;
         for read in 1..self.runs.len() {
@@ -75,25 +77,26 @@ impl IntervalSet {
             }
         }
         self.runs.truncate(write + 1);
+        self.coalesced_len = self.runs.len();
     }
 
     /// Total number of individual positions covered. Only meaningful after
     /// [`Self::coalesce`].
     pub fn len_positions(&self) -> u64 {
-        self.runs
+        self.runs()
             .iter()
             .map(|&(start, end)| (end - start) as u64)
             .sum()
     }
 
     pub fn runs(&self) -> &[(u32, u32)] {
-        &self.runs
+        &self.runs[..self.coalesced_len]
     }
 
     /// Binary search over the coalesced runs. Only meaningful after
     /// [`Self::coalesce`].
     pub fn contains(&self, position: u32) -> bool {
-        self.runs
+        self.runs()
             .binary_search_by(|&(start, end)| {
                 if position < start {
                     std::cmp::Ordering::Greater
@@ -110,7 +113,7 @@ impl IntervalSet {
     /// meaningful after [`Self::coalesce`]; intended for small result sets,
     /// not as a substitute for run-level operations on large ones.
     pub fn iter_positions(&self) -> impl Iterator<Item = u32> + '_ {
-        self.runs.iter().flat_map(|&(start, end)| start..end)
+        self.runs().iter().flat_map(|&(start, end)| start..end)
     }
 
     /// Intersect two coalesced sets into `out` (cleared first) via a
@@ -122,7 +125,7 @@ impl IntervalSet {
     pub fn intersect_into(&self, other: &IntervalSet, out: &mut IntervalSet) {
         out.clear();
         let (mut i, mut j) = (0, 0);
-        let (a, b) = (&self.runs, &other.runs);
+        let (a, b) = (self.runs(), other.runs());
         while i < a.len() && j < b.len() {
             let (a_start, a_end) = a[i];
             let (b_start, b_end) = b[j];
@@ -137,6 +140,7 @@ impl IntervalSet {
                 j += 1;
             }
         }
+        out.coalesced_len = out.runs.len();
     }
 }
 
@@ -166,6 +170,52 @@ mod tests {
         set.coalesce();
         assert_eq!(set.runs(), &[(5, 25), (100, 110)]);
         assert_eq!(set.len_positions(), 20 + 10);
+    }
+
+    #[test]
+    fn queued_spans_preserve_the_coalesced_prefix_across_reuse_and_clone() {
+        let mut set = IntervalSet::default();
+        set.push_span(10, 20);
+        assert!(!set.is_empty());
+        assert!(set.runs().is_empty());
+        assert_eq!(set.len_positions(), 0);
+        set.coalesce();
+        set.push_span(1, 5);
+        set.push_span(20, 25);
+        assert_eq!(set.runs(), &[(10, 20)]);
+        assert!(!set.contains(1));
+        let mut cloned = set.clone();
+        cloned.coalesce();
+        assert_eq!(cloned.runs(), &[(1, 5), (10, 25)]);
+        assert_eq!(set.runs(), &[(10, 20)]);
+        set.coalesce();
+        assert_eq!(set.runs(), cloned.runs());
+        set.clear();
+        assert!(set.is_empty());
+        for point in [1, 2, 4] {
+            set.push_ordered_point(point);
+        }
+        set.coalesce();
+        assert_eq!(set.runs(), &[(1, 3), (4, 5)]);
+        let mut out = IntervalSet::default();
+        out.push_span(100, 110);
+        set.intersect_into(&cloned, &mut out);
+        assert_eq!(out.runs(), set.runs());
+        out.push_span(3, 4);
+        out.coalesce();
+        assert_eq!(out.runs(), &[(1, 5)]);
+    }
+
+    #[test]
+    fn coalescing_reuses_the_queued_span_allocation() {
+        let mut set = IntervalSet::default();
+        for point in (0..100_000).rev() {
+            set.push_point(point);
+        }
+        let allocated = set.allocated_bytes();
+        set.coalesce();
+        assert_eq!(set.runs(), &[(0, 100_000)]);
+        assert_eq!(set.allocated_bytes(), allocated);
     }
 
     #[test]

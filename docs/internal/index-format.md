@@ -58,6 +58,12 @@ and decode only its touched front-coded buckets. Dense sets use a temporary
 record bitmap; the choice compares four bytes per survivor with one bit per
 base record. This staging is query-local and does not change the archive.
 
+Each term's interval set coalesces queued spans in the same allocation as its
+settled runs. Reusable path-search scratch has an aggregate 1 MiB capacity
+budget per execution thread; larger buffers are released after the query,
+including cancelled returns. This bounds owned scratch retained between queries,
+not in-flight interval storage, caller-owned results, or allocator-retained pages.
+
 ## Persistence and compaction
 
 Full builds and delta compaction write columns through file-backed spools and
