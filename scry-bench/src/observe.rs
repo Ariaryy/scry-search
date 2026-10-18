@@ -395,7 +395,7 @@ pub fn command() -> Result<()> {
         "profile":env!("SCRY_BENCH_PROFILE"),"source":env!("SCRY_BENCH_COMMIT"),
         "daemon_stats_before":stats_before,"query_routes":routes,
         "query_shapes":["one-byte-path","substring","prefix","extension-filter","wildcard","negative"],
-        "phases":{"0":"before","1":"query_burst","2":"disconnected_idle","3":"visibility","4":"disconnected_settle"},
+        "phases":{"0":"before","1":"query_burst","2":if idle_connections==0 {"disconnected_idle"}else{"connected_idle"},"3":"visibility","4":"settle"},
         "query_repeats":repeats,"query_limit":50,"idle_requested_seconds":idle,"settle_seconds":settle,"idle_connections":idle_connections,
         "idle":{"sampled_seconds":elapsed,"samples":idle_samples.len(),"cpu_seconds":cpu,
             "one_logical_cpu_pct":if elapsed>0.0 {Some(cpu/elapsed*100.0)}else{None},
