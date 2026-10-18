@@ -78,6 +78,11 @@ pub struct ProcessMemoryCountersEx {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetCurrentProcess() -> Handle;
+    pub fn GetProcessAffinityMask(
+        process: Handle,
+        process_mask: *mut usize,
+        system_mask: *mut usize,
+    ) -> Bool;
     pub fn GetCurrentThread() -> Handle;
 
     pub fn SetProcessInformation(

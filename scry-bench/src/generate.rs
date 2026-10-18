@@ -49,7 +49,10 @@ pub fn count(
         else {
             anyhow::bail!("unsupported generated metadata predicate");
         };
-        ensure!(terms.len() == 2, "expected two generated terms");
+        ensure!(
+            (1..=2).contains(&terms.len()),
+            "expected one or two generated terms"
+        );
         let terms: Vec<_> = terms
             .iter()
             .map(|s| s.to_ascii_lowercase().into_bytes())
@@ -72,7 +75,7 @@ pub fn count(
                 }
             }
             masks.set(record as usize, mask);
-            total += u64::from(mask == 3);
+            total += u64::from(mask == (1u8 << terms.len()) - 1);
         }
     } else {
         if kind == "path_terms" {
@@ -135,6 +138,14 @@ pub fn build(
         let Ok(text) = std::str::from_utf8(&name) else {
             continue;
         };
+        if let Some(first) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+            candidates.insert(("broad-path".into(), "path_terms".into(), first.to_string()));
+            candidates.insert((
+                "broad-substring".into(),
+                "substring".into(),
+                first.to_string(),
+            ));
+        }
         for bytes in 1..=5 {
             if let Some(prefix) = text.get(..bytes).filter(|s| !s.is_empty()) {
                 candidates.insert((
@@ -187,6 +198,9 @@ pub fn build(
         if chars.len() > 2 {
             let mut typo = chars.clone();
             typo.swap(0, 1);
+            if typo == chars {
+                typo.remove(1);
+            }
             let subsequence: String = chars.iter().step_by(2).collect();
             let acronym: String = text
                 .split(|c: char| !c.is_alphanumeric())
@@ -196,6 +210,13 @@ pub fn build(
         }
     }
     let mut groups: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+    let negative = format!("scry_bench_absent_{seed:016x}");
+    ensure!(
+        count(store, "substring", &negative, scratch)? == 0,
+        "synthetic negative unexpectedly exists; choose another seed"
+    );
+    candidates.insert(("negative-prefix".into(), "prefix".into(), negative.clone()));
+    candidates.insert(("negative-substring".into(), "substring".into(), negative));
     let mut evaluated = 0;
     for (shape, kind, pattern) in candidates {
         if pattern.len() > 256 {
@@ -227,8 +248,8 @@ pub fn build(
     );
     let sha = crate::fingerprint::sha256_snapshot(store)?;
     Ok((
-        json!({"corpus":{"label":"seeded-snapshot-workload","records":arena.len(),"volumes":1,"delta_state":"frozen empty delta","cache_state":"uncontrolled"},"cases":cases,"generation":{"seed":format!("{seed:016x}"),"snapshot_sha256":sha,"cases":counts}}),
-        json!({"schema":1,"seed":format!("{seed:016x}"),"record_draws":draws,"snapshot_sha256":sha,"candidates_evaluated":evaluated,"selection":"at most two lexicographically ordered candidates per shape/bucket; record draws with replacement","count_method":"exhaustive name scan or canonical DFS term masks; no result limit","buckets":{"lt10":[0,9],"lt1k":[10,999],"lt100k":[1000,99999],"ge100k":[100000,null]},"cases":counts,"future_variants":{"status":"deferred until fuzzy execution exists","draws":future.len()}}),
+        json!({"corpus":{"label":"seeded-snapshot-workload","records":arena.len(),"volumes":1,"delta_state":"frozen empty delta","cache_state":"uncontrolled"},"cases":cases,"generation":{"version":2,"seed":format!("{seed:016x}"),"snapshot_sha256":sha,"cases":counts}}),
+        json!({"schema":1,"generator_version":2,"seed":format!("{seed:016x}"),"record_draws":draws,"snapshot_sha256":sha,"candidates_evaluated":evaluated,"selection":"at most two lexicographically ordered candidates per shape/bucket; seeded record draws plus explicit negatives and broad probes","count_method":"exhaustive name scan or canonical DFS term masks; no result limit","buckets":{"lt10":[0,9],"lt1k":[10,999],"lt100k":[1000,99999],"ge100k":[100000,null]},"cases":counts,"future_variants":{"status":"deferred until fuzzy execution exists","draws":future.len()}}),
         json!({"status":"not executable until fuzzy support exists","variants":future}),
     ))
 }

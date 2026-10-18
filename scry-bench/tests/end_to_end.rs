@@ -34,11 +34,13 @@ impl Fixture {
     }
 
     fn with_corruption(sharing: bool, corrupt: bool) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pipe = format!(
-            r"\\.\pipe\scry-bench-fixture-{}-{}-{}",
+            r"\\.\pipe\scry-bench-fixture-{}-{}-{}-{}",
             std::process::id(),
             sharing,
-            corrupt
+            corrupt,
+            NEXT.fetch_add(1, Ordering::Relaxed)
         );
         let server = scry_ipc::PipeServer::new(&pipe).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -255,4 +257,51 @@ fn same_count_wrong_timed_identity_rejects_capture_after_successful_preflight() 
         std::fs::read_to_string(temporary.path().join(".scratch/rejected.jsonl")).unwrap();
     assert!(capture.contains("\"ordered_equal\":true"));
     assert!(!capture.contains("\"type\":\"complete\""));
+}
+
+#[test]
+fn external_observer_reads_process_counters_and_times_disconnected_idle() {
+    let fixture = Fixture::new(true);
+    let temporary = tempfile::tempdir().unwrap();
+    for idle_connections in ["0", "2"] {
+        let output = format!(".scratch/observe-{idle_connections}.json");
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_scry-bench"))
+            .current_dir(temporary.path())
+            .args([
+                "observe",
+                "--pipe",
+                &fixture.pipe,
+                "--output",
+                &output,
+                "--idle-seconds",
+                "1",
+                "--settle-seconds",
+                "0",
+                "--visibility-samples",
+                "0",
+                "--query-repeats",
+                "1",
+                "--idle-connections",
+                idle_connections,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = std::fs::read_to_string(temporary.path().join(&output)).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["complete"], true);
+        assert!(report["idle"]["sampled_seconds"].as_f64().unwrap() >= 1.0);
+        assert!(report["sampled_private_max"]["before"].as_u64().unwrap() > 0);
+        assert_eq!(report["query_routes"]["rpc"], 6);
+        assert_eq!(report["query_routes"]["shared_index"], 6);
+        assert_eq!(
+            report["idle_connections"],
+            idle_connections.parse::<u64>().unwrap()
+        );
+        assert!(!text.contains("report_0001.txt"));
+    }
 }

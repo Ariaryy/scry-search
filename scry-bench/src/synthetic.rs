@@ -33,6 +33,16 @@ fn select(prefix: &Spool<u64>, start: usize, end: usize, rng: &mut Rng) -> u32 {
 }
 
 pub fn build(path: &Path, records: usize, seed: u64, scratch: &Path) -> Result<()> {
+    build_profile(path, records, seed, scratch, false)
+}
+
+fn build_profile(
+    path: &Path,
+    records: usize,
+    seed: u64,
+    scratch: &Path,
+    stress: bool,
+) -> Result<()> {
     ensure!(
         (10_000..=5_000_000).contains(&records),
         "records must be 10000..5000000"
@@ -85,7 +95,11 @@ pub fn build(path: &Path, records: usize, seed: u64, scratch: &Path) -> Result<(
                 true,
                 0,
                 true,
-                select(&prefix, ps, pe, &mut rng),
+                if stress && i % 1000 == 0 {
+                    PARENT_NONE
+                } else {
+                    select(&prefix, ps, pe, &mut rng)
+                },
             );
         }
     }
@@ -127,16 +141,35 @@ pub fn build(path: &Path, records: usize, seed: u64, scratch: &Path) -> Result<(
             name.push_str(word);
         }
         name.truncate(target - suffix.len());
+        if stress && group % 64 == 0 {
+            while name.len() < 190 {
+                name.push('x');
+            }
+        }
+        if stress && group % 16 == 0 {
+            name.push_str("_café_数据");
+        }
         name.push_str(&suffix);
         let copies = files / unique_files + usize::from(group < files % unique_files);
         for _ in 0..copies {
-            let parent = select(&prefix, 0, dirs, &mut rng);
+            let parent = if stress && group % 33 == 0 {
+                0
+            } else {
+                select(&prefix, 0, dirs, &mut rng)
+            };
+            let mtime = 1_700_000_000 + (rng.next() % 10000) as u32;
+            let size = rng.next() % 10_000_000;
+            let exact = !stress || group % 100 != 0;
             builder.push(
                 name.as_bytes(),
-                1_700_000_000 + (rng.next() % 10000) as u32,
+                mtime,
                 false,
-                rng.next() % 10_000_000,
-                true,
+                if exact && (!stress || group % 111 != 0) {
+                    size
+                } else {
+                    0
+                },
+                exact,
                 parent,
             );
         }
@@ -183,10 +216,11 @@ pub fn build(path: &Path, records: usize, seed: u64, scratch: &Path) -> Result<(
 pub fn command() -> Result<()> {
     let mut output = PathBuf::from(".scratch/benchmark/calibrated-v1.rkyv");
     let (mut records, mut seed) = (440_000, 0x5eed_034c_0000_0001);
+    let mut profile = "calibrated-v1".to_owned();
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         if arg == "--help" {
-            println!("scry-bench synthesize --output .scratch/...rkyv [--records 10000..5000000 --seed U64]\nAdditional calibrated-v1 profile; historical generators are unchanged. Writes an aggregate .report.json fingerprint.");
+            println!("scry-bench synthesize --output .scratch/...rkyv [--records 10000..5000000 --seed U64 --profile calibrated-v1|stress-v1]\nHistorical generators stay unchanged. stress-v1 adds wide fanout, multiple roots, Unicode/long names and unknown/empty sizes. Writes an aggregate fingerprint.");
             return Ok(());
         }
         let value = args.next().context("synthesis option needs a value")?;
@@ -194,6 +228,7 @@ pub fn command() -> Result<()> {
             "--output" => output = value.into(),
             "--records" => records = value.parse()?,
             "--seed" => seed = value.parse()?,
+            "--profile" => profile = value,
             _ => anyhow::bail!("unknown synthesis option"),
         }
     }
@@ -202,13 +237,40 @@ pub fn command() -> Result<()> {
     let reservation = crate::scratch_writer(&output)?;
     drop(reservation);
     let mut report = crate::scratch_writer(&output.with_extension("report.json"))?;
-    build(&output, records, seed, output.parent().unwrap())?;
+    ensure!(
+        matches!(profile.as_str(), "calibrated-v1" | "stress-v1"),
+        "unknown synthetic profile"
+    );
+    build_profile(
+        &output,
+        records,
+        seed,
+        output.parent().unwrap(),
+        profile == "stress-v1",
+    )?;
     let store = ArenaStore::open(&output)?;
     let mut fp = crate::fingerprint::compute(&store, output.parent().unwrap())?;
     fp["snapshot_sha256"] = json!(crate::fingerprint::sha256_snapshot(&store)?);
     serde_json::to_writer_pretty(
         &mut report,
-        &json!({"profile":"calibrated-v1","seed":format!("{seed:016x}"),"records":records,"fingerprint":fp,"limitations":"aggregate calibration of depth, name repetition and extension concentration; not a replica of a real filesystem"}),
+        &json!({"profile":profile,"seed":format!("{seed:016x}"),"records":records,"fingerprint":fp,"limitations":"aggregate calibration or explicit stress coverage; not a replica of a real filesystem"}),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stress_profile_covers_unicode_forest_wide_fanout_and_size_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stress.rkyv");
+        super::build_profile(&path, 10000, 42, temp.path(), true).unwrap();
+        let store = scry_core::ArenaStore::open(&path).unwrap();
+        let report = crate::fingerprint::compute(&store, temp.path()).unwrap();
+        assert!(report["shape"]["canonical_roots"].as_u64().unwrap() > 1);
+        assert!(report["shape"]["directory_fanout"]["max"].as_u64().unwrap() > 200);
+        assert!(report["names"]["non_ascii_name_share"].as_f64().unwrap() > 0.0);
+        assert!(report["names"]["utf8_byte_length"]["max"].as_u64().unwrap() > 190);
+        assert!(report["sizes"]["exact_size_share"].as_f64().unwrap() < 1.0);
+    }
 }

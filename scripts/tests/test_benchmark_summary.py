@@ -13,13 +13,13 @@ spec.loader.exec_module(summary)
 
 def capture(ns=10_000_000):
     metadata = {field: "fixed" for field in summary.COMPATIBLE}
-    metadata.update(schema=2, samples=40, rounds=3, daemon_build="build-a",
+    metadata.update(schema=3, samples=40, rounds=3, daemon_build="build-a",
                     timed_validation="ordered_full_entry_sha256", reference_snapshot_sha256="fixture-snapshot", corpus_fingerprint={"records":130},
                     machine="fixture", power="AC-fixed-plan",
                     corpus={"records": 130, "volumes": 1, "delta_state": "fixed-overlay"})
     key = ("target", "substring", "substring", "relevance", "rpc", "rpc", "warm", 0)
     rows = [dict(zip(summary.CELL, key), round=round_no, sample=sample,
-                 elapsed_ns=ns, emitted=50, expected_emitted=50, validated=True)
+                 elapsed_ns=ns, emitted=50, expected_emitted=50, validated=True,answer_sha256='a'*64)
             for round_no in range(3) for sample in range(1, 41)]
     return metadata, {key: rows}, []
 
@@ -50,6 +50,17 @@ class EvidenceTests(unittest.TestCase):
 
     def test_improvement_passes(self):
         self.assertTrue(summary.compare(capture(), capture(8_000_000), self.args)["passed"])
+
+    def test_equal_counts_with_changed_ordered_answers_cannot_pass(self):
+        after=capture(8_000_000)
+        for row in next(iter(after[1].values())):
+            row['answer_sha256']='b'*64
+        with self.assertRaisesRegex(ValueError,'ordered answers'):
+            summary.compare(capture(),after,self.args)
+        old=capture()
+        old[0]['schema']=2
+        with self.assertRaisesRegex(ValueError,'schema-3'):
+            summary.compare(old,capture(),self.args)
 
     def test_no_benefit_and_regression_fail(self):
         self.assertFalse(summary.compare(capture(), capture(), self.args)["passed"])

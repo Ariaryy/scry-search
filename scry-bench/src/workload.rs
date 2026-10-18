@@ -14,6 +14,8 @@ pub struct Workload {
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Generation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
     pub seed: String,
     pub snapshot_sha256: String,
     pub cases: Vec<Stratum>,

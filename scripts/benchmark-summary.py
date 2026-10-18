@@ -15,7 +15,7 @@ CELL = ("case", "shape", "kind", "order", "requested", "execution", "phase", "st
 COMPATIBLE = ("schema", "workload_hash", "corpus", "limit", "samples", "warmups",
               "rounds", "machine", "power", "target", "rustc", "profile", "opt_level",
               "rustflags", "os_cache", "background_connections")
-COMPATIBLE += ("timed_validation", "reference_snapshot_sha256", "corpus_fingerprint", "daemon_runtime", "generation")
+COMPATIBLE += ("timed_validation", "reference_snapshot_sha256", "corpus_fingerprint", "daemon_runtime", "generation", "cache_diagnostics", "client_affinity")
 
 
 def percentile(values, fraction):
@@ -52,6 +52,8 @@ def load(path):
         raise ValueError("incomplete capture")
     for observations in cells.values():
         for row in observations:
+            if metadata.get('schema',1)>=3 and not re.fullmatch('[0-9a-f]{64}',row.get('answer_sha256','')):
+                raise ValueError('sample lacks persisted ordered-answer digest')
             if (row["round"], row["case"], row["requested"]) not in verification:
                 raise ValueError("sample lacks untimed correctness verification")
             if metadata.get("schema", 1) >= 2:
@@ -83,8 +85,8 @@ def compare(before, after, args):
     bm, bc, _ = before
     am, ac, _ = after
     for metadata in (bm, am):
-        if metadata.get("schema", 1) < 2 or metadata.get("timed_validation") != "ordered_full_entry_sha256":
-            raise ValueError("comparison requires validated schema-2 captures")
+        if metadata.get("schema", 1) < 3 or metadata.get("timed_validation") != "ordered_full_entry_sha256":
+            raise ValueError("comparison requires schema-3 captures with persisted ordered answers")
         if not metadata.get("reference_snapshot_sha256") or not metadata.get("corpus_fingerprint"):
             raise ValueError("comparison requires a reference snapshot identity and complexity fingerprint")
     for field in COMPATIBLE:
@@ -110,6 +112,9 @@ def compare(before, after, args):
         if dict(zip(CELL, key))["phase"] != "warm":
             continue
         old, new = bc[key], ac[key]
+        identities=[{row.get('answer_sha256') for row in observations} for observations in (old,new)]
+        if len(identities[0])!=1 or identities[0]!=identities[1] or None in identities[0]:
+            raise ValueError('ordered answers differ between builds or samples')
         # Every cell must have enough samples in every round. Switching routes
         # mid-run cannot silently pool local and RPC or hide missing samples.
         for observations, metadata in ((old, bm), (new, am)):

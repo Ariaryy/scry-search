@@ -11,6 +11,15 @@ pub struct Reference {
 }
 
 impl Reference {
+    pub fn hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for byte in self.digest {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        out
+    }
     pub fn of(entries: &[ResultEntry]) -> Self {
         let mut hash = Sha256::new();
         hash.update((entries.len() as u64).to_le_bytes());

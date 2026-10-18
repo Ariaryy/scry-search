@@ -12,12 +12,16 @@ param(
     [Parameter(Mandatory=$true)][string]$Machine,
     [Parameter(Mandatory=$true)][string]$Power,
     [string]$Bench = 'target/release/scry-bench.exe',
+    [string]$BaselineBench,
+    [string]$CandidateBench,
     [ValidateRange(1,20)][int]$Pairs = 3,
     [ValidateRange(1,10000)][int]$Samples = 40,
     [ValidateRange(1,100)][int]$Rounds = 3,
     [ValidateRange(0,100)][int]$Warmups = 2,
     [ValidateRange(1,64)][int]$QueryThreads = 1,
-    [string]$TargetCase
+    [string]$TargetCase,
+    [ValidateRange(0,[long]::MaxValue)][long]$DaemonAffinityMask=0,
+    [ValidateRange(0,[long]::MaxValue)][long]$ClientAffinityMask=0
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -40,6 +44,9 @@ while ($ancestor.FullName -ne (Get-Item -LiteralPath $repoRoot).FullName) {
     if ($null -eq $ancestor) { throw 'Output ancestry left repository' }
 }
 $benchPath = Get-TaskPath $Bench
+$runners=@{baseline=$benchPath;candidate=$benchPath}
+if ($BaselineBench) {$runners.baseline=Get-TaskPath $BaselineBench}
+if ($CandidateBench) {$runners.candidate=Get-TaskPath $CandidateBench}
 $snapshotPath = Get-TaskPath $Snapshot
 $workloadPath = Get-TaskPath $Workload
 $python = (Get-Command python).Source
@@ -54,6 +61,10 @@ $hashes = @{}
 foreach ($label in @('baseline','candidate')) { $hashes[$label]=Get-Sha256 $binaries[$label] }
 $snapshotHash = Get-Sha256 $snapshotPath
 $context = @{schema=1; pairs=$Pairs; samples=$Samples; rounds=$Rounds; warmups=$Warmups; query_threads=$QueryThreads; refinement_cache=$true; machine=$Machine; power=$Power; daemon_sha256=$hashes; bench_sha256=(Get-Sha256 $benchPath); snapshot_sha256=$snapshotHash; workload_sha256=(Get-Sha256 $workloadPath); same_binary_control=($hashes.baseline -eq $hashes.candidate); process_order='baseline,candidate; candidate,baseline; repeat'; background='installed daemon untouched; other activity operator controlled'}
+$context.daemon_affinity_request=$DaemonAffinityMask
+$context.client_affinity_request=$ClientAffinityMask
+$context.runner_sha256=@{baseline=(Get-Sha256 $runners.baseline);candidate=(Get-Sha256 $runners.candidate)}
+$context.same_binary_control=$context.same_binary_control -and ($context.runner_sha256.baseline -eq $context.runner_sha256.candidate)
 [System.IO.File]::WriteAllText((Join-Path $destination 'context.json'),($context | ConvertTo-Json -Depth 5))
 function New-StartInfo($executable, [string[]]$arguments) {
     if (@($arguments | Where-Object { $_.Contains('"') -or $_.Contains("`n") -or $_.Contains("`r") }).Count) { throw 'Arguments contain unsupported quote or newline' }
@@ -71,7 +82,7 @@ function Invoke-Captured($executable, [string[]]$arguments, $prefix) {
     $process = [System.Diagnostics.Process]::Start((New-StartInfo $executable $arguments))
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    try { $process.WaitForExit(); $code=$process.ExitCode }
+    try { if ($executable -in @($runners.baseline,$runners.candidate) -and $ClientAffinityMask -ne 0) {$process.ProcessorAffinity=[IntPtr]$ClientAffinityMask}; $process.WaitForExit(); $code=$process.ExitCode }
     finally { if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() } }
     [System.IO.File]::WriteAllText("$prefix.json",$stdout.Result)
     [System.IO.File]::WriteAllText("$prefix.stderr.log",$stderr.Result)
@@ -82,6 +93,7 @@ for ($pair=0; $pair -lt $Pairs; $pair++) {
     $order = if ($pair % 2 -eq 0) { @('baseline','candidate') } else { @('candidate','baseline') }
     foreach ($label in $order) {
         if ((Get-Sha256 $snapshotPath) -ne $snapshotHash -or (Get-Sha256 $binaries[$label]) -ne $hashes[$label]) { throw 'Snapshot or binary changed' }
+        if ((Get-Sha256 $runners[$label]) -ne $context.runner_sha256[$label]) {throw 'Runner binary changed'}
         $pipe = "\\.\pipe\scry-bench-paired-$PID-$pair-$label"
         $start = New-StartInfo $binaries[$label] @('--benchmark-snapshot',$snapshotPath,'--benchmark-pipe',$pipe)
         $start.EnvironmentVariables['SCRY_QUERY_THREADS'] = "$QueryThreads"
@@ -92,6 +104,7 @@ for ($pair=0; $pair -lt $Pairs; $pair++) {
         $daemonError = $server.StandardError.ReadToEndAsync()
         $prefix = Join-Path $destination "pair-$pair-$label"
         try {
+            if ($DaemonAffinityMask -ne 0) {$server.ProcessorAffinity=[IntPtr]$DaemonAffinityMask}
             $ready = $false
             $deadline = (Get-Date).AddSeconds(15)
             while ((Get-Date) -lt $deadline -and !$server.HasExited) {
@@ -100,7 +113,7 @@ for ($pair=0; $pair -lt $Pairs; $pair++) {
             }
             if (!$ready) { throw 'Frozen daemon did not become ready' }
             $arguments = @('--snapshot',$snapshotPath,'--workload',$workloadPath,'--pipe',$pipe,'--output',"$prefix.jsonl",'--daemon-build',"sha256-$($hashes[$label])",'--machine',$Machine,'--power',$Power,'--samples',"$Samples",'--rounds',"$Rounds",'--warmups',"$Warmups")
-            $code = Invoke-Captured $benchPath $arguments "$prefix-runner"
+            $code = Invoke-Captured $runners[$label] $arguments "$prefix-runner"
             if ($code -ne 0) { throw 'Capture failed; inspect private logs' }
         } finally {
             if (!$server.HasExited) { $server.Kill() }

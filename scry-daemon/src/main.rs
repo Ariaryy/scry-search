@@ -145,6 +145,16 @@ impl QueryMetrics {
             refinement_cache_enabled(),
             BENCHMARK_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
         ));
+        let (mut affinity, mut system) = (0usize, 0usize);
+        let affinity = if unsafe {
+            ffi::GetProcessAffinityMask(ffi::GetCurrentProcess(), &mut affinity, &mut system)
+        } != 0
+        {
+            affinity.to_string()
+        } else {
+            "unknown".into()
+        };
+        out.push_str(&format!(" affinity_mask={affinity}"));
         out
     }
 }
@@ -259,19 +269,27 @@ fn is_shutdown_signal(ctrl_type: ffi::Dword) -> bool {
 }
 
 static BENCHMARK_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BENCHMARK_CACHE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+struct BenchmarkSnapshot {
+    path: std::path::PathBuf,
+    overlay: Option<std::path::PathBuf>,
+}
 
 struct StartupOptions {
     volumes: Vec<String>,
     index_mbps: Option<u64>,
-    benchmark_snapshot: Option<std::path::PathBuf>,
+    benchmark_snapshot: Vec<BenchmarkSnapshot>,
     benchmark_pipe: Option<String>,
+    benchmark_cache: Option<std::path::PathBuf>,
 }
 
 fn startup_options() -> anyhow::Result<StartupOptions> {
     let mut volumes = Vec::new();
     let mut index_mbps = None;
-    let mut benchmark_snapshot = None;
+    let mut benchmark_snapshot: Vec<BenchmarkSnapshot> = Vec::new();
     let mut benchmark_pipe = None;
+    let mut benchmark_cache = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -288,9 +306,29 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
             }
             "--unbounded" => index_mbps = Some(0),
             "--benchmark-snapshot" => {
-                benchmark_snapshot = Some(
-                    args.next()
+                benchmark_snapshot.push(BenchmarkSnapshot {
+                    path: args
+                        .next()
                         .ok_or_else(|| anyhow::anyhow!("--benchmark-snapshot needs a file"))?
+                        .into(),
+                    overlay: None,
+                });
+            }
+            "--benchmark-overlay" => {
+                let snapshot = benchmark_snapshot
+                    .last_mut()
+                    .ok_or_else(|| anyhow::anyhow!("overlay requires a preceding snapshot"))?;
+                anyhow::ensure!(snapshot.overlay.is_none(), "one overlay per snapshot");
+                snapshot.overlay = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("overlay needs a file"))?
+                        .into(),
+                );
+            }
+            "--benchmark-live-cache" => {
+                benchmark_cache = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("live benchmark cache needs a directory"))?
                         .into(),
                 );
             }
@@ -321,12 +359,21 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
         }
     }
     anyhow::ensure!(
-        benchmark_snapshot.is_some() == benchmark_pipe.is_some(),
-        "benchmark snapshot and pipe must be supplied together"
+        (!benchmark_snapshot.is_empty() || benchmark_cache.is_some()) == benchmark_pipe.is_some(),
+        "benchmark snapshots or live cache require a private pipe"
     );
     anyhow::ensure!(
-        benchmark_snapshot.is_none() || (volumes.is_empty() && index_mbps.is_none()),
+        benchmark_snapshot.is_empty()
+            || (volumes.is_empty() && index_mbps.is_none() && benchmark_cache.is_none()),
         "frozen benchmark mode cannot ingest volumes"
+    );
+    anyhow::ensure!(
+        benchmark_snapshot.len() <= 16,
+        "at most sixteen benchmark volumes"
+    );
+    anyhow::ensure!(
+        benchmark_cache.is_none() || !volumes.is_empty(),
+        "live benchmark requires explicit volumes"
     );
     if let Some(pipe) = &benchmark_pipe {
         anyhow::ensure!(
@@ -339,6 +386,7 @@ fn startup_options() -> anyhow::Result<StartupOptions> {
         index_mbps,
         benchmark_snapshot,
         benchmark_pipe,
+        benchmark_cache,
     })
 }
 
@@ -360,16 +408,63 @@ fn main() -> anyhow::Result<()> {
     // Read-only experiment: use the production RPC/refinement/section paths,
     // but never replay, watch, compact, persist, or open a raw volume. This
     // needs no elevation and cannot take the installed daemon's pipe name.
-    if let Some(path) = options.benchmark_snapshot {
+    if !options.benchmark_snapshot.is_empty() {
         BENCHMARK_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        let base = Arc::new(ArenaStore::open(&path)?);
-        let indexes = Arc::new(vec![VolumeIndex {
-            volume: "benchmark".into(),
-            store: Arc::new(arc_swap::ArcSwap::from_pointee(IndexView::new(base))),
-            cursor: None,
-        }]);
-        return serve_indexes(indexes, options.benchmark_pipe.as_deref().unwrap())
-            .map_err(Into::into);
+        let mut indexes = Vec::new();
+        for snapshot in options.benchmark_snapshot {
+            let base = Arc::new(ArenaStore::open(&snapshot.path)?);
+            let mut view = IndexView::new(base);
+            if let Some(path) = snapshot.overlay {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?
+                    .take(64 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(
+                    bytes.len() <= 64 * 1024 * 1024,
+                    "benchmark overlay exceeds 64 MiB"
+                );
+                view.delta = Arc::new(
+                    scry_core::delta::Delta::decode_query_overlay(
+                        &bytes,
+                        view.base.archived().len(),
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("invalid benchmark overlay"))?,
+                );
+            }
+            indexes.push(VolumeIndex {
+                volume: format!("benchmark-{}", indexes.len()),
+                store: Arc::new(arc_swap::ArcSwap::from_pointee(view)),
+                cursor: None,
+            });
+        }
+        return serve_indexes(
+            Arc::new(indexes),
+            options.benchmark_pipe.as_deref().unwrap(),
+        )
+        .map_err(Into::into);
+    }
+
+    if let Some(path) = options.benchmark_cache {
+        let scratch = std::env::current_dir()?.join(".scratch");
+        std::fs::create_dir_all(&scratch)?;
+        let absolute = std::path::absolute(&path)?;
+        anyhow::ensure!(
+            absolute.starts_with(&scratch),
+            "live cache must be inside .scratch"
+        );
+        let parent = absolute
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid cache directory"))?;
+        std::fs::create_dir_all(parent)?;
+        anyhow::ensure!(
+            parent.canonicalize()?.starts_with(scratch.canonicalize()?),
+            "live cache escapes scratch"
+        );
+        std::fs::create_dir(&absolute)?; // A fresh directory guarantees no snapshot resume.
+        BENCHMARK_CACHE
+            .set(absolute)
+            .map_err(|_| anyhow::anyhow!("cache already configured"))?;
     }
 
     let requested_volumes = options.volumes;
@@ -473,7 +568,14 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    serve_indexes(indexes, scry_ipc::PIPE_NAME).map_err(Into::into)
+    serve_indexes(
+        indexes,
+        options
+            .benchmark_pipe
+            .as_deref()
+            .unwrap_or(scry_ipc::PIPE_NAME),
+    )
+    .map_err(Into::into)
 }
 
 fn serve_indexes(indexes: VolumeIndexes, pipe_name: &str) -> std::io::Result<()> {
@@ -826,6 +928,9 @@ fn trim_working_set() {
 
 fn snapshot_path(volume: &str) -> std::path::PathBuf {
     let safe: String = volume.chars().filter(|c| c.is_alphanumeric()).collect();
+    if let Some(directory) = BENCHMARK_CACHE.get() {
+        return directory.join(format!("index-{safe}.rkyv"));
+    }
     let app_data = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("APPDATA"))
         .map(std::path::PathBuf::from)
@@ -1310,6 +1415,10 @@ struct RefinementCache {
     order: Order,
     terms: Vec<String>,
     per_volume: Vec<Option<VolumeCandidates>>,
+    last_reused: usize,
+    last_scanned: usize,
+    last_bypassed: bool,
+    last_cancelled: bool,
 }
 
 struct VolumeCandidates {
@@ -1405,11 +1514,17 @@ fn search_indexes_with_cache_with_spans(
     spans: &mut QuerySpans,
 ) -> Vec<ResultEntry> {
     let SearchOptions { limit, order } = options;
+    cache.last_reused = 0;
+    cache.last_scanned = 0;
+    cache.last_bypassed = false;
+    cache.last_cancelled = false;
     if limit == 0 || cancel.is_cancelled() {
         return Vec::new();
     }
     let Some(new_terms) = refinable_terms(kind, query).filter(|_| refinement_cache_enabled())
     else {
+        cache.last_bypassed = true;
+        cache.last_scanned = indexes.len();
         return search_indexes_cancellable_with_spans(indexes, query, options, cancel, spans);
     };
     let refine =
@@ -1451,6 +1566,7 @@ fn search_indexes_with_cache_with_spans(
             .filter(|cached| cached.generation == view.generation);
         let mut name = Vec::new();
         let hits = if let Some(cached) = reused {
+            cache.last_reused += 1;
             cached
                 .hits
                 .iter()
@@ -1477,6 +1593,7 @@ fn search_indexes_with_cache_with_spans(
                 })
                 .collect::<Vec<_>>()
         } else {
+            cache.last_scanned += 1;
             view.search_hits_cancellable_with_spans(
                 query,
                 SearchOptions::ordered(scan_limit, order),
@@ -1649,7 +1766,24 @@ fn handle_request(
         }));
     }
     if req.kind == QueryKind::QueryStats {
-        return Ok(query_metrics().lock().unwrap().report().into_bytes());
+        let mut report = query_metrics().lock().unwrap().report();
+        report.push_str(&format!(
+            "\nindex_volumes={} index_records={} index_delta_events={}",
+            indexes.len(),
+            indexes
+                .iter()
+                .map(|index| index.store.load().len())
+                .sum::<usize>(),
+            indexes
+                .iter()
+                .map(|index| {
+                    let view = index.store.load();
+                    view.delta.added.len() + view.delta.tombstones.count_ones() as usize
+                })
+                .sum::<usize>()
+        ));
+        report.push_str(&format!("\nrefinement_diagnostics=1 last_reused_volumes={} last_scanned_volumes={} last_bypassed={} last_cancelled={}",cache.last_reused,cache.last_scanned,cache.last_bypassed,cache.last_cancelled));
+        return Ok(report.into_bytes());
     }
     let query = match req.kind {
         QueryKind::Prefix => Query::Prefix(req.pattern.clone()),
@@ -1676,6 +1810,7 @@ fn handle_request(
         cache,
         spans,
     );
+    cache.last_cancelled = cancel.is_cancelled();
     let started = std::time::Instant::now();
     let response = encode_results(&entries);
     spans.encode_ns = spans

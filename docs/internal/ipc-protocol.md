@@ -55,6 +55,10 @@ with the generation snapshot taken after consuming a request. A delayed peek of
 that same request must not cancel it. Observations of newer input can still
 cancel in-flight work. This synchronization adds no wire fields.
 
+Statistics include the previous search's cache reuse, scan, bypass and
+cancellation counts for that connection. Reading statistics preserves the
+cache. Clients must drain pending search replies before requesting statistics.
+
 ## Security and compatibility
 
 The elevated daemon creates an explicitly local-accessible pipe so an

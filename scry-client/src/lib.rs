@@ -52,6 +52,10 @@ pub enum SearchExecution {
 }
 
 impl Client {
+    /// The PID reported by Windows for the server end of this connection.
+    pub fn server_process_id(&self) -> anyhow::Result<u32> {
+        Ok(self.pipe.server_process_id()?)
+    }
     /// A daemon creates the next named-pipe instance immediately after
     /// accepting the previous one, but there is a small interval where
     /// `CreateFileW` reports ERROR_FILE_NOT_FOUND rather than PIPE_BUSY.
@@ -376,6 +380,15 @@ impl Client {
 }
 
 impl SearchSession {
+    /// Read diagnostics on this session after all outstanding replies have
+    /// been drained. This is outside the measured query path.
+    pub fn stats(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !self.is_pending(),
+            "drain pending searches before reading statistics"
+        );
+        self.client.stats()
+    }
     pub fn connect(limit: u32) -> anyhow::Result<Self> {
         Ok(Client::connect()?.into_search_session(limit))
     }

@@ -57,6 +57,17 @@ fn exhaustive_counts_match_core_without_top_k_truncation_and_generation_is_priva
         assert!(!a.1.to_string().contains(secret));
     }
     assert!(!a.2["variants"].as_array().unwrap().is_empty());
+    assert_eq!(a.0["generation"]["version"], 2);
+    assert!(a.1["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["shape"] == "negative-substring" && c["matches"] == 0));
+    assert!(a.1["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["shape"] == "broad-path"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     for (n, b) in [
         (0, "lt10"),
