@@ -52,42 +52,31 @@ background work is usually a regression. Performance is part of correctness.
 - **Two client paths:** ordinary named-pipe RPC plus validated read-only local
   execution with automatic RPC fallback.
 
-## Measured behavior
+## Performance
 
-**Measurement set:** recorded for Scry Search `0.1.0-alpha.1`.
+Tests with **about 930,000 files and folders** on a Windows PC with an Intel
+Core i5-13500HX and 16 GiB RAM gave the following results:
 
-These are diagnostic measurements from one Windows development machine, not
-universal promises. Corpus shape, storage, CPU, cache warmth, query, and result
-limit all matter. No numbers below compare Scry with another product.
+| Task | Measured result |
+|---|---:|
+| Build the initial index | 10.8 seconds |
+| Search by the first few letters of a name | 0.4 ms median |
+| Search for text within a name | 8 ms median |
+| Broad single-letter search | 161 ms median |
+| Make a new or renamed file searchable | About half a second median |
+| Memory after ten minutes idle | 55 MiB private memory; 14 MiB resident in RAM |
 
-| Scenario | Corpus | Observed result |
-|---|---:|---:|
-| Steady-connection absent query | ~2.7M records, two volumes, 200 samples | 0.020 ms p50 / 0.334 ms p99 RPC round trip |
-| Selective two-term query, fresh process/connection | ~2.7M records, 200 samples | 21.449 ms p50 / 24.197 ms p99 |
-| Pathological one-byte path term | ~2.7M records, 10 warm samples | 125.33 ms p50 / 246.19 ms p99 |
-| Streaming compaction | 224,231-record base → 236,232-record snapshot | 0.846 s; 29.23 MB peak private commit |
-| Ten-minute idle run after compaction | 236,232 records, 1 Hz sampling | 18.43–18.50 MB private commit; 1.95–3.04 MB working set; zero observed I/O/reindexes/compactions |
-| Idle Task Manager snapshot | current daemon, mapped pages mostly cold | ~3 MB private / ~7 MB total / ~4 MB shared working set |
+During the ten-minute idle test, Scry recorded no measurable CPU time and no
+file read/write activity in its process counters. Windows gradually reclaimed
+resident memory while Scry's private memory stayed around 55 MiB.
 
-Task Manager working-set values are not a fixed idle promise. Active
-`SearchSession`s retain bounded refinement candidates, and recent searches or
-indexing touch memory-mapped snapshot pages that Windows may keep resident for
-a while. Total and shared working set can therefore rise temporarily—sometimes
-substantially—then fall as those pages become cold and the OS reclaims them.
-Private working set and process commit are more useful indicators of memory the
-daemon uniquely owns; mapped pages are shared/reclaimable but still appear in
-the displayed total.
+Search times are from repeated searches returning up to 50 results. Broad
+searches take longer because they match more of the index. Results vary with
+hardware, filenames, folder structure and recent activity; the initial indexing
+test did not clear Windows' disk cache.
 
-The maintained synthetic and live-snapshot probes are ignored tests so normal
-CI stays deterministic. Reproduce the portable suite with:
-
-```powershell
-cargo test --workspace
-cargo bench -p scry-core --bench query
-```
-
-Live-volume measurements require an elevated shell and explicitly supplied
-snapshot or volume; see [internal performance notes](docs/internal/query-latency-baseline.md).
+See the [benchmark guide](docs/internal/benchmarks.md) for the full results,
+test setup and instructions to reproduce them.
 
 ## Install
 
