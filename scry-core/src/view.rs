@@ -89,6 +89,53 @@ mod tests {
     use super::*;
     use crate::delta::{DeltaRecord, ParentRef};
 
+    #[cfg(windows)]
+    mod query_probe {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/query_probe.rs"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "release-mode query memory/latency probe; requires SCRY_BENCH_SNAPSHOT"]
+    fn benchmark_query_scratch_memory() {
+        let path = std::env::var_os("SCRY_BENCH_SNAPSHOT")
+            .expect("set SCRY_BENCH_SNAPSHOT to a synthetic benchmark snapshot");
+        let view = IndexView::new(Arc::new(ArenaStore::open(Path::new(&path)).unwrap()));
+        let query = Query::PathTerms(vec!["one".to_owned()]);
+        query_probe::run("System", view.base.archived().len(), || {
+            view.search(&query, 200)
+        });
+    }
+
+    #[test]
+    #[ignore = "release-mode scratch capacity attribution; requires SCRY_BENCH_SNAPSHOT"]
+    fn benchmark_path_scratch_capacity() {
+        let path = std::env::var_os("SCRY_BENCH_SNAPSHOT")
+            .expect("set SCRY_BENCH_SNAPSHOT to a synthetic benchmark snapshot");
+        let view = IndexView::new(Arc::new(ArenaStore::open(Path::new(&path)).unwrap()));
+        for (label, terms) in [
+            ("common", vec!["one".to_owned()]),
+            ("multi", vec!["one".to_owned(), "report".to_owned()]),
+            ("short", vec!["p".to_owned()]),
+        ] {
+            let query = Query::PathTerms(terms);
+            let hits = view.search_hits(&query, SearchOptions::new(200));
+            PATH_SEARCH_SCRATCH.with(|scratch| {
+                let scratch = scratch.borrow();
+                for (index, set) in scratch.term_sets.iter().enumerate() {
+                    println!("{label}: term={index} interval_bytes={}", set.allocated_bytes());
+                }
+                let fold = [scratch.fold_a.allocated_bytes(), scratch.fold_b.allocated_bytes()];
+                println!("{label}: records={} hits={} fold_bytes={fold:?} heap_bytes={} own_match_bytes={} candidate_bytes={} name_bytes={}",
+                    view.base.archived().len(), hits.len(), scratch.heap.capacity() * std::mem::size_of::<u64>(),
+                    scratch.own_matches.capacity(), scratch.candidate_blocks.capacity() * std::mem::size_of::<u32>() + scratch.candidate_bitmap.capacity() + scratch.trigram_hashes.capacity() * std::mem::size_of::<usize>(), scratch.name.capacity());
+            });
+        }
+    }
+
     /// The bounded top-k heap only bounds output; an unclamped caller-supplied
     /// limit would still let a one-character query size its intermediate
     /// state to the whole index.
@@ -1728,6 +1775,47 @@ mod tests {
     }
 
     #[test]
+    fn large_path_queries_release_scratch_and_small_queries_remain_reusable() {
+        let (_dir, view) = base_view(150_000);
+        let small = Query::PathTerms(vec!["match_000".to_owned()]);
+        let expected_small = view.search(&small, 50);
+        PATH_SEARCH_SCRATCH.with(|scratch| {
+            let bytes = scratch.borrow().allocated_bytes();
+            assert!(bytes > 0 && bytes <= PATH_SCRATCH_RETAINED_BYTES);
+        });
+        let broad = Query::PathTerms(vec!["match".to_owned()]);
+        let first = view.search(&broad, 200);
+        assert_eq!(first.len(), 200);
+        PATH_SEARCH_SCRATCH.with(|scratch| assert_eq!(scratch.borrow().allocated_bytes(), 0));
+        assert_eq!(view.search(&broad, 200), first);
+        PATH_SEARCH_SCRATCH.with(|scratch| assert_eq!(scratch.borrow().allocated_bytes(), 0));
+        assert_eq!(view.search(&small, 50), expected_small);
+        PATH_SEARCH_SCRATCH.with(|scratch| {
+            assert!(scratch.borrow().allocated_bytes() <= PATH_SCRATCH_RETAINED_BYTES);
+        });
+    }
+
+    #[test]
+    fn cancelled_path_query_releases_oversized_scratch() {
+        let (_dir, view) = base_view(20);
+        PATH_SEARCH_SCRATCH.with(|scratch| {
+            scratch.borrow_mut().own_matches = vec![0; PATH_SCRATCH_RETAINED_BYTES + 1];
+        });
+        let generation = AtomicU64::new(1);
+        let hits = search_path_terms_filtered_cancellable(
+            view.base.archived(),
+            &view.delta,
+            &["match".to_owned()],
+            &QueryFilter::default(),
+            SearchOptions::new(10),
+            Some(Cancellation::new(&generation, 0)),
+            1,
+        );
+        assert!(hits.is_empty());
+        PATH_SEARCH_SCRATCH.with(|scratch| assert_eq!(scratch.borrow().allocated_bytes(), 0));
+    }
+
+    #[test]
     fn query_spans_are_opt_in_and_capture_search_work() {
         let (_dir, view) = base_view(100);
         let query = Query::Substring("match".into());
@@ -2672,6 +2760,10 @@ pub fn materialize_hits(
 /// Tiny final DFS sets use direct name decoding without candidate staging.
 const SPARSE_PATH_HITS: u64 = 1024;
 
+/// Retained per-thread query scratch, excluding caller-owned output and live
+/// in-flight work. Large queries release their buffers before returning.
+const PATH_SCRATCH_RETAINED_BYTES: usize = 1024 * 1024;
+
 /// Sparse enumeration stages only record IDs, in bounded batches. No paths,
 /// names, or per-match objects survive a bucket visit.
 const PATH_RECORD_BATCH: usize = 4096;
@@ -2800,6 +2892,29 @@ struct PathSearchScratch {
 }
 
 impl PathSearchScratch {
+    fn allocated_bytes(&self) -> usize {
+        self.term_sets.capacity() * std::mem::size_of::<crate::intervals::IntervalSet>()
+            + self
+                .term_sets
+                .iter()
+                .map(crate::intervals::IntervalSet::allocated_bytes)
+                .sum::<usize>()
+            + self.fold_a.allocated_bytes()
+            + self.fold_b.allocated_bytes()
+            + self.candidate_blocks.capacity() * std::mem::size_of::<u32>()
+            + self.candidate_bitmap.capacity()
+            + self.trigram_hashes.capacity() * std::mem::size_of::<usize>()
+            + self.own_matches.capacity()
+            + self.heap.capacity() * std::mem::size_of::<u64>()
+            + self.name.capacity()
+    }
+
+    fn release_excess(&mut self) {
+        if self.allocated_bytes() > PATH_SCRATCH_RETAINED_BYTES {
+            *self = Self::default();
+        }
+    }
+
     fn reset(&mut self, term_count: usize, limit: usize) {
         self.term_sets.resize_with(term_count, Default::default);
         for set in self.term_sets.iter_mut().take(term_count) {
@@ -3231,17 +3346,20 @@ fn search_path_terms_filtered_cancellable(
     threads: usize,
 ) -> Vec<Hit> {
     PATH_SEARCH_SCRATCH.with(|scratch| {
-        search_path_terms_with_scratch(
+        let mut scratch = scratch.borrow_mut();
+        let hits = search_path_terms_with_scratch(
             arena,
             delta,
             terms,
             filter,
             options,
-            &mut scratch.borrow_mut(),
+            &mut scratch,
             true,
             cancel,
             threads,
-        )
+        );
+        scratch.release_excess();
+        hits
     })
 }
 
