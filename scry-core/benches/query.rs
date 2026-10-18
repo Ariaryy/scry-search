@@ -261,6 +261,39 @@ fn sparse_path_terms(c: &mut Criterion) {
     group.finish();
 }
 
+/// Keep the API and output identical while changing worker count. Cover both
+/// the visible result page and the larger refinement heap.
+fn dense_path_threads(c: &mut Criterion) {
+    let (view, _dir) = corpus();
+    let mut group = c.benchmark_group("path_dense_threads");
+    for (label, term, limit) in [
+        ("common_hits_200", INFIX_COMMON, 200),
+        ("common_hits_20000", INFIX_COMMON, 20_000),
+        ("short_hits_200", "p", 200),
+    ] {
+        let query = Query::PathTerms(vec![term.to_owned()]);
+        let options = scry_core::view::SearchOptions::new(limit);
+        let expected = view.search_hits_cancellable(&query, options, None, 1);
+        for threads in [1, 2, 4] {
+            assert_eq!(
+                view.search_hits_cancellable(&query, options, None, threads),
+                expected
+            );
+            group.bench_with_input(BenchmarkId::new(label, threads), &threads, |b, &threads| {
+                b.iter(|| {
+                    black_box(view.search_hits_cancellable(
+                        black_box(&query),
+                        options,
+                        None,
+                        threads,
+                    ))
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 fn other_query_kinds(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut prefix = c.benchmark_group("prefix");
@@ -379,6 +412,7 @@ criterion_group!(
     selectivity,
     path_terms,
     sparse_path_terms,
+    dense_path_threads,
     other_query_kinds,
     fixed_costs,
     materialize

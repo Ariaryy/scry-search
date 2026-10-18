@@ -1526,6 +1526,39 @@ mod tests {
     }
 
     #[test]
+    fn dense_record_bitmap_preserves_dfs_membership_and_partial_bytes() {
+        let (_dir, view) = base_view(258);
+        let arena = view.base.archived();
+        assert!(!arena.len().is_multiple_of(8));
+        for stride in [1, 3, 31, arena.len() + 1] {
+            let mut runs = crate::intervals::IntervalSet::default();
+            for position in (0..arena.len() as u32).step_by(stride) {
+                runs.push_point(position);
+            }
+            runs.coalesce();
+            let bits = path_record_bitmap(arena, &runs, None).unwrap();
+            assert_eq!(bits.len(), arena.len().div_ceil(8));
+            for record in 0..arena.len() as u32 {
+                assert_eq!(
+                    bits[record as usize / 8] & (1 << (record % 8)) != 0,
+                    runs.contains(arena.dfs_position(record)),
+                    "stride={stride}, record={record}"
+                );
+            }
+            for unused in arena.len()..bits.len() * 8 {
+                assert_eq!(bits[unused / 8] & (1 << (unused % 8)), 0);
+            }
+        }
+        let empty = crate::intervals::IntervalSet::default();
+        let bits = path_record_bitmap(arena, &empty, None).unwrap();
+        assert!(bits.iter().all(|&byte| byte == 0));
+        let generation = AtomicU64::new(1);
+        assert!(
+            path_record_bitmap(arena, &empty, Some(Cancellation::new(&generation, 0))).is_none()
+        );
+    }
+
+    #[test]
     fn path_candidate_visits_cover_batch_density_and_bucket_boundaries() {
         let (_dir, view) = base_view(150_000);
         let arena = view.base.archived();
@@ -2843,16 +2876,9 @@ fn visit_path_candidate_names(
 
     // Dense results retain the linear bitmap walk. Keep this local so index-
     // sized storage never remains in a long-lived connection's scratch.
-    let mut matches = vec![0u8; arena.len().div_ceil(8)];
-    for &(start, end) in runs.runs() {
-        for position in start..end {
-            if is_cancelled_periodically(cancel, &mut checked) {
-                return false;
-            }
-            let record = arena.dfs_record(position);
-            matches[record as usize / 8] |= 1 << (record % 8);
-        }
-    }
+    let Some(matches) = path_record_bitmap(arena, runs, cancel) else {
+        return false;
+    };
     const BUCKET_BYTES: usize = crate::record::BUCKET_SIZE / 8;
     for (bucket, bits) in matches.chunks(BUCKET_BYTES).enumerate() {
         if bits.iter().all(|&byte| byte == 0) {
@@ -2872,6 +2898,34 @@ fn visit_path_candidate_names(
         });
     }
     true
+}
+
+/// Convert DFS intervals to record membership once. Dense workers borrow the
+/// same bitmap; it is released with the query rather than retained in scratch.
+fn path_record_bitmap(
+    arena: &crate::ArchivedArena,
+    runs: &crate::intervals::IntervalSet,
+    cancel: Option<Cancellation>,
+) -> Option<Vec<u8>> {
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return None;
+    }
+    let mut matches = vec![0u8; arena.len().div_ceil(8)];
+    let mut checked = 0;
+    for &(start, end) in runs.runs() {
+        for position in start..end {
+            if is_cancelled_periodically(cancel, &mut checked) {
+                return None;
+            }
+            let record = arena.dfs_record(position);
+            matches[record as usize / 8] |= 1 << (record % 8);
+        }
+    }
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        None
+    } else {
+        Some(matches)
+    }
 }
 
 #[derive(Default)]
@@ -3583,6 +3637,8 @@ fn retain_dense_path_hits_parallel(
     cancel: Option<Cancellation>,
     threads: usize,
 ) -> Option<BinaryHeap<u64>> {
+    let matches = path_record_bitmap(arena, runs, cancel)?;
+    let matches = &matches;
     let ranges: Vec<_> = crate::query::bucket_shards(arena.len(), threads).collect();
     let heaps: Vec<_> = ranges
         .iter()
@@ -3602,7 +3658,7 @@ fn retain_dense_path_hits_parallel(
                                 return std::ops::ControlFlow::Break(());
                             }
                             if delta.tombstones.get(record)
-                                || !runs.contains(arena.dfs_position(record))
+                                || matches[record as usize / 8] & (1 << (record % 8)) == 0
                                 || !record_matches_filter(arena, delta, record, name, filter)
                             {
                                 return std::ops::ControlFlow::Continue(());
