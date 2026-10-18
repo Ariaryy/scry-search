@@ -58,6 +58,13 @@ impl Pipe {
 }
 
 impl Pipe {
+    pub fn server_process_id(&self) -> io::Result<u32> {
+        let mut process_id = 0;
+        if unsafe { ffi::GetNamedPipeServerProcessId(self.0, &mut process_id) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(process_id)
+    }
     pub fn client_process_id(&self) -> io::Result<u32> {
         let mut process_id = 0;
         let ok = unsafe { ffi::GetNamedPipeClientProcessId(self.0, &mut process_id) };

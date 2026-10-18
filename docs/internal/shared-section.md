@@ -33,3 +33,9 @@ for result frames.
 Required invariants are covered by section round-trips and replacement tests,
 bounded generation caching, failed-remap fallback, and local-versus-RPC search
 equivalence with a non-empty overlay.
+
+The client exposes `search_local_ordered_with_execution` for callers that need
+the actual route of a completed search: `SearchExecution::SharedIndex` or
+`SearchExecution::RpcFallback`. The existing methods discard this diagnostic
+and retain their result-only signatures. This adds no wire fields and does not
+change mapping validation, retry timing, or fallback behavior.

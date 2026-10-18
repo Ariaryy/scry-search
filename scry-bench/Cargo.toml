@@ -1,0 +1,17 @@
+[package]
+name = "scry-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+scry-client = { path = "../scry-client" }
+scry-core = { path = "../scry-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+scry-ipc = { path = "../scry-ipc" }

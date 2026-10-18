@@ -2,6 +2,7 @@
 *.idx
 /plans/
 /.tokensave/
+/.scratch/
 
 .claude/
 .serena/

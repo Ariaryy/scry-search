@@ -109,6 +109,7 @@ extern "system" {
         options: Dword,
     ) -> Bool;
     pub fn GetNamedPipeClientProcessId(pipe: Handle, client_process_id: *mut Dword) -> Bool;
+    pub fn GetNamedPipeServerProcessId(pipe: Handle, server_process_id: *mut Dword) -> Bool;
     #[cfg(test)]
     pub fn GetProcessHandleCount(process: Handle, handle_count: *mut Dword) -> Bool;
 

@@ -1,0 +1,18 @@
+{
+  "corpus": {
+    "label": "operator-described-corpus",
+    "records": null,
+    "volumes": null,
+    "delta_state": "unknown",
+    "cache_state": "OS cache uncontrolled; queries warm pages during run"
+  },
+  "cases": [
+    {"label":"independent","shape":"replacement","kind":"path_terms","order":"relevance","patterns":["a","report","zqxjv_no_match"]},
+    {"label":"typing","shape":"typing-backspace-replacement","kind":"path_terms","order":"relevance","patterns":["r","re","rep","repo","report","repo","re","archive"],"cadence_ms":30},
+    {"label":"superseding","shape":"latest-wins-burst","kind":"path_terms","order":"relevance","patterns":["r","re","rep","report"],"supersede":true},
+    {"label":"prefix","shape":"prefix-1-3-5","kind":"prefix","order":"relevance","patterns":["a","arc","archi"]},
+    {"label":"substring","shape":"substring-short-long-negative","kind":"substring","order":"relevance","patterns":["a","re","report","zqxjv_no_match"]},
+    {"label":"wildcard","shape":"wildcard-extension","kind":"wildcard","order":"relevance","patterns":["*.txt","*report*"]},
+    {"label":"filters","shape":"metadata-only","kind":"path_terms","order":"largest","patterns":["ext:txt","size:>1kb"]}
+  ]
+}
