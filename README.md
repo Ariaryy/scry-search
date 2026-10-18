@@ -35,13 +35,20 @@ index, saved state, ranking and update tracking.
 
 ## Features
 
+- Index large collections: about 930,000 files and folders in 10.8 seconds in
+  the reference test.
+- Leave it running in the background: 55 MiB of private memory and 14 MiB
+  resident in RAM after ten minutes idle, with no measurable CPU time.
 - Search names and folder paths, with prefix, substring, wildcard and regex
   matching. Filter by file type, extension, size or age, and choose the result order.
-- Find new and renamed files without rebuilding the whole index for each change.
+- Find new and renamed files in about half a second (median in the reference
+  test), without rebuilding the whole index for each change.
 - Search as you type. A persistent `SearchSession` cancels outdated requests and
   lets your UI check for results without blocking.
 - Reuse one local index from the CLI or an application. The Rust client supports
   both daemon queries and read-only shared search with automatic fallback.
+
+See [performance](#performance) for the hardware, workload and measurement limits.
 
 ## Install
 
