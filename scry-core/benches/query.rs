@@ -223,6 +223,44 @@ fn path_terms(c: &mut Criterion) {
     group.finish();
 }
 
+/// Keep the survivor count fixed while varying index size and name-bucket
+/// locality. This catches whole-index enumeration costs hidden by selectivity.
+fn sparse_path_terms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path_sparse");
+    for files in [440_000usize, 2_700_000] {
+        let mut builder = Arena::builder();
+        let root = builder.push("V:", 0, true);
+        let clustered = builder.push("sparse_clustered", 0, true);
+        let scattered = builder.push("sparse_scattered", 0, true);
+        builder.set_parent(clustered, root);
+        builder.set_parent(scattered, root);
+        let stride = (files - 1025) / 1025;
+        for index in 0..files {
+            let record = builder.push(&format!("leaf_{index:09}.bin"), 0, false);
+            let parent = if index < 1025 {
+                clustered
+            } else if (index - 1025).is_multiple_of(stride) && (index - 1025) / stride < 1025 {
+                scattered
+            } else {
+                root
+            };
+            builder.set_parent(record, parent);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("sparse.rkyv");
+        scry_core::store::save(&builder.build().0, &snapshot).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&snapshot).unwrap()));
+        for term in ["sparse_clustered", "sparse_scattered"] {
+            let query = Query::PathTerms(vec![term.to_owned()]);
+            assert_eq!(view.search(&query, 2000).len(), 1026);
+            group.bench_with_input(BenchmarkId::new(term, files), &query, |b, query| {
+                b.iter(|| black_box(view.search(black_box(query), 1)))
+            });
+        }
+    }
+    group.finish();
+}
+
 fn other_query_kinds(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut prefix = c.benchmark_group("prefix");
@@ -340,6 +378,7 @@ criterion_group!(
     benches,
     selectivity,
     path_terms,
+    sparse_path_terms,
     other_query_kinds,
     fixed_costs,
     materialize
