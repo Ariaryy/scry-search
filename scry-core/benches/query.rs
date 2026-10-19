@@ -207,19 +207,17 @@ fn selectivity(c: &mut Criterion) {
 fn path_terms(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut group = c.benchmark_group("path_terms");
-    let cases: [(&str, Vec<&str>); 7] = [
+    let cases: [(&str, Vec<&str>); 9] = [
         ("no_match", vec!["zzzznomatchqqqq"]),
         ("rare", vec![INFIX_RARE]),
         ("clustered", vec![PREFIX_CLUSTERED]),
         ("mid", vec![INFIX_MID]),
         ("common", vec![INFIX_COMMON]),
-        // The point of these two: each term's interval set is built from an
-        // independent scan (never a unioned candidate-block set — see the
-        // CLAUDE.md rule about not intersecting trigram blocks across
-        // terms), but the final intersection is ordered smallest-set-first,
-        // so a query containing a rare term costs close to what the rare
-        // term alone costs, not what its least selective term costs.
+        // Cover selective ancestry verification as well as the exhaustive
+        // interval fold. Trigram blocks remain independent per term.
         ("rare+common", vec![INFIX_RARE, INFIX_COMMON]),
+        ("rare+short", vec![INFIX_RARE, "a"]),
+        ("broad+short", vec![PREFIX_CLUSTERED, "a"]),
         ("mid+clustered", vec![INFIX_MID, PREFIX_CLUSTERED]),
     ];
     for (label, terms) in cases {
