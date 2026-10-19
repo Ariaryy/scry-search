@@ -68,6 +68,9 @@ Dense parallel ranking builds one such bitmap and shares it read-only across
 workers, avoiding a binary search over DFS intervals for each decoded record.
 The bitmap uses `ceil(base_records / 8)` bytes in total, independent of worker
 count, and is released on completion or cancellation.
+The serial bitmap visitor polls cancellation before every bucket, including
+empty buckets, and after the final bucket. Each bucket decodes at most 32
+records; this bounds traversal work between polls, not wall-clock latency.
 
 Each term's interval set coalesces queued spans in the same allocation as its
 settled runs. Reusable path-search scratch has an aggregate 1 MiB capacity

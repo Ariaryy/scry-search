@@ -1715,6 +1715,73 @@ mod tests {
         assert!((1..=crate::record::BUCKET_SIZE).contains(&visited));
     }
 
+    #[test]
+    fn dense_path_cancellation_stops_at_the_next_bucket() {
+        let (_dir, view) = base_view(4100);
+        let arena = view.base.archived();
+        let mut runs = crate::intervals::IntervalSet::default();
+        runs.push_span(0, arena.len() as u32);
+        runs.coalesce();
+        assert!(!use_path_record_batches(arena.len(), runs.len_positions()));
+        for signal_at in [1, 31, 32, 33, arena.len()] {
+            let generation = AtomicU64::new(0);
+            let mut visited = 0;
+            let completed = visit_path_candidate_names(
+                arena,
+                &runs,
+                &mut Vec::new(),
+                Some(Cancellation::new(&generation, 0)),
+                |_, _, _| {
+                    visited += 1;
+                    if visited == signal_at {
+                        generation.store(1, AtomicOrdering::Relaxed);
+                    }
+                },
+            );
+            // The caller discards its partial heap when completion is false.
+            assert!(!completed, "signal_at={signal_at}");
+            assert!(visited >= signal_at);
+            assert!(visited - signal_at < crate::record::BUCKET_SIZE);
+        }
+    }
+
+    #[test]
+    fn dense_path_cancellation_polls_inside_empty_bitmap_regions() {
+        let (_dir, view) = base_view(4100);
+        let arena = view.base.archived();
+        for occupied_edges in [false, true] {
+            let mut bits = vec![0u8; arena.len().div_ceil(8)];
+            if occupied_edges {
+                bits[0] = 1;
+                let last = arena.len() - 1;
+                bits[last / 8] |= 1 << (last % 8);
+            }
+            // Trigger the generation change at different points inside a long
+            // empty region. No sleeps or scheduling races are involved.
+            for signal_poll in [2, 33, 64, 100] {
+                let generation = AtomicU64::new(0);
+                let cancel = Cancellation::new(&generation, 0);
+                let mut polls = 0;
+                let mut visited = 0;
+                assert!(!visit_path_bitmap_names(
+                    arena,
+                    &bits,
+                    &mut Vec::new(),
+                    || {
+                        polls += 1;
+                        if polls == signal_poll {
+                            generation.store(1, AtomicOrdering::Relaxed);
+                        }
+                        cancel.is_cancelled()
+                    },
+                    |_, _, _| visited += 1,
+                ));
+                assert_eq!(polls, signal_poll);
+                assert_eq!(visited, usize::from(occupied_edges));
+            }
+        }
+    }
+
     /// The same matches take the bitmap route in the compact corpus and
     /// bounded batches with unrelated padding. Check both against full paths,
     /// across orders, metadata filters, limits, threads and live overlays.
@@ -2981,13 +3048,33 @@ fn visit_path_candidate_names(
     let Some(matches) = path_record_bitmap(arena, runs, cancel) else {
         return false;
     };
+    visit_path_bitmap_names(
+        arena,
+        &matches,
+        name,
+        || cancel.is_some_and(|cancel| cancel.is_cancelled()),
+        visit,
+    )
+}
+
+/// Poll before every bitmap bucket, including empty ones. Each decode covers
+/// at most BUCKET_SIZE records, so cancellation cannot skip a long empty run
+/// or accumulate a record counter in bucket units. The final poll also covers
+/// cancellation during the last (possibly partial) bucket.
+fn visit_path_bitmap_names(
+    arena: &crate::ArchivedArena,
+    matches: &[u8],
+    name: &mut Vec<u8>,
+    mut is_cancelled: impl FnMut() -> bool,
+    mut visit: impl FnMut(u32, &[u8], bool),
+) -> bool {
     const BUCKET_BYTES: usize = crate::record::BUCKET_SIZE / 8;
     for (bucket, bits) in matches.chunks(BUCKET_BYTES).enumerate() {
+        if is_cancelled() {
+            return false;
+        }
         if bits.iter().all(|&byte| byte == 0) {
             continue;
-        }
-        if is_cancelled_periodically(cancel, &mut checked) {
-            return false;
         }
         let start = (bucket * crate::record::BUCKET_SIZE) as u32;
         let end = start + crate::record::BUCKET_SIZE as u32;
@@ -3008,7 +3095,7 @@ fn visit_path_candidate_names(
             },
         );
     }
-    true
+    !is_cancelled()
 }
 
 /// Convert DFS intervals to record membership once. Dense workers borrow the
