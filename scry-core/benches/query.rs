@@ -91,6 +91,10 @@ fn synth_name(rng: &mut Rng, ordinal: usize) -> String {
 /// the builder-side ones. Benchmarking the in-memory `Arena` would measure
 /// something the daemon never runs.
 fn corpus() -> (IndexView, tempfile::TempDir) {
+    corpus_with_repeated_names(false)
+}
+
+fn corpus_with_repeated_names(repeated: bool) -> (IndexView, tempfile::TempDir) {
     let mut rng = Rng(0x5EED_1234_5678_9ABC);
     let mut builder = Arena::builder();
     let root = builder.push("V:", 0, true);
@@ -129,7 +133,11 @@ fn corpus() -> (IndexView, tempfile::TempDir) {
 
     for index in 0..FILES {
         let parent = dirs[rng.below(dirs.len())];
-        let name = synth_name(&mut rng, index);
+        let name = if repeated {
+            format!("record_{:08}_report.bin", index / 4)
+        } else {
+            synth_name(&mut rng, index)
+        };
         let node = builder.push(&name, 1_700_000_000, false);
         builder.set_parent(node, parent);
     }
@@ -294,6 +302,39 @@ fn dense_path_threads(c: &mut Criterion) {
     group.finish();
 }
 
+/// Four byte-identical copies per file name; metadata/ancestry still belongs
+/// to individual records. Historical all-distinct corpus generation is kept.
+fn repeated_name_queries(c: &mut Criterion) {
+    let (view, _dir) = corpus_with_repeated_names(true);
+    let mut group = c.benchmark_group("repeated_names");
+    for (label, query) in [
+        ("path_short", Query::PathTerms(vec!["p".into()])),
+        ("path_report", Query::PathTerms(vec!["report".into()])),
+        ("substring_short", Query::Substring("p".into())),
+        ("substring_report", Query::Substring("report".into())),
+    ] {
+        let options = scry_core::view::SearchOptions::new(200);
+        let expected = view.search_hits_cancellable(&query, options, None, 1);
+        for threads in [1, 4] {
+            assert_eq!(
+                view.search_hits_cancellable(&query, options, None, threads),
+                expected
+            );
+            group.bench_with_input(BenchmarkId::new(label, threads), &threads, |b, &threads| {
+                b.iter(|| {
+                    black_box(view.search_hits_cancellable(
+                        black_box(&query),
+                        options,
+                        None,
+                        threads,
+                    ))
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 fn other_query_kinds(c: &mut Criterion) {
     let (view, _dir) = corpus();
     let mut prefix = c.benchmark_group("prefix");
@@ -413,6 +454,7 @@ criterion_group!(
     path_terms,
     sparse_path_terms,
     dense_path_threads,
+    repeated_name_queries,
     other_query_kinds,
     fixed_costs,
     materialize

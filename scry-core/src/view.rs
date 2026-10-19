@@ -277,6 +277,80 @@ mod tests {
     }
 
     #[test]
+    fn repeated_names_keep_record_specific_ranking_and_tombstones() {
+        let (_dir, view) = streaming_corpus_with_repeats(true);
+        for query in [
+            Query::Substring("ne".into()),
+            Query::Substring("needle".into()),
+            Query::Substring("0005".into()),
+            Query::Substring("absent".into()),
+            Query::Regex(".*".into()),
+            Query::Regex(r"^needle_000[15]\.dat$".into()),
+        ] {
+            for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                for limit in [0, 1, 5, 1000] {
+                    let expected = collect_then_rank(&view, &query, order, limit);
+                    for threads in [1, 2, 4, 8] {
+                        assert_eq!(
+                            view.search_hits_cancellable(
+                                &query,
+                                SearchOptions::ordered(limit, order),
+                                None,
+                                threads
+                            ),
+                            expected,
+                            "{query:?}, {order:?}, limit={limit}, threads={threads}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_candidate_names_reset_after_skipped_records() {
+        let (_dir, view) = streaming_corpus_with_repeats(true);
+        let arena = view.base.archived();
+        for sparse in [false, true] {
+            let records: Vec<_> = (0..arena.len() as u32)
+                .filter(|&record| {
+                    if sparse {
+                        [2, 87, 173].contains(&record)
+                    } else {
+                        record % 5 == 3
+                    }
+                })
+                .collect();
+            let mut runs = crate::intervals::IntervalSet::default();
+            for &record in &records {
+                runs.push_point(arena.dfs_position(record));
+            }
+            runs.coalesce();
+            assert_eq!(
+                use_path_record_batches(arena.len(), runs.len_positions()),
+                sparse
+            );
+            let mut previous = None;
+            let mut actual = Vec::new();
+            assert!(visit_path_candidate_names(
+                arena,
+                &runs,
+                &mut Vec::new(),
+                None,
+                |record, name, repeated| {
+                    if repeated {
+                        assert_eq!(previous.as_deref(), Some(name));
+                    }
+                    previous = Some(name.to_vec());
+                    actual.push(record);
+                }
+            ));
+            actual.sort_unstable();
+            assert_eq!(actual, records);
+        }
+    }
+
+    #[test]
     fn largest_places_incomplete_directory_after_exact_file() {
         let mut builder = crate::ArenaBuilder::default();
         let root = builder.push("root", 0, true);
@@ -316,13 +390,17 @@ mod tests {
     /// polluting the heap), and a live delta addition (so the merge with
     /// delta-added records is exercised alongside the streamed base match).
     fn streaming_corpus() -> (tempfile::TempDir, IndexView) {
+        streaming_corpus_with_repeats(false)
+    }
+
+    fn streaming_corpus_with_repeats(repeated: bool) -> (tempfile::TempDir, IndexView) {
         let mut builder = crate::ArenaBuilder::default();
         let root = builder.push("C:", 0, true);
         for i in 0..300u32 {
             let mtime = 1_000 + i;
             let size = ((i % 17) as u64 + 1) * 4_096;
             let child = builder.push_bytes_with_metadata(
-                format!("needle_{i:04}.dat").as_bytes(),
+                format!("needle_{:04}.dat", if repeated { i % 7 } else { i }).as_bytes(),
                 mtime,
                 false,
                 None,
@@ -364,7 +442,33 @@ mod tests {
         let mut heap = BinaryHeap::new();
         let needs_name = !order.needs_metadata();
         let mut name = Vec::new();
-        for index in crate::query::search_base(arena, query, usize::MAX) {
+        let regex = match query {
+            Query::Regex(pattern) => Regex::builder()
+                .syntax(syntax::Config::new().case_insensitive(true))
+                .build(pattern)
+                .ok(),
+            _ => None,
+        };
+        let substring_lower = match query {
+            Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
+            _ => None,
+        };
+        for index in 0..arena.len() as u32 {
+            arena.name_into(index, &mut name);
+            let matched = match query {
+                Query::Prefix(prefix) => ascii::starts_with_ci(&name, prefix.as_bytes()),
+                Query::Substring(_) => {
+                    ascii::contains_ci(&name, substring_lower.as_ref().unwrap().as_bytes())
+                }
+                Query::Regex(_) => regex
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.is_match(&name)),
+                _ => unreachable!(),
+            };
+            if !matched {
+                continue;
+            }
+
             if delta.tombstones.get(index) {
                 continue;
             }
@@ -380,17 +484,6 @@ mod tests {
                 limit,
             );
         }
-        let regex = match query {
-            Query::Regex(pattern) => Regex::builder()
-                .syntax(syntax::Config::new().case_insensitive(true))
-                .build(pattern)
-                .ok(),
-            _ => None,
-        };
-        let substring_lower = match query {
-            Query::Substring(needle) => Some(needle.to_ascii_lowercase()),
-            _ => None,
-        };
         for (index, record) in delta.live_added() {
             let matched = match query {
                 Query::Prefix(prefix) => {
@@ -1590,7 +1683,7 @@ mod tests {
                 &runs,
                 &mut name,
                 None,
-                |record, name| {
+                |record, name, _| {
                     let mut expected_name = Vec::new();
                     arena.name_into(record, &mut expected_name);
                     assert_eq!(name, expected_name);
@@ -1614,7 +1707,7 @@ mod tests {
             &runs,
             &mut name,
             Some(cancel),
-            |_, _| {
+            |_, _, _| {
                 visited += 1;
                 generation.store(1, AtomicOrdering::Relaxed);
             }
@@ -1656,9 +1749,9 @@ mod tests {
                     file += 1;
                     let extension = if leaf % 2 == 0 { "txt" } else { "bin" };
                     let leaf_name = if leaf % 5 == 0 {
-                        format!("zone_leaf_{group:02}_{sub}_{leaf:02}.{extension}")
+                        format!("zone_leaf_{leaf:02}.{extension}")
                     } else {
-                        format!("leaf_{group:02}_{sub}_{leaf:02}.{extension}")
+                        format!("leaf_{leaf:02}.{extension}")
                     };
                     let record = builder.push_bytes_with_metadata(
                         leaf_name.as_bytes(),
@@ -2813,7 +2906,7 @@ fn visit_path_record_batch(
     records: &mut [u32],
     name: &mut Vec<u8>,
     cancel: Option<Cancellation>,
-    visit: &mut impl FnMut(u32, &[u8]),
+    visit: &mut impl FnMut(u32, &[u8], bool),
 ) -> bool {
     records.sort_unstable();
     let mut remaining = &*records;
@@ -2829,16 +2922,25 @@ fn visit_path_record_batch(
         let mask = bucket
             .iter()
             .fold(0u32, |mask, &record| mask | (1 << (record - start)));
-        arena.for_each_name_in_buf(first..last + 1, name, |record, record_name| {
-            if mask & (1 << (record - start)) != 0 {
-                visit(record, record_name);
-            }
-            if record == last {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
-            }
-        });
+        let mut can_reuse = false;
+        arena.for_each_name_in_buf_with_repeats(
+            first..last + 1,
+            name,
+            |record, record_name, repeated| {
+                if !repeated {
+                    can_reuse = false;
+                }
+                if mask & (1 << (record - start)) != 0 {
+                    visit(record, record_name, can_reuse);
+                    can_reuse = true;
+                }
+                if record == last {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        );
         remaining = rest;
     }
     true
@@ -2851,7 +2953,7 @@ fn visit_path_candidate_names(
     runs: &crate::intervals::IntervalSet,
     name: &mut Vec<u8>,
     cancel: Option<Cancellation>,
-    mut visit: impl FnMut(u32, &[u8]),
+    mut visit: impl FnMut(u32, &[u8], bool),
 ) -> bool {
     let mut checked = 0;
     if use_path_record_batches(arena.len(), runs.len_positions()) {
@@ -2889,13 +2991,22 @@ fn visit_path_candidate_names(
         }
         let start = (bucket * crate::record::BUCKET_SIZE) as u32;
         let end = start + crate::record::BUCKET_SIZE as u32;
-        arena.for_each_name_in_buf(start..end, name, |record, record_name| {
-            let offset = (record - start) as usize;
-            if bits[offset / 8] & (1 << (offset % 8)) != 0 {
-                visit(record, record_name);
-            }
-            std::ops::ControlFlow::Continue(())
-        });
+        let mut can_reuse = false;
+        arena.for_each_name_in_buf_with_repeats(
+            start..end,
+            name,
+            |record, record_name, repeated| {
+                if !repeated {
+                    can_reuse = false;
+                }
+                let offset = (record - start) as usize;
+                if bits[offset / 8] & (1 << (offset % 8)) != 0 {
+                    visit(record, record_name, can_reuse);
+                    can_reuse = true;
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
     }
     true
 }
@@ -3163,6 +3274,7 @@ fn search_ranked_cancellable_with_spans(
     let mut heap = match query {
         Query::Substring(_) | Query::Regex(_) => {
             let select_started = spans.as_ref().map(|_| std::time::Instant::now());
+            let mut name_rank = None;
             let (heap, seen) = crate::query::search_ranked_streaming(
                 arena,
                 query,
@@ -3170,12 +3282,16 @@ fn search_ranked_cancellable_with_spans(
                 threads,
                 cancel,
                 spans.as_deref_mut(),
-                |index, name| {
+                move |index, name, repeated| {
+                    if !repeated {
+                        name_rank = None;
+                    }
                     if delta.tombstones.get(index) {
                         return None;
                     }
                     let (quality, name_len) = if needs_name {
-                        (match_quality(query, name), name.len() as u32)
+                        *name_rank
+                            .get_or_insert_with(|| (match_quality(query, name), name.len() as u32))
                     } else {
                         (0, 0)
                     };
@@ -3439,12 +3555,16 @@ fn build_short_single_term_set(
     if threads <= 1 || arena.len() < crate::record::BUCKET_SIZE * 2 {
         let mut checked = 0u32;
         let mut cancelled = false;
-        arena.for_each_name(|record, name| {
+        let mut matched = false;
+        arena.for_each_name_with_repeats(|record, name, repeated| {
             if is_cancelled_periodically(cancel, &mut checked) {
                 cancelled = true;
                 return std::ops::ControlFlow::Break(());
             }
-            if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
+            if !repeated {
+                matched = ascii::contains_ci(name, term_lower);
+            }
+            if !delta.tombstones.get(record) && matched {
                 own_matches[record as usize / 8] |= 1 << (record % 8);
             }
             std::ops::ControlFlow::Continue(())
@@ -3468,19 +3588,24 @@ fn build_short_single_term_set(
                         .spawn_scoped(scope, move || {
                             let mut checked = 0u32;
                             let mut cancelled = false;
-                            arena.for_each_name_in(start..end, |record, name| {
-                                if is_cancelled_periodically(cancel, &mut checked) {
-                                    cancelled = true;
-                                    return std::ops::ControlFlow::Break(());
-                                }
-                                if !delta.tombstones.get(record)
-                                    && ascii::contains_ci(name, term_lower)
-                                {
-                                    let local_record = record - start;
-                                    local[local_record as usize / 8] |= 1 << (local_record % 8);
-                                }
-                                std::ops::ControlFlow::Continue(())
-                            });
+                            let mut matched = false;
+                            arena.for_each_name_in_with_repeats(
+                                start..end,
+                                |record, name, repeated| {
+                                    if is_cancelled_periodically(cancel, &mut checked) {
+                                        cancelled = true;
+                                        return std::ops::ControlFlow::Break(());
+                                    }
+                                    if !repeated {
+                                        matched = ascii::contains_ci(name, term_lower);
+                                    }
+                                    if !delta.tombstones.get(record) && matched {
+                                        let local_record = record - start;
+                                        local[local_record as usize / 8] |= 1 << (local_record % 8);
+                                    }
+                                    std::ops::ControlFlow::Continue(())
+                                },
+                            );
                             (start, local, cancelled)
                         })
                         .expect("short path worker spawn failed")
@@ -3555,50 +3680,42 @@ fn build_term_interval_set(
             candidate_bitmap,
             trigram_hashes,
         );
+    let mut matched = false;
+    let mut cancelled = false;
+    let mut visit = |record, name: &[u8], repeated: bool| {
+        if is_cancelled_periodically(cancel, checked) {
+            cancelled = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        if !repeated {
+            matched = ascii::contains_ci(name, term_lower);
+        }
+        if !delta.tombstones.get(record) && matched {
+            if arena.is_dir(record) {
+                let span = arena.subtree(record);
+                set.push_span(span.start, span.end);
+            } else {
+                set.push_point(arena.dfs_position(record));
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    };
     if filtered {
         candidate_blocks.sort_unstable();
         candidate_blocks.dedup();
         for &block in candidate_blocks.iter() {
             let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
             let end = start.saturating_add(crate::trigram::TRIGRAM_BLOCK as u32);
-            arena.for_each_name_in(start..end, |record, name| {
-                if is_cancelled_periodically(cancel, checked) {
-                    return std::ops::ControlFlow::Break(());
-                }
-                if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
-                    if arena.is_dir(record) {
-                        let span = arena.subtree(record);
-                        set.push_span(span.start, span.end);
-                    } else {
-                        set.push_point(arena.dfs_position(record));
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            });
+            arena.for_each_name_in_with_repeats(start..end, &mut visit);
             if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
                 return false;
             }
         }
     } else {
-        let mut cancelled = false;
-        arena.for_each_name(|record, name| {
-            if is_cancelled_periodically(cancel, checked) {
-                cancelled = true;
-                return std::ops::ControlFlow::Break(());
-            }
-            if !delta.tombstones.get(record) && ascii::contains_ci(name, term_lower) {
-                if arena.is_dir(record) {
-                    let span = arena.subtree(record);
-                    set.push_span(span.start, span.end);
-                } else {
-                    set.push_point(arena.dfs_position(record));
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        if cancelled || cancel.is_some_and(|cancel| cancel.is_cancelled()) {
-            return false;
-        }
+        arena.for_each_name_with_repeats(&mut visit);
+    }
+    if cancelled || cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return false;
     }
     #[cfg(test)]
     PATH_TERM_SCAN_NS.fetch_add(
@@ -3653,25 +3770,40 @@ fn retain_dense_path_hits_parallel(
                     .stack_size(64 * 1024)
                     .spawn_scoped(scope, move || {
                         let mut checked = 0u32;
-                        arena.for_each_name_in(start..end, |record, name| {
-                            if is_cancelled_periodically(cancel, &mut checked) {
-                                return std::ops::ControlFlow::Break(());
-                            }
-                            if delta.tombstones.get(record)
-                                || matches[record as usize / 8] & (1 << (record % 8)) == 0
-                                || !record_matches_filter(arena, delta, record, name, filter)
-                            {
-                                return std::ops::ControlFlow::Continue(());
-                            }
-                            let own = path_match_mask(automaton, name);
-                            let quality = (term_count as u32 - own.count_ones()) as u8;
-                            rank::retain_hit(
-                                &mut heap,
-                                sort_key(order, arena, delta, record, quality, name.len() as u32),
-                                limit,
-                            );
-                            std::ops::ControlFlow::Continue(())
-                        });
+                        let mut own_mask = None;
+                        arena.for_each_name_in_with_repeats(
+                            start..end,
+                            |record, name, repeated| {
+                                if !repeated {
+                                    own_mask = None;
+                                }
+                                if is_cancelled_periodically(cancel, &mut checked) {
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                if delta.tombstones.get(record)
+                                    || matches[record as usize / 8] & (1 << (record % 8)) == 0
+                                    || !record_matches_filter(arena, delta, record, name, filter)
+                                {
+                                    return std::ops::ControlFlow::Continue(());
+                                }
+                                let own = *own_mask
+                                    .get_or_insert_with(|| path_match_mask(automaton, name));
+                                let quality = (term_count as u32 - own.count_ones()) as u8;
+                                rank::retain_hit(
+                                    &mut heap,
+                                    sort_key(
+                                        order,
+                                        arena,
+                                        delta,
+                                        record,
+                                        quality,
+                                        name.len() as u32,
+                                    ),
+                                    limit,
+                                );
+                                std::ops::ControlFlow::Continue(())
+                            },
+                        );
                         heap
                     })
                     .expect("dense path worker spawn failed")
@@ -3862,12 +3994,20 @@ fn search_path_terms_with_scratch(
         };
         *heap = parallel_heap;
     } else if needs_name && final_set.len_positions() > SPARSE_PATH_HITS {
-        let completed =
-            visit_path_candidate_names(arena, final_set, name, cancel, |record, record_name| {
+        let mut own_mask = None;
+        let completed = visit_path_candidate_names(
+            arena,
+            final_set,
+            name,
+            cancel,
+            |record, record_name, repeated| {
+                if !repeated {
+                    own_mask = None;
+                }
                 if !delta.tombstones.get(record)
                     && record_matches_filter(arena, delta, record, record_name, filter)
                 {
-                    let mask = mask_for(record_name);
+                    let mask = *own_mask.get_or_insert_with(|| mask_for(record_name));
                     rank::retain_hit(
                         heap,
                         sort_key(
@@ -3881,7 +4021,8 @@ fn search_path_terms_with_scratch(
                         limit,
                     );
                 }
-            });
+            },
+        );
         if !completed {
             return Vec::new();
         }
