@@ -176,11 +176,15 @@ fn scan_full_parallel(
                 scope.spawn(move || {
                     let mut local = Vec::new();
                     let mut checked: u32 = 0;
-                    arena.for_each_name_in(start..end, |idx, name| {
+                    let mut matched = false;
+                    arena.for_each_name_in_with_repeats(start..end, |idx, name, repeated| {
                         if is_cancelled_periodically(cancel, &mut checked) {
                             return std::ops::ControlFlow::Break(());
                         }
-                        if matches(name) {
+                        if !repeated {
+                            matched = matches(name);
+                        }
+                        if matched {
                             local.push(idx);
                         }
                         std::ops::ControlFlow::Continue(())
@@ -213,27 +217,31 @@ fn scan_full_parallel_ranked(
     cancel: Option<Cancellation>,
     limit: usize,
     is_match: impl Fn(&[u8]) -> bool + Sync,
-    key_for: impl Fn(u32, &[u8]) -> Option<u64> + Sync,
+    key_for: impl FnMut(u32, &[u8], bool) -> Option<u64> + Clone + Send,
 ) -> (std::collections::BinaryHeap<u64>, u64) {
     let n = arena.len();
     if n == 0 || limit == 0 {
         return (std::collections::BinaryHeap::new(), 0);
     }
     let is_match = &is_match;
-    let key_for = &key_for;
     let shards: Vec<(std::collections::BinaryHeap<u64>, u64)> = std::thread::scope(|scope| {
         bucket_shards(n, threads)
             .map(|(start, end)| {
+                let mut key_for = key_for.clone();
                 scope.spawn(move || {
                     let mut heap = std::collections::BinaryHeap::new();
                     let mut seen: u64 = 0;
                     let mut checked: u32 = 0;
-                    arena.for_each_name_in(start..end, |idx, name| {
+                    let mut matched = false;
+                    arena.for_each_name_in_with_repeats(start..end, |idx, name, repeated| {
                         if is_cancelled_periodically(cancel, &mut checked) {
                             return std::ops::ControlFlow::Break(());
                         }
-                        if is_match(name) {
-                            if let Some(key) = key_for(idx, name) {
+                        if !repeated {
+                            matched = is_match(name);
+                        }
+                        if matched {
+                            if let Some(key) = key_for(idx, name, repeated) {
                                 seen += 1;
                                 crate::rank::retain_hit(&mut heap, key, limit);
                             }
@@ -276,14 +284,15 @@ fn search_base_impl(
         }
         Query::Substring(needle) => {
             let mut results = Vec::new();
-            let cancelled = scan_substring_impl(arena, needle, cancel, spans, |idx, _name| {
-                results.push(idx);
-                if results.len() >= limit {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            });
+            let cancelled =
+                scan_substring_impl(arena, needle, cancel, spans, |idx, _name, _repeated| {
+                    results.push(idx);
+                    if results.len() >= limit {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                });
             if cancelled {
                 return Vec::new();
             }
@@ -291,14 +300,15 @@ fn search_base_impl(
         }
         Query::Regex(pattern) => {
             let mut results = Vec::new();
-            let cancelled = scan_regex_impl(arena, pattern, cancel, spans, |idx, _name| {
-                results.push(idx);
-                if results.len() >= limit {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            });
+            let cancelled =
+                scan_regex_impl(arena, pattern, cancel, spans, |idx, _name, _repeated| {
+                    results.push(idx);
+                    if results.len() >= limit {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                });
             if cancelled {
                 return Vec::new();
             }
@@ -323,7 +333,7 @@ fn scan_substring_impl(
     needle: &str,
     cancel: Option<Cancellation>,
     mut spans: Option<&mut QuerySpans>,
-    mut sink: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+    mut sink: impl FnMut(u32, &[u8], bool) -> std::ops::ControlFlow<()>,
 ) -> bool {
     // `needle_lower` drives the trigram block filter (the trigram index is
     // built lowercase); per-name matching runs directly over the raw bytes
@@ -337,13 +347,17 @@ fn scan_substring_impl(
     let stopped = std::cell::Cell::new(false);
     let cancelled = std::cell::Cell::new(false);
     let mut checked: u32 = 0;
-    let mut visit = |idx, name: &[u8]| {
+    let mut matched = false;
+    let mut visit = |idx, name: &[u8], repeated: bool| {
         if is_cancelled_periodically(cancel, &mut checked) {
             cancelled.set(true);
             stopped.set(true);
             return std::ops::ControlFlow::Break(());
         }
-        if finder.is_match(name) && sink(idx, name).is_break() {
+        if !repeated {
+            matched = finder.is_match(name);
+        }
+        if matched && sink(idx, name, repeated).is_break() {
             stopped.set(true);
             return std::ops::ControlFlow::Break(());
         }
@@ -352,7 +366,7 @@ fn scan_substring_impl(
     match arena.candidate_blocks(&needle_lower) {
         None => {
             record_full_scan_blocks(arena, spans.as_deref_mut());
-            arena.for_each_name(&mut visit)
+            arena.for_each_name_with_repeats(&mut visit)
         }
         Some(blocks) => {
             if let Some(spans) = spans.as_mut() {
@@ -364,7 +378,7 @@ fn scan_substring_impl(
             for block in blocks {
                 let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
                 let end = (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
-                arena.for_each_name_in(start..end, &mut visit);
+                arena.for_each_name_in_with_repeats(start..end, &mut visit);
                 if stopped.get() {
                     break;
                 }
@@ -380,7 +394,7 @@ fn scan_regex_impl(
     pattern: &str,
     cancel: Option<Cancellation>,
     spans: Option<&mut QuerySpans>,
-    mut sink: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
+    mut sink: impl FnMut(u32, &[u8], bool) -> std::ops::ControlFlow<()>,
 ) -> bool {
     let re = match Regex::builder()
         .syntax(syntax::Config::new().case_insensitive(true))
@@ -392,13 +406,17 @@ fn scan_regex_impl(
     let stopped = std::cell::Cell::new(false);
     let cancelled = std::cell::Cell::new(false);
     let mut checked: u32 = 0;
-    let mut visit = |idx, name: &[u8]| {
+    let mut matched = false;
+    let mut visit = |idx, name: &[u8], repeated: bool| {
         if is_cancelled_periodically(cancel, &mut checked) {
             cancelled.set(true);
             stopped.set(true);
             return std::ops::ControlFlow::Break(());
         }
-        if re.is_match(name) && sink(idx, name).is_break() {
+        if !repeated {
+            matched = re.is_match(name);
+        }
+        if matched && sink(idx, name, repeated).is_break() {
             stopped.set(true);
             return std::ops::ControlFlow::Break(());
         }
@@ -409,13 +427,13 @@ fn scan_regex_impl(
     {
         None => {
             record_full_scan_blocks(arena, spans);
-            arena.for_each_name(&mut visit)
+            arena.for_each_name_with_repeats(&mut visit)
         }
         Some(blocks) => {
             for block in blocks {
                 let start = block * crate::trigram::TRIGRAM_BLOCK as u32;
                 let end = (start + crate::trigram::TRIGRAM_BLOCK as u32).min(arena.len() as u32);
-                arena.for_each_name_in(start..end, &mut visit);
+                arena.for_each_name_in_with_repeats(start..end, &mut visit);
                 if stopped.get() {
                     break;
                 }
@@ -435,6 +453,9 @@ fn scan_regex_impl(
 /// already resolves through a tight binary-search range and `PathTerms` is
 /// handled elsewhere. Returns the merged heap and the number of candidates
 /// seen, for `QuerySpans::candidates`.
+/// The key callback is cloned per worker so name-derived ranking state stays
+/// local. Repeat flags reset at each bucket/range head, and the callback still
+/// runs for every matching record, including tombstones it may reject.
 pub(crate) fn search_ranked_streaming(
     arena: &ArchivedArena,
     query: &Query,
@@ -442,7 +463,7 @@ pub(crate) fn search_ranked_streaming(
     threads: usize,
     cancel: Option<Cancellation>,
     mut spans: Option<&mut QuerySpans>,
-    key_for: impl Fn(u32, &[u8]) -> Option<u64> + Sync,
+    mut key_for: impl FnMut(u32, &[u8], bool) -> Option<u64> + Clone + Send,
 ) -> (std::collections::BinaryHeap<u64>, u64) {
     if limit == 0 {
         return (std::collections::BinaryHeap::new(), 0);
@@ -460,8 +481,8 @@ pub(crate) fn search_ranked_streaming(
     if threads <= 1 || filtered {
         let mut heap = std::collections::BinaryHeap::with_capacity(limit.min(4096));
         let mut seen: u64 = 0;
-        let mut visit = |idx, name: &[u8]| {
-            if let Some(key) = key_for(idx, name) {
+        let mut visit = |idx, name: &[u8], repeated| {
+            if let Some(key) = key_for(idx, name, repeated) {
                 seen += 1;
                 crate::rank::retain_hit(&mut heap, key, limit);
             }
@@ -689,6 +710,37 @@ mod tests {
         let result =
             super::search_base_parallel(arena, &Query::Substring("a".to_string()), 4, Some(cancel));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn repeated_negative_names_still_poll_cancellation() {
+        let mut builder = crate::Arena::builder();
+        let root = builder.push("C:", 0, true);
+        let first = builder.push("alpha_marker", 0, false);
+        builder.set_parent(first, root);
+        for _ in 0..100_000 {
+            let record = builder.push("z_unmatched", 0, false);
+            builder.set_parent(record, root);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate-cancel.rkyv");
+        crate::store::save(&builder.build().0, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let mut emitted = 0;
+        let cancelled = super::scan_substring_impl(
+            store.archived(),
+            "p",
+            Some(crate::cancel::Cancellation::new(&generation, 0)),
+            None,
+            |_, _, _| {
+                emitted += 1;
+                generation.store(1, std::sync::atomic::Ordering::Relaxed);
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert!(cancelled);
+        assert_eq!(emitted, 1);
     }
 
     #[test]

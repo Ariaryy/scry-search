@@ -33,6 +33,13 @@ Bucket `b` covers records `[b*32, min(n, (b+1)*32))`. The first name stores
 varint(suffix_length) + suffix`. Varints are unsigned LEB128. Prefix lookup
 binary-searches bucket heads and scans the bounded edge buckets.
 
+Sequential query walkers can reuse name-derived match results when a front-coded
+entry has `shared_prefix == previous_name_length` and an empty suffix. Reuse
+is byte-exact, local to one scan/worker, and resets at bucket and range heads.
+Skipped candidates invalidate a new-name cache before any later duplicate is
+emitted. Record metadata, tombstones, DFS ancestry and top-k keys are checked
+independently for every record; no name copies or global dictionary are needed.
+
 Substring and literal-bearing regex/wildcard queries use the trigram block
 matrix. Hash collisions may add blocks but cannot remove a match. Short terms
 and patterns without a provable literal use a cancellable sequential or

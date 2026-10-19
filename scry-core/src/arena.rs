@@ -585,6 +585,15 @@ impl ArchivedArena {
     /// Decodes each bucket sequentially — cache-friendly, allocation-free (one
     /// scratch `Vec<u8>` reused across the whole scan).
     pub fn for_each_name(&self, mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>) {
+        self.for_each_name_with_repeats(|idx, name, _| f(idx, name));
+    }
+
+    /// The repeat flag is true only for a byte-identical name after an emitted
+    /// predecessor in the same bucket. Bucket heads always start a new run.
+    pub(crate) fn for_each_name_with_repeats(
+        &self,
+        mut f: impl FnMut(u32, &[u8], bool) -> std::ops::ControlFlow<()>,
+    ) {
         let n = self.parents.len();
         let blob: &[u8] = &self.names;
         let offsets: &[u32] = &self.bucket_offsets;
@@ -610,7 +619,7 @@ impl ArchivedArena {
             name_buf.extend_from_slice(&bucket_blob[p..p + first_len]);
             p += first_len;
 
-            if f(start as u32, &name_buf).is_break() {
+            if f(start as u32, &name_buf, false).is_break() {
                 break 'outer;
             }
 
@@ -619,10 +628,11 @@ impl ArchivedArena {
                 let suffix_len = read_varint(bucket_blob, &mut p) as usize;
                 let suffix_start = p;
                 p += suffix_len;
+                let repeated = shared == name_buf.len() && suffix_len == 0;
                 name_buf.truncate(shared);
                 name_buf.extend_from_slice(&bucket_blob[suffix_start..suffix_start + suffix_len]);
 
-                if f(i as u32, &name_buf).is_break() {
+                if f(i as u32, &name_buf, repeated).is_break() {
                     break 'outer;
                 }
             }
@@ -646,6 +656,25 @@ impl ArchivedArena {
         name: &mut Vec<u8>,
         mut f: impl FnMut(u32, &[u8]) -> std::ops::ControlFlow<()>,
     ) {
+        self.for_each_name_in_buf_with_repeats(range, name, |idx, name, _| f(idx, name));
+    }
+
+    pub(crate) fn for_each_name_in_with_repeats(
+        &self,
+        range: std::ops::Range<u32>,
+        f: impl FnMut(u32, &[u8], bool) -> std::ops::ControlFlow<()>,
+    ) {
+        self.for_each_name_in_buf_with_repeats(range, &mut Vec::new(), f);
+    }
+
+    /// As the ranged walker, with exact-repeat information. The first emitted
+    /// record and every bucket head reset reuse, including mid-bucket ranges.
+    pub(crate) fn for_each_name_in_buf_with_repeats(
+        &self,
+        range: std::ops::Range<u32>,
+        name: &mut Vec<u8>,
+        mut f: impl FnMut(u32, &[u8], bool) -> std::ops::ControlFlow<()>,
+    ) {
         let end = range.end.min(self.parents.len() as u32);
         if range.start >= end {
             return;
@@ -664,16 +693,18 @@ impl ArchivedArena {
             name.extend_from_slice(&blob[pos..pos + first_len]);
             pos += first_len;
             for idx in bucket_start..bucket_end {
+                let mut repeated = false;
                 if idx != bucket_start {
                     let shared = read_varint(blob, &mut pos) as usize;
                     let suffix_len = read_varint(blob, &mut pos) as usize;
+                    repeated = shared == name.len() && suffix_len == 0;
                     name.truncate(shared);
                     name.extend_from_slice(&blob[pos..pos + suffix_len]);
                     pos += suffix_len;
                 }
                 if idx >= range.start as usize
                     && idx < end as usize
-                    && f(idx as u32, name).is_break()
+                    && f(idx as u32, name, repeated && idx > range.start as usize).is_break()
                 {
                     break 'outer;
                 }
@@ -2441,6 +2472,72 @@ mod tests {
             std::ops::ControlFlow::Continue(())
         });
         assert_eq!(mid, full[5..45]);
+    }
+
+    #[test]
+    fn repeat_flags_match_independent_names_and_reset_at_boundaries() {
+        let mut builder = ArenaBuilder::default();
+        for name in ["", "a", "A", "alpha", "alphabet", "réport_数据"] {
+            for _ in 0..70 {
+                builder.push(name, 0, false);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeated-names.rkyv");
+        save(&builder.build().0, &path).unwrap();
+        let store = crate::store::ArenaStore::open(&path).unwrap();
+        let arena = store.archived();
+        let names: Vec<_> = (0..arena.len() as u32)
+            .map(|record| {
+                let mut name = Vec::new();
+                arena.name_into(record, &mut name);
+                name
+            })
+            .collect();
+        let mut full = Vec::new();
+        arena.for_each_name_with_repeats(|record, name, repeated| {
+            full.push((record, name.to_vec(), repeated));
+            std::ops::ControlFlow::Continue(())
+        });
+        let mut buffer = vec![b'x'; 100];
+        for start in [0, 1, 31, 32, 33, 63, 64, 65, arena.len() - 1, arena.len()] {
+            for end in [start, (start + 35).min(arena.len()), arena.len() + 10] {
+                let mut actual = Vec::new();
+                arena.for_each_name_in_buf_with_repeats(
+                    start as u32..end as u32,
+                    &mut buffer,
+                    |record, name, repeated| {
+                        actual.push((record, name.to_vec(), repeated));
+                        std::ops::ControlFlow::Continue(())
+                    },
+                );
+                assert_eq!(actual.len(), end.min(arena.len()) - start);
+                for (record, name, repeated) in actual {
+                    let index = record as usize;
+                    assert_eq!(name, names[index]);
+                    assert_eq!(
+                        repeated,
+                        index > start
+                            && !index.is_multiple_of(BUCKET_SIZE)
+                            && names[index] == names[index - 1]
+                    );
+                }
+            }
+        }
+        assert_eq!(full.len(), names.len());
+        for (index, (_, name, repeated)) in full.iter().enumerate() {
+            assert_eq!(name, &names[index]);
+            assert_eq!(
+                *repeated,
+                !index.is_multiple_of(BUCKET_SIZE) && names[index] == names[index - 1]
+            );
+        }
+        let mut visited = 0;
+        arena.for_each_name_with_repeats(|_, _, _| {
+            visited += 1;
+            std::ops::ControlFlow::Break(())
+        });
+        assert_eq!(visited, 1);
     }
 
     #[test]
