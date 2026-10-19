@@ -31,9 +31,9 @@ impl<'a> Cancellation<'a> {
 }
 
 /// How often the O(n) scan loops re-check cancellation. Checking every
-/// record would add an atomic load to the hottest loop in the crate; checking
-/// this rarely still bounds the worst-case overrun to a few hundred
-/// microseconds even at the measured million-record corpus.
+/// record would add an atomic load to the hottest loop in the crate. This is
+/// a bound on record work between polls, not a wall-clock latency guarantee.
+/// Bucket-ordered path enumeration polls every bucket, including empty ones.
 pub const CHECK_INTERVAL: u32 = 1 << 16;
 
 #[cfg(test)]
