@@ -55,8 +55,21 @@ that canonical edge, so materialized paths and interval queries agree even on
 corrupt input.
 
 `dfs_positions[r]..dfs_ends[r]` is record `r`'s subtree in `dfs_records`.
-Path-term search converts every term to coalesced DFS intervals and intersects
-the smallest sets first. Recursive directory size is one prefix subtraction;
+Path-term search normally converts every term to coalesced DFS intervals and
+intersects the smallest sets first. For multi-term queries without delta
+additions, independent trigram survival estimates choose a seed term. If its
+actual subtree union covers at most 1,024 positions, canonical ancestor masks
+can verify the other terms instead of building their interval sets. A fixed
+2,048-slot directory memo and 512-entry walk stack use 20 KiB total; verification
+permits at most 16,384 steps and falls back once decoded name lengths exceed
+1 MiB (checked after each name decode). Cache collisions replace
+entries by record identity. Exceeding any budget discards partial verification
+and resumes independent term scans, reusing the seed set. Tombstoned names do
+not contribute masks; metadata filtering and ranking follow verification.
+Views with delta additions retain the interval fold for base ancestry lookup.
+These query-local choices do not change the archive layout.
+
+Recursive directory size is one prefix subtraction;
 unknown descendants contribute zero and clear the directory's exactness bit.
 
 Final path-term candidates needing names use direct decoding for tiny sets.

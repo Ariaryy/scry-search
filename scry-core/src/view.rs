@@ -2135,6 +2135,302 @@ mod tests {
     }
 
     #[test]
+    fn planned_path_terms_match_exhaustive_with_tombstones_and_cycles() {
+        let (_dir, mut view) = adversarial_path_term_view();
+        let mut delta = (*view.delta).clone();
+        delta.added.clear();
+        // A deleted directory's own term must not pass to its descendants.
+        delta
+            .tombstones
+            .set(view.base.archived().prefix_range("bravo").start);
+        view.delta = Arc::new(delta);
+        let cases = [
+            vec!["ALPHA", "deepfile"],
+            vec!["bravo", "deepfile"],
+            vec!["cyclea", "cyclechild"],
+            vec!["cycleb", "cyclechild"],
+            vec!["selfparented", "self"],
+            vec!["c:", "leafonlywkyp"],
+            vec!["plain", "leafonlywkyp"],
+            vec!["alpha", "alpha"],
+            vec![""; 16],
+        ];
+        for case in cases {
+            let terms: Vec<_> = case.into_iter().map(str::to_owned).collect();
+            for filter in [
+                QueryFilter::default(),
+                QueryFilter {
+                    kind: Some(EntryKind::File),
+                    ..QueryFilter::default()
+                },
+                QueryFilter {
+                    extensions: vec!["TXT".into()],
+                    ..QueryFilter::default()
+                },
+                QueryFilter {
+                    min_mtime: Some(1),
+                    ..QueryFilter::default()
+                },
+            ] {
+                for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                    for limit in [1, 4, 20_000] {
+                        let mut scratch = PathSearchScratch::default();
+                        let expected = search_path_terms_with_scratch(
+                            view.base.archived(),
+                            &view.delta,
+                            &terms,
+                            &filter,
+                            SearchOptions::ordered(limit, order),
+                            &mut scratch,
+                            false,
+                            None,
+                            1,
+                        );
+                        for threads in [1, 4] {
+                            let actual = search_path_terms_with_scratch(
+                                view.base.archived(),
+                                &view.delta,
+                                &terms,
+                                &filter,
+                                SearchOptions::ordered(limit, order),
+                                &mut scratch,
+                                true,
+                                None,
+                                threads,
+                            );
+                            assert_eq!(actual, expected, "{terms:?}, {filter:?}, {order:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_path_planner_skips_scans_but_keeps_delta_ancestor_sets() {
+        let (_dir, view) = adversarial_path_term_view();
+        let mut delta = (*view.delta).clone();
+        delta.added.clear();
+        let terms = vec!["alpha".into(), "deepfile".into()];
+        for (overlay, expected_builds) in [(&delta, 1), (&*view.delta, 2)] {
+            TERM_INTERVAL_BUILDS.with(|count| count.set(0));
+            let actual = search_path_terms_with_scratch(
+                view.base.archived(),
+                overlay,
+                &terms,
+                &QueryFilter::default(),
+                SearchOptions::new(200),
+                &mut PathSearchScratch::default(),
+                true,
+                None,
+                1,
+            );
+            assert_eq!(actual.len(), 1);
+            TERM_INTERVAL_BUILDS.with(|count| assert_eq!(count.get(), expected_builds));
+        }
+    }
+
+    #[test]
+    fn path_seed_budgets_discard_partial_verification() {
+        let (_dir, view) = nested_view();
+        let arena = view.base.archived();
+        let mut seed = crate::intervals::IntervalSet::default();
+        seed.push_span(0, arena.len() as u32);
+        seed.coalesce();
+        let automaton = aho_corasick::AhoCorasick::new(["missing"]).unwrap();
+        let mut output = crate::intervals::IntervalSet::default();
+        let mut name = Vec::new();
+        assert_eq!(
+            verify_path_seed(
+                arena,
+                &view.delta,
+                &seed,
+                &automaton,
+                1,
+                &mut output,
+                &mut name,
+                || false,
+                0
+            ),
+            Ok(false)
+        );
+        // Change the generation after verification has entered the walk.
+        let generation = AtomicU64::new(0);
+        let cancel = Cancellation::new(&generation, 0);
+        let mut polls = 0;
+        assert_eq!(
+            verify_path_seed(
+                arena,
+                &view.delta,
+                &seed,
+                &automaton,
+                1,
+                &mut output,
+                &mut name,
+                || {
+                    polls += 1;
+                    if polls == 3 {
+                        generation.store(1, AtomicOrdering::Relaxed);
+                    }
+                    cancel.is_cancelled()
+                },
+                PATH_VERIFY_STEPS
+            ),
+            Err(())
+        );
+        assert_eq!(polls, 3);
+        let generation = AtomicU64::new(1);
+        assert_eq!(
+            verify_path_seed(
+                arena,
+                &view.delta,
+                &seed,
+                &automaton,
+                1,
+                &mut output,
+                &mut name,
+                || Cancellation::new(&generation, 0).is_cancelled(),
+                PATH_VERIFY_STEPS
+            ),
+            Err(())
+        );
+        seed.clear();
+        seed.push_span(0, PATH_VERIFY_CANDIDATES as u32 + 1);
+        seed.coalesce();
+        assert_eq!(
+            verify_path_seed(
+                arena,
+                &view.delta,
+                &seed,
+                &automaton,
+                1,
+                &mut output,
+                &mut name,
+                || false,
+                PATH_VERIFY_STEPS
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn deep_path_seed_falls_back_without_losing_ancestor_matches() {
+        let mut builder = crate::ArenaBuilder::default();
+        let mut parent = builder.push("ancestorqzxv", 0, true);
+        for index in 0..PATH_VERIFY_DEPTH + 20 {
+            let next = builder.push(&format!("level_{index:04}"), 0, true);
+            builder.set_parent(next, parent);
+            parent = next;
+        }
+        let leaf = builder.push("needlewkyp", 0, false);
+        builder.set_parent(leaf, parent);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep-planner.rkyv");
+        crate::store::save(&builder.build().0, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+        TERM_INTERVAL_BUILDS.with(|count| count.set(0));
+        let actual = view.search_hits(
+            &Query::PathTerms(vec!["needlewkyp".into(), "ancestorqzxv".into()]),
+            SearchOptions::new(200),
+        );
+        assert_eq!(actual.len(), 1);
+        TERM_INTERVAL_BUILDS.with(|count| assert_eq!(count.get(), 2));
+    }
+
+    #[test]
+    fn path_planner_matches_fold_across_sparse_and_broad_seed_sets() {
+        let mut builder = crate::ArenaBuilder::default();
+        let root = builder.push("common", 0, true);
+        let mut parents = Vec::new();
+        for index in 0..128 {
+            let name = format!(
+                "{}_dir_{index:04}",
+                if index % 2 == 0 { "even" } else { "odd" }
+            );
+            let parent = builder.push(&name, 0, true);
+            builder.set_parent(parent, root);
+            parents.push(parent);
+        }
+        for index in 0..8_192 {
+            let name = if index % 97 == 0 {
+                "needle.bin"
+            } else {
+                "plain.txt"
+            };
+            let record = builder.push_bytes_with_metadata(
+                name.as_bytes(),
+                index,
+                false,
+                None,
+                u64::from(index) * 1024,
+            );
+            builder.set_parent(record, parents[index as usize * 37 % parents.len()]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("planner-strata.rkyv");
+        crate::store::save(&builder.build().0, &path).unwrap();
+        let view = IndexView::new(Arc::new(ArenaStore::open(&path).unwrap()));
+        let arena = view.base.archived();
+        let mut delta = (*view.delta).clone();
+        for record in (0..arena.len() as u32).step_by(7) {
+            delta.tombstones.set(record);
+        }
+        let mut scratch = PathSearchScratch::default();
+        for terms in [
+            vec!["odd", "needle"],
+            vec!["EVEN", "needle"],
+            vec!["common", "plain"],
+            vec!["common", "needle"],
+            vec!["needle", "bin"],
+            vec!["absent", "needle"],
+        ] {
+            let terms: Vec<_> = terms.into_iter().map(str::to_owned).collect();
+            for order in [Order::Relevance, Order::Recent, Order::Largest] {
+                for filter in [
+                    QueryFilter::default(),
+                    QueryFilter {
+                        min_size: Some(100_000),
+                        extensions: vec!["bin".into()],
+                        ..QueryFilter::default()
+                    },
+                ] {
+                    for limit in [1, 200, 20_000] {
+                        let options = SearchOptions::ordered(limit, order);
+                        let expected = search_path_terms_with_scratch(
+                            arena,
+                            &delta,
+                            &terms,
+                            &filter,
+                            options,
+                            &mut scratch,
+                            false,
+                            None,
+                            1,
+                        );
+                        for threads in [1, 4] {
+                            let actual = search_path_terms_with_scratch(
+                                arena,
+                                &delta,
+                                &terms,
+                                &filter,
+                                options,
+                                &mut scratch,
+                                true,
+                                None,
+                                threads,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "{terms:?}, {filter:?}, {order:?}, {limit}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "million-record release benchmark"]
     fn benchmark_path_term_candidate_blocks() {
         const GROUPS: usize = 128;
@@ -3828,6 +4124,98 @@ fn path_match_mask(automaton: &aho_corasick::AhoCorasick, name: &[u8]) -> u16 {
         })
 }
 
+// Fixed query-local budgets, independent of the number of indexed directories.
+const PATH_VERIFY_CANDIDATES: u64 = 1_024;
+const PATH_VERIFY_STEPS: usize = 16_384;
+const PATH_VERIFY_MEMO_SLOTS: usize = 2_048;
+const PATH_VERIFY_DEPTH: usize = 512;
+const PATH_VERIFY_NAME_BYTES: usize = 1024 * 1024;
+
+/// Verify a small seed set without constructing the other terms' interval
+/// sets. `false` means abandon this partial set and use the exhaustive fold;
+/// `Err` means cancellation. Cache only complete directory-ancestor masks.
+/// Direct-mapped cache collisions replace entries, never merge identities.
+#[allow(clippy::too_many_arguments)]
+fn verify_path_seed(
+    arena: &crate::ArchivedArena,
+    delta: &Delta,
+    seed: &crate::intervals::IntervalSet,
+    automaton: &aho_corasick::AhoCorasick,
+    full_mask: u16,
+    output: &mut crate::intervals::IntervalSet,
+    name: &mut Vec<u8>,
+    mut cancelled: impl FnMut() -> bool,
+    max_steps: usize,
+) -> Result<bool, ()> {
+    output.clear();
+    if seed.len_positions() > PATH_VERIFY_CANDIDATES {
+        return Ok(false);
+    }
+    let mut memo = [(PARENT_NONE, 0u16); PATH_VERIFY_MEMO_SLOTS];
+    let mut chain = [(PARENT_NONE, 0u16); PATH_VERIFY_DEPTH];
+    let mut steps = 0;
+    let mut bytes = 0usize;
+    for position in seed.iter_positions() {
+        let record = arena.dfs_record(position);
+        if cancelled() {
+            return Err(());
+        }
+        if delta.tombstones.get(record) {
+            continue;
+        }
+        let mut current = record;
+        let mut depth = 0;
+        let mut own = 0;
+        let mut inherited = loop {
+            if cancelled() {
+                return Err(());
+            }
+            if steps >= max_steps || depth == chain.len() {
+                return Ok(false);
+            }
+            steps += 1;
+            if current == PARENT_NONE {
+                break 0;
+            }
+            let slot = current as usize % memo.len();
+            // The leaf's own name contributes even when it is not a directory.
+            if current != record && memo[slot].0 == current {
+                break memo[slot].1;
+            }
+            arena.name_into(current, name);
+            bytes = bytes.saturating_add(name.len());
+            if bytes > PATH_VERIFY_NAME_BYTES {
+                return Ok(false);
+            }
+            let mask = if !delta.tombstones.get(current) {
+                path_match_mask(automaton, name)
+            } else {
+                0
+            };
+            if current == record {
+                own = mask;
+            }
+            chain[depth] = (current, if arena.is_dir(current) { mask } else { 0 });
+            depth += 1;
+            current = arena.tree_parent(current);
+        };
+        for &(ancestor, mask) in chain[..depth].iter().rev() {
+            inherited |= mask;
+            if arena.is_dir(ancestor) {
+                memo[ancestor as usize % PATH_VERIFY_MEMO_SLOTS] = (ancestor, inherited);
+            }
+        }
+        if own | inherited == full_mask {
+            output.push_ordered_point(position);
+        }
+    }
+    if cancelled() {
+        Err(())
+    } else {
+        Ok(true)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn retain_dense_path_hits_parallel(
     arena: &crate::ArchivedArena,
@@ -3951,16 +4339,50 @@ fn search_path_terms_with_scratch(
         .map(|term| term.as_bytes().to_ascii_lowercase())
         .collect();
 
+    let full_mask = ((1u32 << terms.len()) - 1) as u16;
+    let mut build_order = [0usize; crate::terms::MAX_TERMS];
+    for (index, slot) in build_order[..terms.len()].iter_mut().enumerate() {
+        *slot = index;
+    }
+    // Survival estimates order independent scans; they are never intersected
+    // across terms. Delta additions still need all base term sets for their
+    // ancestor checks, so retain the existing algorithm for those views.
+    let can_plan = use_filter && terms.len() > 1 && delta.added.is_empty();
+    if can_plan {
+        let mut costs = [0usize; crate::terms::MAX_TERMS];
+        for (index, term) in terms_lower.iter().enumerate() {
+            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Vec::new();
+            }
+            costs[index] = if arena.candidate_blocks_into(
+                term,
+                &mut scratch.candidate_blocks,
+                &mut scratch.candidate_bitmap,
+                &mut scratch.trigram_hashes,
+            ) {
+                scratch.candidate_blocks.len()
+            } else {
+                arena.len().div_ceil(crate::trigram::TRIGRAM_BLOCK)
+            };
+        }
+        build_order[..terms.len()].sort_by_key(|&index| costs[index]);
+    }
+
     let PathSearchScratch {
         term_sets,
         candidate_blocks,
         candidate_bitmap,
         trigram_hashes,
         own_matches,
+        fold_a,
+        name,
         ..
     } = &mut *scratch;
     let mut checked: u32 = 0;
-    for (term_lower, term_set) in terms_lower.iter().zip(term_sets.iter_mut()) {
+    let mut verified_seed = false;
+    for (build_index, &term_index) in build_order[..terms.len()].iter().enumerate() {
+        let term_lower = &terms_lower[term_index];
+        let term_set = &mut term_sets[term_index];
         let completed = if terms.len() == 1 && term_lower.len() < 3 {
             build_short_single_term_set(
                 arena,
@@ -3998,13 +4420,27 @@ fn search_path_terms_with_scratch(
             // full-index term scans cannot possibly recover a result.
             return Vec::new();
         }
+        if can_plan && build_index == 0 {
+            match verify_path_seed(
+                arena,
+                delta,
+                term_set,
+                &automaton,
+                full_mask,
+                fold_a,
+                name,
+                || cancel.is_some_and(|cancel| cancel.is_cancelled()),
+                PATH_VERIFY_STEPS,
+            ) {
+                Ok(true) => {
+                    verified_seed = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(()) => return Vec::new(),
+            }
+        }
     }
-
-    let full_mask = if terms.len() == 16 {
-        u16::MAX
-    } else {
-        (1u16 << terms.len()) - 1
-    };
 
     // Never intersect per-term trigram candidate blocks: different terms may
     // be satisfied by different ancestor records. The per-term IntervalSets
@@ -4028,7 +4464,9 @@ fn search_path_terms_with_scratch(
         name,
         ..
     } = scratch;
-    let final_set: &crate::intervals::IntervalSet = if terms.len() == 1 {
+    let final_set: &crate::intervals::IntervalSet = if verified_seed {
+        fold_a
+    } else if terms.len() == 1 {
         &term_sets[0]
     } else if term_sets[term_order[0]].is_empty() {
         fold_a.clear();
