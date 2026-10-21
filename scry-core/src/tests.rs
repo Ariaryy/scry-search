@@ -71,19 +71,6 @@ fn wildcard_query_matches_extension() {
 }
 
 #[test]
-fn substring_query_is_case_insensitive() {
-    let arena = sample_arena();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.rkyv");
-    save(&arena, &path).unwrap();
-    let store = ArenaStore::open(&path).unwrap();
-    let archived = store.archived();
-
-    let hits = search_base(archived, &Query::Substring("FINAL".into()), 10);
-    assert_eq!(hits.len(), 1);
-}
-
-#[test]
 fn substring_query_matches_regardless_of_needle_or_name_casing() {
     let mut b = Arena::builder();
     let root = b.push("C:", 0, true);

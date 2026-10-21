@@ -182,6 +182,6 @@ The span report above shows the first `"l"` query scanning 2,690 candidates
 but emitting (and therefore materializing) only 50 — a ~54x reduction in
 `materialize_one` calls versus materializing every cached candidate before
 ranking. `refined_query_materializes_at_most_limit_entries` in
-`scry-daemon/src/main.rs` pins this behavior: `spans.emitted` never exceeds
+`scry-daemon/src/tests/search.rs` pins this behavior: `spans.emitted` never exceeds
 the requested limit even when the refinement cache holds tens of thousands
 of candidates.
