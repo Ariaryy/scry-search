@@ -30,8 +30,8 @@ and keeps up with changes as they happen. Search from the command line, or use
 the Rust client to add file search to your own application. Scry handles the
 index, saved state, ranking and update tracking.
 
-> Alpha release: `0.1.0-alpha.4`. Use matching client and daemon builds;
-> saved-index and communication formats may change between versions.
+> Scry is still in alpha. Breaking changes may affect APIs, saved indexes and
+> communication formats between releases. Use matching client and daemon builds.
 
 ## Features
 
