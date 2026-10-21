@@ -28,6 +28,44 @@ NTFS metadata + USN journal
   realtime sessions.
 - `scry-cli` is a thin formatter and interactive reference consumer.
 
+## Source layout
+
+Public crate APIs and snapshot/wire formats stay at their existing import paths.
+Implementation modules are private and organized around the responsibility they
+own. Entry points assemble the application rather than implement every subsystem.
+
+- **Core archive:** `arena.rs` defines the layout and canonical tree access.
+  `arena/names.rs` owns front coding, bucket scans, and sorted lookup;
+  `arena/builder.rs` stages unsorted input; `arena/spooled.rs` constructs sorted
+  columns without an owned arena. `store/columns.rs` owns borrowed-column rkyv
+  serialization. `dfs/file_backed.rs` owns spool-backed traversal and prefix sums.
+- **Core queries:** `query.rs` owns sequential scans and dispatch;
+  `query/parallel.rs` owns bucket sharding and workers. `view.rs` exposes coherent
+  base/overlay searches and materialization. `view/ranked.rs` owns filtering and
+  top-k selection, `view/path_search.rs` owns independent DFS term intervals and
+  bounded scratch, and `view/compaction.rs` owns streaming snapshot/FRN merging.
+- **Daemon:** `main.rs` wires startup, shutdown, and workers; `options.rs` parses
+  startup options; `platform.rs` applies Windows scheduling policy. `paths.rs`
+  owns snapshot/spool locations, `changes.rs` classifies events and excludes
+  daemon writes, `persistence.rs` builds/replays/compacts snapshots, and
+  `updates.rs` coalesces journal activity and publishes views. `search.rs` owns
+  cross-volume ranking and refinement; `rpc.rs` owns pipe framing, request
+  dispatch, and cancellation; `sections.rs` owns the bounded generation cache.
+- **Windows ingestion:** `windows.rs` exposes the backend and shared event types.
+  `windows/indexing.rs` builds initial indexes, `windows/records.rs` decodes USN
+  records, `windows/journal.rs` validates/replays/watches journals, and
+  `windows/ffi.rs` declares the minimal Win32 boundary.
+- **Consumers:** `scry-client/src/lib.rs` exposes the SDK and RPC calls;
+  `local.rs` owns mapping validation and fallback, and `session.rs` owns
+  interactive request draining. `scry-cli/src/display.rs` owns terminal-safe
+  presentation; the CLI entry point owns argument handling.
+
+Unit tests live beside these modules in `tests.rs` or responsibility-specific
+`tests/` submodules. Shared fixtures stay in the suite parent. Keep behavioral
+oracles and regressions for corrupt input, cancellation, bounded resources,
+serialization identity, and fallback. Prefer extending an existing behavioral
+test over duplicating its setup or testing a copied implementation formula.
+
 ## Data flow
 
 Initial indexing is serialized across fixed NTFS volumes to bound memory and

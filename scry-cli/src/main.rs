@@ -9,11 +9,12 @@
 //! relevance).
 
 mod console;
+mod display;
+use display::{display_mtime, display_size, print_entry};
 mod interactive;
 
 use scry_client::Client;
-use scry_core::protocol::{Order, QueryKind, ResultEntry};
-use std::io::IsTerminal;
+use scry_core::protocol::{Order, QueryKind};
 
 const DEFAULT_LIMIT: u32 = 50;
 const DEFAULT_INTERACTIVE_LIMIT: u32 = 12;
@@ -147,69 +148,6 @@ fn parse_order(value: &str) -> Option<Order> {
     }
 }
 
-fn print_entry(entry: &ResultEntry) {
-    let marker = if entry.is_dir { "/" } else { "" };
-    if std::io::stdout().is_terminal() {
-        let path = visible_terminal_text(&entry.path);
-        let color = if entry.is_dir { "36" } else { "37" };
-        println!(
-            "  \x1b[1;{color}m{path}{marker}\x1b[0m  \x1b[2m{}  ·  {}\x1b[0m",
-            display_size(entry),
-            display_mtime(entry.mtime)
-        );
-    } else {
-        println!(
-            "{}{marker}\t{}\t{}",
-            entry.path,
-            display_size(entry),
-            display_mtime(entry.mtime)
-        );
-    }
-}
-
-fn visible_terminal_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-pub(crate) fn display_size(entry: &ResultEntry) -> String {
-    if !(entry.size_exact || entry.is_dir && entry.size > 0) {
-        return "—".into();
-    }
-    let prefix = if entry.size_exact { "" } else { "≥" };
-    format!("{prefix}{}", human_size(entry.size))
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if value >= 10.0 || value.fract() < 0.05 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-pub(crate) fn display_mtime(mtime: u32) -> String {
-    console::format_local_time(mtime).unwrap_or_else(|| "unknown date".into())
-}
-
 fn infer_query_kind(explicit_kind: Option<QueryKind>, query: &str) -> QueryKind {
     explicit_kind.unwrap_or_else(|| {
         if query.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
@@ -221,60 +159,4 @@ fn infer_query_kind(explicit_kind: Option<QueryKind>, query: &str) -> QueryKind 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sort_names_map_onto_orders() {
-        assert_eq!(parse_order("recent"), Some(Order::Recent));
-        assert_eq!(parse_order("size"), Some(Order::Largest));
-        assert_eq!(parse_order("relevance"), Some(Order::Relevance));
-        assert_eq!(parse_order("largest"), None);
-    }
-
-    #[test]
-    fn infers_wildcard_from_glob_metacharacters() {
-        assert_eq!(infer_query_kind(None, "*.pdf"), QueryKind::Wildcard);
-        assert_eq!(infer_query_kind(None, "report.*"), QueryKind::Wildcard);
-        assert_eq!(infer_query_kind(None, "report?.pdf"), QueryKind::Wildcard);
-    }
-
-    #[test]
-    fn defaults_plain_queries_to_path_terms() {
-        assert_eq!(
-            infer_query_kind(None, "project notes"),
-            QueryKind::PathTerms
-        );
-    }
-
-    #[test]
-    fn explicit_kind_takes_precedence() {
-        assert_eq!(
-            infer_query_kind(Some(QueryKind::Prefix), "*.pdf"),
-            QueryKind::Prefix
-        );
-    }
-
-    #[test]
-    fn sizes_distinguish_exact_lower_bound_and_unknown() {
-        let entry = |size, is_dir, size_exact| ResultEntry {
-            path: "item".into(),
-            size,
-            mtime: 0,
-            is_dir,
-            size_exact,
-        };
-        assert_eq!(display_size(&entry(42, false, true)), "42 B");
-        assert_eq!(display_size(&entry(0, false, true)), "0 B");
-        assert_eq!(display_size(&entry(42, true, false)), "≥42 B");
-        assert_eq!(display_size(&entry(0, false, false)), "—");
-        assert_eq!(human_size(1_023), "1023 B");
-        assert_eq!(human_size(1_024), "1 KB");
-        assert_eq!(human_size(1_572_864), "1.5 MB");
-    }
-
-    #[test]
-    fn terminal_text_cannot_inject_control_sequences() {
-        assert_eq!(visible_terminal_text("safe\u{1b}[2J"), "safe�[2J");
-    }
-}
+mod tests;
