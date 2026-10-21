@@ -30,7 +30,7 @@ and keeps up with changes as they happen. Search from the command line, or use
 the Rust client to add file search to your own application. Scry handles the
 index, saved state, ranking and update tracking.
 
-> Alpha release: `0.1.0-alpha.3`. Use matching client and daemon builds;
+> Alpha release: `0.1.0-alpha.4`. Use matching client and daemon builds;
 > saved-index and communication formats may change between versions.
 
 ## Features
@@ -110,15 +110,16 @@ the [CLI reference](docs/users/cli.md) for command options, and the
 
 ## Performance
 
-Tests on a Windows PC with an Intel Core i5-13500HX, 16 GiB RAM and about
-930,000 files and folders produced these results:
+Tests on a Windows PC with an Intel Core i5-13500HX and 16 GiB RAM
+produced these results. Query timings use a synthetic 440,001-record index;
+indexing, update and idle measurements use about 930,000 files and folders:
 
 | Task | Measured result |
 |---|---:|
 | Build the initial index | 10.8 seconds |
-| Search by the first few letters of a name | 0.4 ms median |
-| Search for text within a name | 8 ms median |
-| Broad single-letter search | 161 ms median |
+| Search by the first few letters of a name | 1.1 ms median |
+| Search for text within a name | 1.9 ms median |
+| Broad single-letter search | 48 ms median |
 | Make a new or renamed file searchable | About half a second median |
 | Memory after ten minutes idle | 55 MiB private memory; 14 MiB resident in RAM |
 
@@ -126,8 +127,10 @@ During the ten-minute idle test, Scry recorded no measurable CPU time and no
 file read/write activity in its process counters. Windows gradually reclaimed
 resident memory while Scry's private memory stayed around 55 MiB.
 
-Search times are from repeated searches returning up to 50 results. Broad
-searches take longer because they match more of the index. Results vary with
+Search times use release builds and shared-index execution, with 60 warm
+samples per query returning up to 50 results. The indexing, update and idle
+figures are from the earlier lifecycle test. Broad searches take longer because
+they match more of the index. Results vary with
 hardware, filenames, folder structure and recent activity; the initial indexing
 test did not clear Windows' disk cache.
 

@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "scry-bench"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "scry-client",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "scry-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "scry-client",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "scry-client"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "scry-core",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "scry-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "aho-corasick",
  "criterion",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "scry-daemon"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "scry-example"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "scry-client",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "scry-fsevents"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "crossbeam",
  "scry-core",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "scry-ipc"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "tempfile",
 ]

@@ -23,10 +23,10 @@ jobs:
           Copy-Item target/daemon-release/scryd.exe dist/scry/
           Copy-Item target/release/scry.exe dist/scry/
           Copy-Item scripts/install-daemon.ps1,scripts/uninstall-daemon.ps1 dist/scry/
-          Copy-Item LICENSE,README.md dist/scry/
+          Copy-Item LICENSE,README.md,CHANGELOG.md dist/scry/
           New-Item -ItemType Directory -Path dist/scry/assets -Force | Out-Null
           Copy-Item assets/scry.svg dist/scry/assets/
-          Copy-Item docs/users dist/scry/docs -Recurse
+          Copy-Item docs dist/scry/docs -Recurse
           $archive = "dist/scry-search-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Compress-Archive -Path dist/scry/* -DestinationPath $archive
       - name: Format release version
@@ -38,5 +38,5 @@ jobs:
         with:
           name: Scry Search ${{ steps.release.outputs.version }}
           files: dist/scry-search-*-windows-x86_64.zip
-          generate_release_notes: true
+          body_path: CHANGELOG.md
           prerelease: ${{ contains(github.ref_name, '-') }}

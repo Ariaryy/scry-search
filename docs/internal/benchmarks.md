@@ -27,6 +27,12 @@ samples and incomplete runs. Older schemas remain diagnostic history. In
 particular, the first live capture predates every-answer validation and is not
 accepted as performance comparison evidence.
 
+## Release comparison
+
+The [alpha.3-to-planner comparison](release-query-comparison.md) records all
+34 synthetic shared-query cells, including regressions, with paired controls.
+It supplements the older lifecycle and frozen-query measurements below.
+
 ## Recorded observations
 
 ### Full daemon lifecycle
