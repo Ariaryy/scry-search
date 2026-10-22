@@ -131,6 +131,17 @@ choose its own cadence and channel, and show optional updates while continuing
 to search with a compatible daemon. These are host policies. Discovery runs
 only on explicit invocation and never in the daemon or local status command.
 
+GitHub limits unauthenticated REST API requests to 60 per hour per public IP
+address, shared with other applications and users behind that address. Host
+applications are responsible for managing their update-check frequency and retry
+policy within this shared quota, including repeated manual checks. Each discovery
+invocation requests a release list and may download up to 20 manifests; an update
+independently requests trusted release metadata. Scry does not cache these requests
+or provide a separate quota. Rate limiting can fail discovery or installation with
+exit 21 without changing the installed daemon. Do not treat that failure as update
+availability or retry in a tight loop. See
+[GitHub's API rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+
 All three JSON contracts use schema 1. Additive fields may appear; consumers
 should ignore fields they do not understand, reject unsupported schema versions,
 and handle unknown enum values as an explicit error. Existing field meanings
@@ -158,6 +169,15 @@ that mechanism. Stop those installations before migration; the updater refuses
 to force-terminate them. Development daemons are never stopped. Readiness checks
 both the requested version and the pipe server's executable path.
 
+Restart preparation retains query/synchronize process handles while checking
+the pipe owner and stopping installed processes. A disappearing owner triggers
+a fresh connection and identity check. Access failures, busy pipes, and foreign
+owners are not treated as a stopped daemon. Shutdown re-enumerates installed
+processes and requires two quiet observations, with bounded retries and a
+30-second shutdown budget. Unresolved ownership fails with exit 23 before task
+activation. Hosts should close search connections and suspend daemon-start
+attempts until the update process finishes.
+
 The protected transaction journal records preparation, activation, and commit.
 Normal activation and recovery both complete the PATH entry and verified
 uninstaller before recording commit.
@@ -174,6 +194,22 @@ Scry normally rebuilds unsupported snapshots rather than migrating them in place
 A future format-changing updater must define a separate rebuild and recovery
 policy. Restoring old binaries cannot undo incompatible index writes. This
 implementation does not promise a binary rollback after replacement startup.
+
+## Bootstrapping an updater fix
+
+The updater engine is embedded in the invoking CLI. Selecting a newer target
+with an older CLI does not replace the engine already performing the update.
+Applications must distribute a refreshed, verified CLI when adopting an updater
+fix, then invoke that executable with the exact tested release tag. Replacing
+adjacent PowerShell files has no effect on a published CLI.
+
+For integration testing before publication, build the CLI from the reviewed fix
+commit, record its commit and binary SHA-256, and bundle that test artifact in the
+host's development build. The daemon target may remain `v0.1.0` while testing the
+fixed engine. After a coordinated patch release, refresh the bundled CLI and
+locked client release together. Do not overwrite existing release assets or
+silently fetch and execute an unverified bootstrap executable. This bootstrap
+policy does not change the local status, discovery, or exact-target JSON schemas.
 
 ## Package trust
 

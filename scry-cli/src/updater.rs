@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const RELEASE_SUPPORT: &str = include_str!("../../scripts/updater/release.ps1");
+const PROCESS_SUPPORT: &str = include_str!("../../scripts/updater/processes.ps1");
 const CHECK: &str = include_str!("../../scripts/updater/check-update.ps1");
 const ENGINE: &str = include_str!("../../scripts/updater/coordinator.ps1");
 
@@ -128,7 +129,9 @@ pub(super) fn dispatch() -> anyhow::Result<Option<i32>> {
     let script = format!(
         "$Release = '{}';\n{}",
         target.as_deref().unwrap_or("latest"),
-        ENGINE.replace("# RELEASE_SUPPORT", RELEASE_SUPPORT)
+        ENGINE
+            .replace("# RELEASE_SUPPORT", RELEASE_SUPPORT)
+            .replace("# PROCESS_SUPPORT", PROCESS_SUPPORT)
     );
     Ok(Some(run_script(&script, json, "Scry Search update")?))
 }

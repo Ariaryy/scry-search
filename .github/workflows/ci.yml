@@ -37,6 +37,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: powershell -NoProfile -File scripts/test-updater.ps1
+      - run: powershell -NoProfile -File scripts/test-updater-processes.ps1
       - run: powershell -NoProfile -File scripts/test-updater-helper.ps1
       - run: powershell -NoProfile -File scripts/test-update-discovery.ps1
       - run: python -B -m unittest discover -s scripts/tests -p 'test_benchmark*.py'

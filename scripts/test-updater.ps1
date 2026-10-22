@@ -10,10 +10,14 @@ $engineAst = [Management.Automation.Language.Parser]::ParseInput($engine, [ref]$
 if ($errors) { throw ($errors | Out-String) }
 $validate = $engineAst.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ValidateArchive' }, $true)
 . ([scriptblock]::Create($validate.Extent.Text))
-foreach ($name in @('DecodeEvent','CancellationCode')) {
+foreach ($name in @('DecodeEvent','CancellationCode','EncodeHelper')) {
     $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))
 }
+$expandedEngine=$engine.Replace('# RELEASE_SUPPORT',(Get-Content (Join-Path $PSScriptRoot 'updater/release.ps1') -Raw)).Replace('# PROCESS_SUPPORT',(Get-Content (Join-Path $PSScriptRoot 'updater/processes.ps1') -Raw))
+$maximumPrefix=("`$Release='v"+('a9b8c7d6'*8)+"';`$PipeName='scry-update-"+('1234567890abcdef'*2)+"';`$OriginSid='S-1-5-"+((1000000001..1000000015)-join '-')+"';")
+$encodedHelper=EncodeHelper ($maximumPrefix+$expandedEngine)
+if($encodedHelper.Length -gt 32000){throw 'Embedded helper exceeds Windows command-line budget'}
 $fn = $engineAst.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'RecoveryAction' }, $true)
 . ([scriptblock]::Create($fn.Extent.Text))
 if ((CancellationCode ([ComponentModel.Win32Exception]::new(1223))) -ne 20) { throw 'UAC denial lost' }
