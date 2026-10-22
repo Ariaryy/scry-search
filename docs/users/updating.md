@@ -167,22 +167,6 @@ processes and requires two quiet observations, with bounded retries and a
 activation. Hosts should close search connections and suspend daemon-start
 attempts until the update process finishes.
 
-## Bootstrapping an updater fix
-
-The updater engine is embedded in the invoking CLI. Selecting a newer target
-with an older CLI does not replace the engine already performing the update.
-Applications must distribute a refreshed, verified CLI when adopting an updater
-fix, then invoke that executable with the exact tested release tag. Replacing
-adjacent PowerShell files has no effect on a published CLI.
-
-For integration testing before publication, build the CLI from the reviewed fix
-commit, record its commit and binary SHA-256, and bundle that test artifact in the
-host's development build. The daemon target may remain `v0.1.0` while testing the
-fixed engine. After a coordinated patch release, refresh the bundled CLI and
-locked client release together. Do not overwrite existing release assets or
-silently fetch and execute an unverified bootstrap executable. This bootstrap
-policy does not change the local status, discovery, or exact-target JSON schemas.
-
 The protected transaction journal records preparation, activation, and commit.
 Normal activation and recovery both complete the PATH entry and verified
 uninstaller before recording commit.
@@ -199,6 +183,22 @@ Scry normally rebuilds unsupported snapshots rather than migrating them in place
 A future format-changing updater must define a separate rebuild and recovery
 policy. Restoring old binaries cannot undo incompatible index writes. This
 implementation does not promise a binary rollback after replacement startup.
+
+## Bootstrapping an updater fix
+
+The updater engine is embedded in the invoking CLI. Selecting a newer target
+with an older CLI does not replace the engine already performing the update.
+Applications must distribute a refreshed, verified CLI when adopting an updater
+fix, then invoke that executable with the exact tested release tag. Replacing
+adjacent PowerShell files has no effect on a published CLI.
+
+For integration testing before publication, build the CLI from the reviewed fix
+commit, record its commit and binary SHA-256, and bundle that test artifact in the
+host's development build. The daemon target may remain `v0.1.0` while testing the
+fixed engine. After a coordinated patch release, refresh the bundled CLI and
+locked client release together. Do not overwrite existing release assets or
+silently fetch and execute an unverified bootstrap executable. This bootstrap
+policy does not change the local status, discovery, or exact-target JSON schemas.
 
 ## Package trust
 
