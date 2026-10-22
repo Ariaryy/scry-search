@@ -79,7 +79,10 @@ impl Client {
         limit: u32,
         order: Order,
     ) -> anyhow::Result<(Vec<ResultEntry>, SearchExecution)> {
-        if matches!(kind, QueryKind::ShareIndex | QueryKind::QueryStats) {
+        if matches!(
+            kind,
+            QueryKind::ShareIndex | QueryKind::QueryStats | QueryKind::Status
+        ) {
             return Err(anyhow::anyhow!("invalid search kind"));
         }
 
@@ -177,7 +180,7 @@ impl Client {
                     .unwrap_or_else(|_| scry_core::Query::PathTerms(Vec::new()))
             }
             QueryKind::ShareIndex => unreachable!(),
-            QueryKind::QueryStats => unreachable!(),
+            QueryKind::QueryStats | QueryKind::Status => unreachable!(),
         };
         let options = SearchOptions::ordered(limit as usize, order);
         let entries =

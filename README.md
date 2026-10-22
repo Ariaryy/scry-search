@@ -69,7 +69,7 @@ task runs it with the required permissions under your Windows account; Scry
 does not install a system service.
 
 The installer copies the binaries to
-`%LOCALAPPDATA%\Programs\Scry Search\bin` and adds that directory to the user
+`%ProgramFiles%\Scry Search\<user SID>\bin` and adds that directory to the user
 `PATH`, so `scry` is available in new terminals. The extracted archive can then
 be deleted.
 
@@ -81,14 +81,10 @@ Per-volume snapshots and their FRN sidecars are stored separately under
 `index-<volume>.frn`. Uninstalling the binaries preserves this index data so a
 later reinstall does not require rebuilding it unnecessarily.
 
-To upgrade, download the newer release and run its installer again. It replaces
-the installed binaries and preserves existing per-volume snapshots.
+Use `scry update` for updates. See the [updater contract and limitations](docs/users/updating.md).
 
-To remove the startup task while preserving snapshots:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Scry Search\uninstall.ps1"
-```
+Run `uninstall.ps1` in the protected installation directory to remove the task
+and programs while preserving snapshots.
 
 </details>
 

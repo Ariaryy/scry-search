@@ -123,7 +123,9 @@ pub(super) fn matches_refined(
             scry_core::ascii::contains_ci(name, &terms_lower[0])
         }
         QueryKind::PathTerms => view.matches_path_terms_lower(hit.record, terms_lower, name),
-        QueryKind::Wildcard | QueryKind::ShareIndex | QueryKind::QueryStats => false,
+        QueryKind::Wildcard | QueryKind::ShareIndex | QueryKind::QueryStats | QueryKind::Status => {
+            false
+        }
     }
 }
 

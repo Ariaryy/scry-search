@@ -707,6 +707,7 @@ dependencies = [
  "anyhow",
  "scry-client",
  "scry-core",
+ "serde_json",
 ]
 
 [[package]]

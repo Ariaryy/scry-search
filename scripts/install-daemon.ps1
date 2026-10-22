@@ -9,7 +9,9 @@ $ErrorActionPreference = "Stop"
 $taskName = "Scry Search Daemon"
 $sourceDaemonPath = Join-Path $PSScriptRoot "scryd.exe"
 $sourceCliPath = Join-Path $PSScriptRoot "scry.exe"
-$installRoot = Join-Path $env:LOCALAPPDATA "Programs\Scry Search"
+$installSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$programRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Scry Search'
+$installRoot = Join-Path $programRoot $installSid
 $binPath = Join-Path $installRoot "bin"
 $daemonPath = Join-Path $binPath "scryd.exe"
 $currentStep = "Checking the installation package"
@@ -161,6 +163,21 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit $elevated.ExitCode
 }
 
+# An elevated startup task must never execute user-writable binaries.
+foreach ($directory in @($programRoot, $installRoot, $binPath)) {
+    $existing = Get-Item -LiteralPath $directory -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        $owner = (Get-Acl -LiteralPath $directory).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $owner -notin @('S-1-5-32-544','S-1-5-18')) {
+            throw 'The installation directory has an unsupported owner or is a reparse point.'
+        }
+    }
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)')
+    Set-Acl -LiteralPath $directory -AclObject $acl
+}
+
 $daemonArguments = if ($Unbounded) {
     "--unbounded"
 } elseif ($IndexMbps) {
@@ -227,6 +244,10 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 $currentStep = "Registering the startup task"
 Write-Step "Registering the elevated per-user startup task"
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null
+
+$scheduler = New-Object -ComObject 'Schedule.Service'
+$scheduler.Connect()
+$scheduler.GetFolder('\').GetTask($taskName).SetSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;$installSid)", 0)
 
 if (-not $NoStart) {
     $currentStep = "Starting the Scry daemon"

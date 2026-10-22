@@ -10,6 +10,7 @@
 
 mod console;
 mod display;
+mod updater;
 use display::{display_mtime, display_size, print_entry};
 mod interactive;
 
@@ -20,6 +21,9 @@ const DEFAULT_LIMIT: u32 = 50;
 const DEFAULT_INTERACTIVE_LIMIT: u32 = 12;
 
 fn main() -> anyhow::Result<()> {
+    if let Some(code) = updater::dispatch()? {
+        std::process::exit(code);
+    }
     let t0 = std::time::Instant::now();
     let mut shared = false;
     let mut verbose = false;
@@ -132,7 +136,7 @@ fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     println!(
-        "scry {}\n\nUsage: scry [OPTIONS] <QUERY>\n\n  --interactive       Search while typing; arrows select and Enter opens\n  --limit N           Maximum results (default 50; interactive 12)\n  --prefix            Force prefix matching\n  --substring         Force substring matching\n  --wildcard          Force wildcard matching\n  --sort VALUE        relevance, recent, or size\n  --shared-index      Prefer validated local execution\n  --no-shared-index   Force daemon RPC\n  --verbose           Print client phase timings\n  --stats             Print daemon query statistics\n  -h, --help          Print help\n  -V, --version       Print version",
+        "scry {}\n\nUsage: scry [OPTIONS] <QUERY>\n       scry status [--json] [--version TAG]\n       scry update [--json] [--version TAG]\n       scry check-update --compatible-ipc N --compatible-index N [--json]\n\n  --interactive       Search while typing; arrows select and Enter opens\n  --limit N           Maximum results (default 50; interactive 12)\n  --prefix            Force prefix matching\n  --substring         Force substring matching\n  --wildcard          Force wildcard matching\n  --sort VALUE        relevance, recent, or size\n  --shared-index      Prefer validated local execution\n  --no-shared-index   Force daemon RPC\n  --verbose           Print client phase timings\n  --stats             Print daemon query statistics\n  -h, --help          Print help\n  -V, --version       Print version",
         env!("CARGO_PKG_VERSION")
     );
 }

@@ -18,6 +18,7 @@ mod platform;
 mod rpc;
 mod search;
 mod sections;
+mod shutdown;
 mod updates;
 
 use options::startup_options;
@@ -228,6 +229,7 @@ fn main() -> anyhow::Result<()> {
     }
     let indexes: VolumeIndexes = Arc::new(indexed);
     let _ = SHUTDOWN_STATE.set((indexes.clone(), auxiliary_marking_enabled));
+    shutdown::listen()?;
     // SAFETY: `handle_console_ctrl` matches `HandlerRoutine`'s signature and
     // reads only `SHUTDOWN_STATE`, which is set above and never mutated again.
     unsafe {

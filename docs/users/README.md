@@ -6,3 +6,4 @@
 - [IPC integration](ipc.md)
 - [Daemon setup](daemon.md)
 
+- [Updating and application integration](updating.md)

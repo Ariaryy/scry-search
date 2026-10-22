@@ -27,6 +27,8 @@ jobs:
           New-Item -ItemType Directory -Path dist/scry/assets -Force | Out-Null
           Copy-Item assets/scry.svg dist/scry/assets/
           Copy-Item docs dist/scry/docs -Recurse
+          @{schema=1;version=$env:GITHUB_REF_NAME.TrimStart('v');ipc_version=1;index_format=10} | ConvertTo-Json -Compress | Set-Content dist/scry/scry-release.json -Encoding utf8
+          Copy-Item dist/scry/scry-release.json dist/scry-release.json
           $archive = "dist/scry-search-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Compress-Archive -Path dist/scry/* -DestinationPath $archive
       - name: Format release version
@@ -37,6 +39,8 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           name: Scry Search ${{ steps.release.outputs.version }}
-          files: dist/scry-search-*-windows-x86_64.zip
+          files: |
+            dist/scry-search-*-windows-x86_64.zip
+            dist/scry-release.json
           body_path: CHANGELOG.md
           prerelease: ${{ contains(github.ref_name, '-') }}

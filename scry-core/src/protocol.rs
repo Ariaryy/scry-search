@@ -17,6 +17,8 @@ pub enum QueryKind {
     ShareIndex = 4,
     /// Internal observability request returning a UTF-8 report.
     QueryStats = 5,
+    /// Bounded application and compatibility status.
+    Status = 6,
 }
 
 impl QueryKind {
@@ -28,6 +30,7 @@ impl QueryKind {
             3 => Some(QueryKind::PathTerms),
             4 => Some(QueryKind::ShareIndex),
             5 => Some(QueryKind::QueryStats),
+            6 => Some(QueryKind::Status),
             _ => None,
         }
     }
@@ -307,5 +310,109 @@ mod tests {
         assert_eq!(decoded.generation, 9);
         assert_eq!(decoded.overlay, [1, 2, 3]);
         assert!(decode_shared_index(&encoded[..encoded.len() - 1]).is_none());
+    }
+}
+
+/// RPC compatibility is independent of application and snapshot versions.
+pub const IPC_VERSION: u32 = 1;
+pub const CAP_SHARED_INDEX: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonStatus {
+    pub version: String,
+    pub ipc_version: u32,
+    pub index_format: u32,
+    pub capabilities: u32,
+}
+
+impl DaemonStatus {
+    pub fn current(shared_index: bool) -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            ipc_version: IPC_VERSION,
+            index_format: crate::record::FORMAT_VERSION,
+            capabilities: if shared_index { CAP_SHARED_INDEX } else { 0 },
+        }
+    }
+
+    pub fn rpc_compatible(&self) -> bool {
+        self.ipc_version == IPC_VERSION
+    }
+
+    pub fn shared_index_compatible(&self) -> bool {
+        self.rpc_compatible()
+            && self.index_format == crate::record::FORMAT_VERSION
+            && self.capabilities & CAP_SHARED_INDEX != 0
+    }
+}
+
+pub fn encode_status(status: &DaemonStatus) -> Vec<u8> {
+    assert!(valid_version(&status.version));
+    let mut bytes = Vec::with_capacity(96);
+    bytes.extend_from_slice(b"SCRYSTA1");
+    bytes.extend_from_slice(&status.ipc_version.to_le_bytes());
+    bytes.extend_from_slice(&status.index_format.to_le_bytes());
+    bytes.extend_from_slice(&status.capabilities.to_le_bytes());
+    bytes.push(status.version.len() as u8);
+    bytes.extend_from_slice(status.version.as_bytes());
+    bytes
+}
+
+fn valid_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+}
+
+pub fn decode_status(bytes: &[u8]) -> Option<DaemonStatus> {
+    if bytes.len() > 85 || bytes.get(..8)? != b"SCRYSTA1" {
+        return None;
+    }
+    let ipc_version = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    let index_format = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?);
+    let capabilities = u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let len = *bytes.get(20)? as usize;
+    let version = std::str::from_utf8(bytes.get(21..)?).ok()?;
+    if version.len() != len || !valid_version(version) {
+        return None;
+    }
+    Some(DaemonStatus {
+        version: version.to_owned(),
+        ipc_version,
+        index_format,
+        capabilities,
+    })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    #[test]
+    fn status_is_bounded_versioned_and_exact() {
+        let status = DaemonStatus::current(true);
+        let bytes = encode_status(&status);
+        assert_eq!(decode_status(&bytes), Some(status));
+        for end in 0..bytes.len() {
+            assert!(decode_status(&bytes[..end]).is_none());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_status(&trailing).is_none());
+        let mut unknown = bytes;
+        unknown[7] = b'2';
+        assert!(decode_status(&unknown).is_none());
+        assert!(decode_status(&vec![0; 1024]).is_none());
+    }
+    #[test]
+    fn application_and_storage_versions_do_not_define_rpc() {
+        let mut status = DaemonStatus::current(true);
+        status.version = "99.0.0".into();
+        status.index_format += 1;
+        assert!(status.rpc_compatible());
+        assert!(!status.shared_index_compatible());
+        status.ipc_version += 1;
+        assert!(!status.rpc_compatible());
     }
 }

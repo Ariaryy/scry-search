@@ -9,7 +9,7 @@ wire shape, not a stable cross-version contract.
 
 ```text
 u8      kind       0 prefix, 1 substring, 2 wildcard, 3 path terms,
-                   4 shared-index capability, 5 query statistics
+                   4 shared-index capability, 5 query statistics, 6 status
 u32 LE  limit
 u8      order      0 relevance, 1 recent, 2 largest
 string  pattern    u32 LE byte length + UTF-8
@@ -65,7 +65,23 @@ The elevated daemon creates an explicitly local-accessible pipe so an
 unelevated same-machine client can query it. Shared handles are duplicated only
 to the PID reported by the pipe itself and receive read/query rights only.
 
-There is no overall protocol-version negotiation. Client and daemon releases
-should be packaged together. Additive trailers are individually versioned;
+Status discovery is opt-in and leaves existing search request encodings intact.
+Kind 6 uses limit zero, order zero, and pattern `SCRYSTA1`. The response is
+`SCRYSTA1`, three little-endian u32 values (RPC version, index format,
+capability bits), a u8 application-version length, and 1 to 64 ASCII version
+bytes. It is at most 85 bytes and must have no trailing data. RPC version is 1;
+index format is 10. Capability bit 0 advertises a single-volume shared index.
+Application version is not a protocol version. An unsupported discovery schema
+returns the eight-byte `SCRYUNS1` marker. Malformed/newer responses fail closed.
+
+`Client::connect_compatible` negotiates before returning a search connection.
+Legacy `connect` remains available for compatibility with existing consumers.
+Discovery does not silently enable shared execution on another archive version.
+`Client::daemon_status` uses a dedicated connection and bounded reads. The
+pre-discovery daemon consumes unknown kinds without replying, so absence of a
+reply is not proof of an obsolete release. Applications own legacy detection.
+See [updating](../users/updating.md) for the CLI contract.
+
+Client and daemon releases should still be packaged together. Additive trailers are individually versioned;
 unknown request discriminants and ordering values fail closed.
 
