@@ -102,6 +102,11 @@ added. Daemon shutdown uses a blocking administrator-only event, not a polling
 loop or a public RPC mutation. See [updating](../users/updating.md) for trust,
 recovery and format-change limitations.
 
+The updater's `processes.ps1` owns retained native process handles, bounded pipe
+ownership reconciliation, and graceful shutdown. A stale pipe identity requires
+a fresh probe; only confirmed process exit is ignored. Other query or access
+errors fail closed. These checks run only during explicit updates.
+
 `scripts/test-updater-activation.ps1` is an explicit elevated acceptance test.
 It uses local network fixtures with the production installation, task, shutdown,
 readiness, and recovery code in a separate protected directory and task. It

@@ -77,6 +77,7 @@ try {
     $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'updater/coordinator.ps1'),[ref]$null,[ref]$null)
     $assignment=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$engine'},$true)
     $engine=$assignment.Right.Expression.Value.Replace('# RELEASE_SUPPORT',(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'updater/release.ps1') -Raw))
+    $engine=$engine.Replace('# PROCESS_SUPPORT',(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'updater/processes.ps1') -Raw))
     # Change only test-owned dependencies. The install, stop, readiness, ACL and
     # journal implementation under test is the production engine.
     $engine=$engine.Replace("'Scry Search'","'Scry Search Updater Validation'").Replace("'Scry Search Daemon'","'Scry Search Updater Validation'")

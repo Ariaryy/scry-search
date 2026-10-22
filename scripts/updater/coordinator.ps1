@@ -16,10 +16,20 @@ function CancellationCode($exception) {
     if ($exception.NativeErrorCode -eq 1223 -or $exception.InnerException.NativeErrorCode -eq 1223) { return 20 }
     return 1
 }
+function EncodeHelper($script) {
+    $memory = [IO.MemoryStream]::new()
+    $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Compress, $true)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($script)
+    $gzip.Write($bytes,0,$bytes.Length); $gzip.Dispose()
+    $packed = [Convert]::ToBase64String($memory.ToArray()); $memory.Dispose()
+    $bootstrap = "`$m=[IO.MemoryStream]::new([Convert]::FromBase64String('$packed'));`$g=[IO.Compression.GZipStream]::new(`$m,[IO.Compression.CompressionMode]::Decompress);`$r=[IO.StreamReader]::new(`$g); & ([scriptblock]::Create(`$r.ReadToEnd()))"
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+}
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $pipeName = 'scry-update-' + [Guid]::NewGuid().ToString('N')
 $engine = @'
 # RELEASE_SUPPORT
+# PROCESS_SUPPORT
 $UpdateDeadline=[DateTime]::UtcNow.AddMinutes(14)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -107,8 +117,13 @@ function WaitReady($releasePath,$releaseTag) {
         $response=& (Join-Path $releasePath 'scry.exe') status --json --version $releaseTag
         if ($LASTEXITCODE -eq 0) {
             $status=$response|ConvertFrom-Json
-            $daemon=Get-Process -Id $status.detail.server_pid -ErrorAction SilentlyContinue
-            if ($daemon -and [IO.Path]::GetFullPath($daemon.Path) -ieq [IO.Path]::GetFullPath((Join-Path $releasePath 'scryd.exe'))) { return }
+            $lease=OpenDaemonLease $status.detail.server_pid
+            if ($lease) {
+                try {
+                    $path=ReadDaemonPath $lease
+                    if ($path -and $path -ieq [IO.Path]::GetFullPath((Join-Path $releasePath 'scryd.exe'))) { return }
+                } finally { $lease.Dispose() }
+            }
         }
         Start-Sleep -Seconds 1
     }
@@ -140,6 +155,10 @@ try {
     $root = Join-Path $base $OriginSid
     SecureDirectory $root
     $lock = [IO.File]::Open((Join-Path $root 'update.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    $stage = Join-Path $root ('stage-' + [Guid]::NewGuid().ToString('N'))
+    SecureDirectory $stage
+    $env:TEMP=$stage; $env:TMP=$stage
+    InitializeProcessSupport
     $journal = Join-Path $root 'transaction.json'
     $taskName = 'Scry Search Daemon'
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -186,9 +205,6 @@ try {
     }
     $code=21
     Step 'Downloading trusted release metadata'
-    $stage = Join-Path $root ('stage-' + [Guid]::NewGuid().ToString('N'))
-    SecureDirectory $stage
-    $env:TEMP=$stage; $env:TMP=$stage
     $endpoint = if ($Release -eq 'latest') { 'latest' } else { 'tags/' + $Release }
     $metadataPath = Join-Path $stage 'release.json'
     Fetch ('https://api.github.com/repos/Ariaryy/scry-search/releases/' + $endpoint) $metadataPath 1048576
@@ -237,34 +253,10 @@ try {
     $code=1
     if ([DateTime]::UtcNow -ge $UpdateDeadline) { throw 'Update deadline expired before activation' }
     Step 'Preparing daemon restart'
-    $running = @(Get-Process -Name scryd -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [IO.Path]::GetFullPath($_.Path) -ieq $oldPath })
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class ScryStop {
- [DllImport("kernel32", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr OpenEvent(uint access, bool inherit, string name);
- [DllImport("kernel32")] public static extern bool SetEvent(IntPtr handle);
- [DllImport("kernel32")] public static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint pid);
- [DllImport("kernel32")] public static extern bool CloseHandle(IntPtr handle);
-}
-"@
-    $probe=[IO.Pipes.NamedPipeClientStream]::new('.','scry',[IO.Pipes.PipeDirection]::InOut)
-    try {
-        try { $probe.Connect(100) } catch [TimeoutException] {}
-        if ($probe.IsConnected) {
-            $serverPid=0
-            if (-not [ScryStop]::GetNamedPipeServerProcessId($probe.SafePipeHandle.DangerousGetHandle(),[ref]$serverPid)) { throw 'Cannot identify existing daemon' }
-            $server=Get-Process -Id $serverPid
-            if ([IO.Path]::GetFullPath($server.Path) -ine $oldPath) { $code=23; throw 'Another daemon owns the query pipe; its process was left running' }
-        }
-    } finally { $probe.Dispose() }
     SaveJournal 'prepared'
-    foreach ($process in $running) {
-        $event = [ScryStop]::OpenEvent(2, $false, ('Local\ScryShutdown-' + $process.Id))
-        if ($event -eq [IntPtr]::Zero) { $code=23; throw 'This legacy daemon must be stopped before updating; graceful stop is unsupported' }
-        try { if (-not [ScryStop]::SetEvent($event)) { throw 'Graceful stop failed' } } finally { [ScryStop]::CloseHandle($event) | Out-Null }
-        if (-not $process.WaitForExit(30000)) { $code=23; throw 'Daemon did not finish graceful shutdown' }
-    }
+    $code=23
+    StopInstalledDaemon $oldPath
+    $code=1
     SaveJournal 'activated'
     $mutated = $true
     if ($task) {
@@ -320,13 +312,7 @@ public static class ScryPeer {
     $server = [IO.Pipes.NamedPipeServerStream]::new($pipeName, [IO.Pipes.PipeDirection]::In, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 4096, 4096, $security)
     $connected = $server.BeginWaitForConnection($null,$null)
     $prefix = "`$Release='$Release';`$PipeName='$pipeName';`$OriginSid='$sid';"
-    $memory = [IO.MemoryStream]::new()
-    $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Compress, $true)
-    $bytes = [Text.Encoding]::UTF8.GetBytes($prefix + $engine)
-    $gzip.Write($bytes,0,$bytes.Length); $gzip.Dispose()
-    $packed = [Convert]::ToBase64String($memory.ToArray()); $memory.Dispose()
-    $bootstrap = "`$m=[IO.MemoryStream]::new([Convert]::FromBase64String('$packed'));`$g=[IO.Compression.GZipStream]::new(`$m,[IO.Compression.CompressionMode]::Decompress);`$r=[IO.StreamReader]::new(`$g); & ([scriptblock]::Create(`$r.ReadToEnd()))"
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+    $encoded = EncodeHelper ($prefix + $engine)
     Emit 'progress' 'elevating' 'Waiting for administrator approval' 0
     $helper = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded) -PassThru
     $null=$helper.Handle

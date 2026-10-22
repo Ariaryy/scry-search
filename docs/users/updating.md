@@ -158,6 +158,31 @@ that mechanism. Stop those installations before migration; the updater refuses
 to force-terminate them. Development daemons are never stopped. Readiness checks
 both the requested version and the pipe server's executable path.
 
+Restart preparation retains query/synchronize process handles while checking
+the pipe owner and stopping installed processes. A disappearing owner triggers
+a fresh connection and identity check. Access failures, busy pipes, and foreign
+owners are not treated as a stopped daemon. Shutdown re-enumerates installed
+processes and requires two quiet observations, with bounded retries and a
+30-second shutdown budget. Unresolved ownership fails with exit 23 before task
+activation. Hosts should close search connections and suspend daemon-start
+attempts until the update process finishes.
+
+## Bootstrapping an updater fix
+
+The updater engine is embedded in the invoking CLI. Selecting a newer target
+with an older CLI does not replace the engine already performing the update.
+Applications must distribute a refreshed, verified CLI when adopting an updater
+fix, then invoke that executable with the exact tested release tag. Replacing
+adjacent PowerShell files has no effect on a published CLI.
+
+For integration testing before publication, build the CLI from the reviewed fix
+commit, record its commit and binary SHA-256, and bundle that test artifact in the
+host's development build. The daemon target may remain `v0.1.0` while testing the
+fixed engine. After a coordinated patch release, refresh the bundled CLI and
+locked client release together. Do not overwrite existing release assets or
+silently fetch and execute an unverified bootstrap executable. This bootstrap
+policy does not change the local status, discovery, or exact-target JSON schemas.
+
 The protected transaction journal records preparation, activation, and commit.
 Normal activation and recovery both complete the PATH entry and verified
 uninstaller before recording commit.
