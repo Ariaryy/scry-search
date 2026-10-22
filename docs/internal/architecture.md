@@ -101,3 +101,10 @@ directory and uses a protected journal for retry. No resident update worker is
 added. Daemon shutdown uses a blocking administrator-only event, not a polling
 loop or a public RPC mutation. See [updating](../users/updating.md) for trust,
 recovery and format-change limitations.
+
+`scripts/test-updater-activation.ps1` is an explicit elevated acceptance test.
+It uses local network fixtures with the production installation, task, shutdown,
+readiness, and recovery code in a separate protected directory and task. It
+temporarily stops the worktree's running PR daemon and restores it during cleanup.
+The bounded test runner supports repeated attempts under one approval and exits
+after a stop signal or twenty minutes. It is not included in release packages.

@@ -92,6 +92,28 @@ function SecureDirectory($path) {
     $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)')
     Set-Acl -LiteralPath $path -AclObject $acl
 }
+function FinalizeInstallation($installRoot,$releasePath) {
+    $uninstaller=Join-Path $releasePath 'uninstall-daemon.ps1'
+    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw 'Verified release uninstaller is missing' }
+    Copy-Item -LiteralPath $uninstaller -Destination (Join-Path $installRoot 'uninstall.ps1') -Force
+    $userPath=[Environment]::GetEnvironmentVariable('Path','User')
+    $legacy=Join-Path $env:LOCALAPPDATA 'Programs\Scry Search\bin'
+    $entries=@($userPath -split ';' | Where-Object { $_ -and $_ -ine $legacy -and $_ -ine (Join-Path $installRoot 'bin') -and $_ -notlike "$installRoot\releases\*" })
+    [Environment]::SetEnvironmentVariable('Path',(($entries+$releasePath)-join ';'),'User')
+}
+function WaitReady($releasePath,$releaseTag) {
+    $deadline=[DateTime]::UtcNow.AddMinutes(10)
+    while ([DateTime]::UtcNow -lt $deadline -and [DateTime]::UtcNow -lt $UpdateDeadline) {
+        $response=& (Join-Path $releasePath 'scry.exe') status --json --version $releaseTag
+        if ($LASTEXITCODE -eq 0) {
+            $status=$response|ConvertFrom-Json
+            $daemon=Get-Process -Id $status.detail.server_pid -ErrorAction SilentlyContinue
+            if ($daemon -and [IO.Path]::GetFullPath($daemon.Path) -ieq [IO.Path]::GetFullPath((Join-Path $releasePath 'scryd.exe'))) { return }
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Daemon readiness deadline expired; new binaries retained for diagnosis'
+}
 function SaveJournal($phase) {
     @{schema=1;phase=$phase;previous_xml=$oldXml;previous_path=$oldPath;target=$final;tag=$tag} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath ($journal + '.new') -Encoding UTF8
     Move-Item -LiteralPath ($journal + '.new') -Destination $journal -Force
@@ -126,7 +148,7 @@ try {
         if ($task.Actions.Count -ne 1 -or $task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Highest') { $code=23; throw 'Unsupported daemon task configuration' }
         $taskSid = if ($task.Principal.UserId -like 'S-1-*') { ([Security.Principal.SecurityIdentifier]::new($task.Principal.UserId)).Value } else { ([Security.Principal.NTAccount]::new($task.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value }
         if ($taskSid -ne $OriginSid) { $code=23; throw 'Daemon task belongs to another user' }
-        $oldPath = $task.Actions[0].Execute
+        $oldPath = [IO.Path]::GetFullPath($task.Actions[0].Execute)
         $legacy = Join-Path $env:LOCALAPPDATA 'Programs\Scry Search\bin\scryd.exe'
         if ($oldPath -ine $legacy -and $oldPath -ine (Join-Path $root 'bin\scryd.exe') -and $oldPath -notlike "$root\releases\*\scryd.exe") { $code=23; throw 'Custom daemon installation is unsupported' }
         if ($task.Actions[0].WorkingDirectory -or $task.Actions[0].Arguments -notmatch '^(\s*(--unbounded|--index-mbps(?:=|\s+)\d+|[A-Za-z]:\\?)\s*)*$') { $code=23; throw 'Unsupported daemon arguments or working directory' }
@@ -152,10 +174,10 @@ try {
                 $code=24; throw 'Recovery task does not match journal'
             }
             Start-ScheduledTask -TaskName $taskName
-            $status = & (Join-Path $recoveryPath 'scry.exe') status --json --version $pending.tag
-            if ($LASTEXITCODE -ne 0) { $code=24; throw 'Interrupted release is not ready; index data and new binaries retained' }
-            $pending.phase='committed'
-            $pending | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $journal -Encoding UTF8
+            WaitReady $recoveryPath $pending.tag
+            FinalizeInstallation $root $recoveryPath
+            $final=$recoveryPath; $tag=$pending.tag; $oldXml=$pending.previous_xml; $oldPath=$pending.previous_path
+            SaveJournal 'committed'
             Send 'result' 'recovered' 'Interrupted update recovered; run update again for another version' 0
             exit 0
         }
@@ -199,17 +221,23 @@ try {
     $manifest=ValidateManifest $manifest $tag
     if ($manifest.ipc_version -ne 1 -or $manifest.index_format -ne 10) { $code=26; throw 'Release requires a newer updater or an explicit index rebuild migration' }
     # Execute only bytes verified against the official release asset digest.
-    $version = & (Join-Path $stage 'scryd.exe') --version
-    if ($LASTEXITCODE -ne 0 -or $version.Trim() -cne ('scryd ' + $tag.Substring(1))) { $code=22; throw 'Release executable version mismatch' }
+    $versionOutput=Join-Path $stage 'version.stdout'
+    $versionProcess=Start-Process -FilePath (Join-Path $stage 'scryd.exe') -ArgumentList '--version' -WindowStyle Hidden -RedirectStandardOutput $versionOutput -RedirectStandardError (Join-Path $stage 'version.stderr') -PassThru
+    # Cache the handle before waiting: Windows PowerShell 5.1 otherwise loses ExitCode.
+    $null=$versionProcess.Handle
+    if (-not $versionProcess.WaitForExit(30000)) { $versionProcess.Kill(); throw 'Release version probe timed out' }
+    if ((Get-Item -LiteralPath $versionOutput).Length -gt 128) { throw 'Invalid release version output' }
+    $version=Get-Content -LiteralPath $versionOutput -Raw
+    if ($versionProcess.ExitCode -ne 0 -or -not $version -or $version.Trim() -cne ('scryd ' + $tag.Substring(1))) { $code=22; throw 'Release executable version mismatch' }
     $releases = Join-Path $root 'releases'
     SecureDirectory $releases
     $final = Join-Path $releases ($tag + '-' + [Guid]::NewGuid().ToString('N'))
     SecureDirectory $final
-    Copy-Item -LiteralPath (Join-Path $stage 'scry.exe'),(Join-Path $stage 'scryd.exe') -Destination $final
+    Copy-Item -LiteralPath (Join-Path $stage 'scry.exe'),(Join-Path $stage 'scryd.exe'),(Join-Path $stage 'uninstall-daemon.ps1') -Destination $final
     $code=1
     if ([DateTime]::UtcNow -ge $UpdateDeadline) { throw 'Update deadline expired before activation' }
     Step 'Preparing daemon restart'
-    $running = @(Get-Process -Name scryd -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $oldPath })
+    $running = @(Get-Process -Name scryd -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [IO.Path]::GetFullPath($_.Path) -ieq $oldPath })
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -227,7 +255,7 @@ public static class ScryStop {
             $serverPid=0
             if (-not [ScryStop]::GetNamedPipeServerProcessId($probe.SafePipeHandle.DangerousGetHandle(),[ref]$serverPid)) { throw 'Cannot identify existing daemon' }
             $server=Get-Process -Id $serverPid
-            if ($server.Path -ine $oldPath) { $code=23; throw 'Another daemon owns the query pipe; its process was left running' }
+            if ([IO.Path]::GetFullPath($server.Path) -ine $oldPath) { $code=23; throw 'Another daemon owns the query pipe; its process was left running' }
         }
     } finally { $probe.Dispose() }
     SaveJournal 'prepared'
@@ -241,7 +269,7 @@ public static class ScryStop {
     $mutated = $true
     if ($task) {
         [xml]$xml = $oldXml
-        $xml.Task.Actions.Exec.Command = Join-Path $final 'scryd.exe'
+        $xml.Task.Actions.Exec.Command = [string](Join-Path $final 'scryd.exe')
         Register-ScheduledTask -TaskName $taskName -Xml $xml.OuterXml -Force | Out-Null
     } else {
         $action = New-ScheduledTaskAction -Execute (Join-Path $final 'scryd.exe')
@@ -256,22 +284,10 @@ public static class ScryStop {
     SaveJournal 'activated'
     Step 'Starting daemon and checking compatibility'
     Start-ScheduledTask -TaskName $taskName
-    $ready = $false
-    $readinessDeadline=[DateTime]::UtcNow.AddMinutes(10)
-    while ([DateTime]::UtcNow -lt $readinessDeadline -and [DateTime]::UtcNow -lt $UpdateDeadline) {
-        $response = & (Join-Path $final 'scry.exe') status --json --version $tag
-        if ($LASTEXITCODE -eq 0) {
-            $status = $response | ConvertFrom-Json
-            $daemon = Get-Process -Id $status.detail.server_pid -ErrorAction SilentlyContinue
-            if ($daemon -and $daemon.Path -ieq (Join-Path $final 'scryd.exe')) { $ready=$true; break }
-        }
-        Start-Sleep -Seconds 1
-    }
-    if (-not $ready) { $code=25; throw 'Daemon readiness deadline expired; new binaries retained for diagnosis' }
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    $entries = @($userPath -split ';' | Where-Object { $_ -and $_ -ine (Join-Path $env:LOCALAPPDATA 'Programs\Scry Search\bin') -and $_ -notlike "$root\releases\*" })
-    [Environment]::SetEnvironmentVariable('Path', (($entries + $final) -join ';'), 'User')
-    Copy-Item -LiteralPath (Join-Path $stage 'uninstall-daemon.ps1') -Destination (Join-Path $root 'uninstall.ps1') -Force
+    $code=25
+    WaitReady $final $tag
+    $code=1
+    FinalizeInstallation $root $final
     SaveJournal 'committed'
     Send 'result' 'updated' "Scry Search $tag is ready" 0
     $code=0
@@ -313,6 +329,7 @@ public static class ScryPeer {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
     Emit 'progress' 'elevating' 'Waiting for administrator approval' 0
     $helper = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded) -PassThru
+    $null=$helper.Handle
     if (-not $connected.AsyncWaitHandle.WaitOne(30000)) { throw 'Elevated helper connection timed out' }
     $server.EndWaitForConnection($connected)
     $peer = 0

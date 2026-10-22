@@ -1,7 +1,7 @@
 # Updating Scry Search
 
 `scry update` installs the latest non-prerelease GitHub release. Use
-`scry update --version v0.1.0-alpha.4` to request an exact release tag instead.
+`scry update --version v0.1.0` to request an exact release tag instead.
 An exact tag never falls back to another release. The target must include the
 updater manifest described below. Earlier release archives cannot be installed
 by this command.
@@ -29,7 +29,7 @@ supplied to the elevated helper.
 Status emits one object. For example:
 
 ```json
-{"schema":1,"event":"status","state":"ready","exit_code":0,"detail":{"server_pid":1234,"daemon_version":"0.1.0-alpha.4","ipc_version":1,"index_format":10,"capabilities":1}}
+{"schema":1,"event":"status","state":"ready","exit_code":0,"detail":{"server_pid":1234,"daemon_version":"0.1.0","ipc_version":1,"index_format":10,"capabilities":1}}
 ```
 
 | Status state | Meaning | Exit code |
@@ -58,7 +58,7 @@ object. `message` is display text, not an enum. A progress event has `state` equ
 to `elevating` or `updating`. A result includes the process `exit_code`:
 
 ```json
-{"schema":1,"event":"result","state":"updated","message":"Scry Search v0.1.0-alpha.4 is ready","exit_code":0}
+{"schema":1,"event":"result","state":"updated","message":"Scry Search v0.1.0 is ready","exit_code":0}
 ```
 
 | Update exit code | Meaning |
@@ -159,6 +159,8 @@ to force-terminate them. Development daemons are never stopped. Readiness checks
 both the requested version and the pipe server's executable path.
 
 The protected transaction journal records preparation, activation, and commit.
+Normal activation and recovery both complete the PATH entry and verified
+uninstaller before recording commit.
 Rerun the same update command after interruption. Recovery resumes the installed
 replacement or restarts the previous task if activation had not occurred.
 After replacement startup, failures retain the replacement and journal for

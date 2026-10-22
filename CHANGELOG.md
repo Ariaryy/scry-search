@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0 - 2026-10-22
+
+- Add local daemon compatibility discovery independently of application versions.
+- Add explicit compatible-release discovery and verified exact-target updates.
+- Keep update progress in the originating terminal through a hidden UAC helper.
+- Protect elevated task executables in Program Files and recover interrupted activation.
+- Preserve index format v10 and IPC compatibility version 1.
+
+Windows x86_64 releases are unsigned. Existing packages without release manifests
+are unsupported by the updater. Running legacy daemons must be stopped before
+migration. Index-format-changing updates are refused rather than rolled back.
+
 ## 0.1.0-alpha.4 — 2026-10-21
 
 - Add selective path-term query planning for narrow combinations.

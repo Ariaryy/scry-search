@@ -35,6 +35,28 @@ $pending.phase='activated';$pending.target=Join-Path $root '../escape'
 $rejected=$false
 try { $null=RecoveryAction $pending $root $pending.previous_path } catch { $rejected=$true }
 if (-not $rejected) { throw 'Recovery path escape accepted' }
+$fn = $engineAst.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'FinalizeInstallation' }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+$completionRoot=Join-Path ([IO.Path]::GetTempPath()) ('scry-completion-'+[Guid]::NewGuid().ToString('N'))
+$completionRelease=Join-Path $completionRoot 'releases/v1'
+$originalPath=[Environment]::GetEnvironmentVariable('Path','User')
+try {
+    [IO.Directory]::CreateDirectory($completionRelease)|Out-Null
+    Set-Content -LiteralPath (Join-Path $completionRelease 'uninstall-daemon.ps1') -Value '# verified fixture'
+    $stale=Join-Path $completionRoot 'releases/previous'
+    [Environment]::SetEnvironmentVariable('Path',($originalPath+';'+$stale),'User')
+    FinalizeInstallation $completionRoot $completionRelease
+    # Recovery must finish both operations even after a prior partial attempt.
+    Remove-Item -LiteralPath (Join-Path $completionRoot 'uninstall.ps1')
+    FinalizeInstallation $completionRoot $completionRelease
+    $entries=[Environment]::GetEnvironmentVariable('Path','User') -split ';'
+    if (@($entries|Where-Object {$_ -ieq $completionRelease}).Count -ne 1 -or $entries -contains $stale) {throw 'Recovery PATH completion failed'}
+    if ((Get-Content -LiteralPath (Join-Path $completionRoot 'uninstall.ps1') -Raw).Trim() -ne '# verified fixture') {throw 'Recovery uninstaller completion failed'}
+} finally {
+    [Environment]::SetEnvironmentVariable('Path',$originalPath,'User')
+    foreach($file in @((Join-Path $completionRelease 'uninstall-daemon.ps1'),(Join-Path $completionRoot 'uninstall.ps1'))) {Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue}
+    foreach($directory in @($completionRelease,(Join-Path $completionRoot 'releases'),$completionRoot)) {Remove-Item -LiteralPath $directory -ErrorAction SilentlyContinue}
+}
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 function CheckArchive($name, $accepted, $attributes=0) {
