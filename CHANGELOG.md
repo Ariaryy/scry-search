@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 - 2026-10-22
+
+- Reconcile daemon pipe ownership when a process exits or is replaced during an update.
+- Retain process handles through graceful shutdown and readiness verification.
+- Keep ownership and access checks fail closed without force-stopping unknown processes.
+
+IPC compatibility remains version 1 and index format remains v10. Applications
+must bundle the refreshed CLI to receive this fix because the updater is embedded
+in that executable. The full Hayai downgrade/update acceptance test remains pending;
+its previous attempt was blocked by GitHub API rate limiting before daemon shutdown.
+
 ## 0.1.0 - 2026-10-22
 
 - Add local daemon compatibility discovery independently of application versions.

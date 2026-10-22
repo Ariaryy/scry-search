@@ -131,6 +131,17 @@ choose its own cadence and channel, and show optional updates while continuing
 to search with a compatible daemon. These are host policies. Discovery runs
 only on explicit invocation and never in the daemon or local status command.
 
+GitHub limits unauthenticated REST API requests to 60 per hour per public IP
+address, shared with other applications and users behind that address. Host
+applications are responsible for managing their update-check frequency and retry
+policy within this shared quota, including repeated manual checks. Each discovery
+invocation requests a release list and may download up to 20 manifests; an update
+independently requests trusted release metadata. Scry does not cache these requests
+or provide a separate quota. Rate limiting can fail discovery or installation with
+exit 21 without changing the installed daemon. Do not treat that failure as update
+availability or retry in a tight loop. See
+[GitHub's API rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+
 All three JSON contracts use schema 1. Additive fields may appear; consumers
 should ignore fields they do not understand, reject unsupported schema versions,
 and handle unknown enum values as an explicit error. Existing field meanings
