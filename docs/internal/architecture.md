@@ -26,7 +26,7 @@ NTFS metadata + USN journal
 - `scry-ipc` provides minimal hand-written Win32 pipe and section primitives.
 - `scry-client` provides RPC fallback, validated local search, and persistent
   realtime sessions.
-- `scry-cli` is a thin formatter and interactive reference consumer.
+- `scry-cli` formats queries and owns the on-demand update coordinator and fixed elevated engine.
 
 ## Source layout
 
@@ -87,3 +87,24 @@ IPC are per-user. Applications should connect once, reuse sessions, and degrade
 gracefully when the daemon is absent. Packaging should install matching client
 and daemon versions and provide an explicit UAC-backed per-user startup path.
 
+
+## Installation updates
+
+The updater embeds its PowerShell coordinator and elevated engine from
+`scripts/updater/` in the CLI. Explicit `check-update` discovery shares manifest
+validation with installation and never runs in the daemon.
+The original process renders progress; a hidden UAC helper downloads and
+verifies official GitHub release assets into protected Program Files storage.
+A process-authenticated output-only pipe returns bounded events. Release
+activation changes the existing per-user task to a separate immutable binary
+directory and uses a protected journal for retry. No resident update worker is
+added. Daemon shutdown uses a blocking administrator-only event, not a polling
+loop or a public RPC mutation. See [updating](../users/updating.md) for trust,
+recovery and format-change limitations.
+
+`scripts/test-updater-activation.ps1` is an explicit elevated acceptance test.
+It uses local network fixtures with the production installation, task, shutdown,
+readiness, and recovery code in a separate protected directory and task. It
+temporarily stops the worktree's running PR daemon and restores it during cleanup.
+The bounded test runner supports repeated attempts under one approval and exits
+after a stop signal or twenty minutes. It is not included in release packages.

@@ -73,6 +73,48 @@ impl Pipe {
         }
         Ok(process_id)
     }
+    /// Reads a bounded frame before a deadline. Use a dedicated connection:
+    /// a timeout may consume a partial frame and the connection must be dropped.
+    pub fn read_frame_timeout(
+        &self,
+        timeout: std::time::Duration,
+        max_len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let deadline = std::time::Instant::now() + timeout.min(std::time::Duration::from_secs(30));
+        let read = |buffer: &mut [u8]| -> io::Result<()> {
+            let mut offset = 0;
+            while offset < buffer.len() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "daemon response timed out",
+                    ));
+                }
+                let available = self.pending_bytes()? as usize;
+                if available == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                let end = buffer.len().min(offset.saturating_add(available));
+                self.read_exact(&mut buffer[offset..end])?;
+                offset = end;
+            }
+            Ok(())
+        };
+        let mut header = [0; 4];
+        read(&mut header)?;
+        let len = u32::from_le_bytes(header) as usize;
+        if len > max_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon response exceeds bound",
+            ));
+        }
+        let mut bytes = vec![0; len];
+        read(&mut bytes)?;
+        Ok(bytes)
+    }
+
     pub fn read_frame(&self) -> io::Result<Vec<u8>> {
         let mut len_buf = [0u8; 4];
         self.read_exact(&mut len_buf)?;
@@ -239,6 +281,7 @@ impl PipeServer {
 /// immediately under concurrent client load.
 pub fn connect_client(name: &str) -> io::Result<Pipe> {
     let wide = to_wide(name);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let handle = unsafe {
             ffi::CreateFileW(
@@ -258,7 +301,16 @@ pub fn connect_client(name: &str) -> io::Result<Pipe> {
         if err != ffi::ERROR_PIPE_BUSY {
             return Err(io::Error::from_raw_os_error(err as i32));
         }
-        let waited = unsafe { ffi::WaitNamedPipeW(wide.as_ptr(), 2000) };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pipe remained busy",
+            ));
+        }
+        let waited = unsafe {
+            ffi::WaitNamedPipeW(wide.as_ptr(), remaining.as_millis().clamp(1, 2000) as u32)
+        };
         if waited == 0 {
             return Err(io::Error::last_os_error());
         }

@@ -14,6 +14,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $versions = @($metadata.packages.version | Select-Object -Unique)
+          if ($versions.Count -ne 1 -or "v$($versions[0])" -cne $env:GITHUB_REF_NAME) {
+            throw "Release tag must match every workspace package version"
+          }
       - run: cargo build --profile daemon-release -p scry-daemon
       - run: cargo build --release -p scry-cli
       - name: Stage archive
@@ -27,16 +35,25 @@ jobs:
           New-Item -ItemType Directory -Path dist/scry/assets -Force | Out-Null
           Copy-Item assets/scry.svg dist/scry/assets/
           Copy-Item docs dist/scry/docs -Recurse
+          @{schema=1;version=$env:GITHUB_REF_NAME.TrimStart('v');ipc_version=1;index_format=10} | ConvertTo-Json -Compress | Set-Content dist/scry/scry-release.json -Encoding utf8
+          Copy-Item dist/scry/scry-release.json dist/scry-release.json
           $archive = "dist/scry-search-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Compress-Archive -Path dist/scry/* -DestinationPath $archive
       - name: Format release version
         id: release
         shell: pwsh
         run: |
-          "version=$($env:GITHUB_REF_NAME.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $pattern = '(?ms)^## ' + [regex]::Escape($version) + ' [^\r\n]*\r?\n(.*?)(?=^## |\z)'
+          $notes = [regex]::Match((Get-Content CHANGELOG.md -Raw), $pattern)
+          if (-not $notes.Success) { throw "Missing release notes for $version" }
+          $notes.Groups[1].Value.Trim() | Set-Content dist/release-notes.md -Encoding utf8
       - uses: softprops/action-gh-release@v2
         with:
           name: Scry Search ${{ steps.release.outputs.version }}
-          files: dist/scry-search-*-windows-x86_64.zip
-          body_path: CHANGELOG.md
+          files: |
+            dist/scry-search-*-windows-x86_64.zip
+            dist/scry-release.json
+          body_path: dist/release-notes.md
           prerelease: ${{ contains(github.ref_name, '-') }}

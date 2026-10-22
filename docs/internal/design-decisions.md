@@ -52,3 +52,14 @@ Only the required calls and layouts are declared. This keeps dependencies and
 binary size down and correctly models variable-length USN records, at the cost
 of requiring careful checked parsing and focused ABI tests.
 
+
+## Protected program storage for elevated tasks
+
+An elevated logon task must not launch user-writable executable content.
+Installations use an administrator-owned per-user directory in Program Files.
+The task grants its user read and execute access without action modification.
+Index state remains separate in Local App Data. Update downloads happen inside
+the elevated helper and are verified against the official GitHub asset digest;
+unelevated staging files are never trusted. Side-by-side release directories
+avoid replacing a running CLI image. Recovery proceeds forward after startup;
+no binary-only rollback is promised for incompatible index writes.

@@ -4,6 +4,62 @@ use scry_core::protocol::{
     decode_request, encode_results, encode_shared_index, SharedIndexResponse,
 };
 
+#[test]
+fn discovery_is_bounded_and_does_not_mistake_legacy_or_corruption_for_status() {
+    for response in [
+        Some(scry_core::protocol::encode_status(&DaemonStatus::current(
+            true,
+        ))),
+        Some(b"SCRYSTA2".to_vec()),
+        Some(b"SCRYUNS1".to_vec()),
+        Some(vec![0; 86]),
+        None,
+    ] {
+        let name = unique_pipe_name();
+        let server = scry_ipc::PipeServer::new(&name).unwrap();
+        let expected = response
+            .as_ref()
+            .is_some_and(|b| b.starts_with(b"SCRYSTA1"));
+        let legacy = response.is_none();
+        let worker = std::thread::spawn(move || {
+            let pipe = server.accept().unwrap();
+            let request = decode_request(&pipe.read_frame().unwrap()).unwrap();
+            assert_eq!(request.kind, QueryKind::Status);
+            assert_eq!(request.pattern, "SCRYSTA1");
+            if let Some(bytes) = response {
+                pipe.write_frame(&bytes).unwrap();
+            }
+            // The deployed legacy daemon consumes and ignores an unknown kind.
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+        });
+        let result = (0..100)
+            .find_map(|_| {
+                let result = Client::daemon_status_at(&name, std::time::Duration::from_millis(500));
+                if result
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<std::io::Error>())
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    None
+                } else {
+                    Some(result)
+                }
+            })
+            .expect("test pipe did not become ready");
+        assert_eq!(result.is_ok(), expected, "{result:?}");
+        if legacy {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+        worker.join().unwrap();
+    }
+}
+
 fn unique_pipe_name() -> String {
     format!(
         r"\\.\pipe\scry-client-test-{}-{}",

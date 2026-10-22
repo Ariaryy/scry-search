@@ -4,12 +4,23 @@
 //! be a thin wrapper around the same `Client::query` call.
 
 use scry_core::protocol::{decode_results, encode_request, Request};
-pub use scry_core::protocol::{Order, QueryKind, ResultEntry};
+pub use scry_core::protocol::{DaemonStatus, Order, QueryKind, ResultEntry};
 mod local;
 mod session;
 
 use local::LocalIndex;
 pub use session::SearchSession;
+
+/// The daemon recognizes discovery but cannot serve the requested schema.
+#[derive(Debug)]
+pub struct UnsupportedHandshake;
+
+impl std::fmt::Display for UnsupportedHandshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon does not support status schema 1")
+    }
+}
+impl std::error::Error for UnsupportedHandshake {}
 
 pub struct Client {
     pipe: scry_ipc::Pipe,
@@ -38,6 +49,62 @@ impl Client {
     pub fn server_process_id(&self) -> anyhow::Result<u32> {
         Ok(self.pipe.server_process_id()?)
     }
+    /// Probe on a separate connection so a legacy daemon ignoring kind 6 cannot
+    /// desynchronize an existing search session. Unsupported discovery times out;
+    /// callers must distinguish that from a successful incompatible response.
+    pub fn daemon_status(timeout: std::time::Duration) -> anyhow::Result<DaemonStatus> {
+        Self::daemon_status_with_server(timeout).map(|(status, _)| status)
+    }
+
+    /// Returns the pipe-authenticated server PID alongside its status.
+    pub fn daemon_status_with_server(
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(DaemonStatus, u32)> {
+        let pipe = scry_ipc::connect_client(scry_ipc::PIPE_NAME)?;
+        let pid = pipe.server_process_id()?;
+        Ok((Self::read_daemon_status(&pipe, timeout)?, pid))
+    }
+
+    /// Discovery for an explicitly selected pipe, with the same bounded contract.
+    pub fn daemon_status_at(
+        pipe_name: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<DaemonStatus> {
+        let pipe = scry_ipc::connect_client(pipe_name)?;
+        Self::read_daemon_status(&pipe, timeout)
+    }
+
+    fn read_daemon_status(
+        pipe: &scry_ipc::Pipe,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<DaemonStatus> {
+        pipe.write_frame(&encode_request(&Request {
+            kind: QueryKind::Status,
+            pattern: "SCRYSTA1".to_owned(),
+            limit: 0,
+            order: Order::default(),
+        }))?;
+        let bytes = pipe.read_frame_timeout(timeout, 85)?;
+        if bytes == b"SCRYUNS1" {
+            return Err(UnsupportedHandshake.into());
+        }
+        scry_core::protocol::decode_status(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("invalid or unsupported daemon status response"))
+    }
+
+    /// Connect only when the daemon supports this client's RPC protocol.
+    /// Discovery and subsequent searches use the same server connection.
+    pub fn connect_compatible(timeout: std::time::Duration) -> anyhow::Result<Self> {
+        let client = Self::connect()?;
+        let status = Self::read_daemon_status(&client.pipe, timeout)?;
+        anyhow::ensure!(
+            status.rpc_compatible(),
+            "incompatible daemon IPC version {}",
+            status.ipc_version
+        );
+        Ok(client)
+    }
+
     pub fn connect() -> anyhow::Result<Self> {
         Self::connect_to(scry_ipc::PIPE_NAME)
     }

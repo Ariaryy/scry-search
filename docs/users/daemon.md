@@ -4,19 +4,10 @@
 fast indexing. Start it once and keep it alive; clients should not launch a new
 daemon for each query.
 
-An installer and automatic elevation flow are not shipped yet. Until they are,
-start `scryd` from an elevated terminal. An application embedding Scry should
-distinguish these states:
-
-1. daemon reachable — connect and reuse the session;
-2. daemon installed but stopped — offer an explicit UAC start action;
-3. daemon unavailable — show installation guidance and keep non-file features
-   working.
-
-A per-user elevated startup task is the intended default deployment model. A
-Windows service is not currently required: Scry's snapshots and IPC endpoint are
-user-scoped, while a service would need additional identity, authorization, and
-session-lifecycle machinery.
+The release installer registers the elevated per-user task `Scry Search Daemon`.
+For updates and application integration, see [Updating Scry Search](updating.md).
+Applications should distinguish missing installations, stopped daemons, incompatible
+versions, and transport failures. Clients remain unelevated.
 
 ## Daemon options
 
@@ -49,7 +40,7 @@ The release installer accepts matching task settings:
 ```
 
 The installer copies `scryd.exe` and `scry.exe` to
-`%LOCALAPPDATA%\Programs\Scry Search\bin`, adds that directory to the user
+`%ProgramFiles%\Scry Search\<user SID>\bin`, adds that directory to the user
 `PATH`, registers the elevated logon task, and starts the daemon in the
 background. Use `-NoStart` only when the daemon should wait until the next
 logon or a manual task start. Open a new terminal before invoking `scry` by
@@ -65,7 +56,7 @@ The daemon stores per-user index data under `%LOCALAPPDATA%\scry`:
   directory beneath the same location. The files are removed when compaction
   ends; the empty scratch directory may remain for reuse.
 
-This directory is separate from `%LOCALAPPDATA%\Programs\Scry Search`, which
+This directory is separate from the protected program directory, which
 contains the installed executables. The uninstaller removes the executables,
 PATH entry, and scheduled task but deliberately preserves the index directory.
 

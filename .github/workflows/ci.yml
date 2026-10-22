@@ -9,6 +9,9 @@ on:
       - "Cargo.lock"
       - "scripts/benchmark-*.py"
       - "scripts/benchmark-*.ps1"
+      - "scripts/test-updater*.ps1"
+      - "scripts/test-update-discovery.ps1"
+      - "scripts/updater/*.ps1"
       - "scripts/tests/**"
       - "assets/**"
       - ".github/workflows/ci.yml"
@@ -33,5 +36,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: powershell -NoProfile -File scripts/test-updater.ps1
+      - run: powershell -NoProfile -File scripts/test-updater-helper.ps1
+      - run: powershell -NoProfile -File scripts/test-update-discovery.ps1
       - run: python -B -m unittest discover -s scripts/tests -p 'test_benchmark*.py'
 

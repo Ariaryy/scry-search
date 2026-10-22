@@ -137,6 +137,14 @@ pub(super) fn handle_request(
     cache: &mut RefinementCache,
     spans: &mut QuerySpans,
 ) -> std::io::Result<Vec<u8>> {
+    if req.kind == QueryKind::Status {
+        if req.pattern != "SCRYSTA1" || req.limit != 0 {
+            return Ok(b"SCRYUNS1".to_vec());
+        }
+        return Ok(scry_core::protocol::encode_status(
+            &scry_core::protocol::DaemonStatus::current(indexes.len() == 1),
+        ));
+    }
     // `load_full` clones the Arc, keeping this index alive for the whole
     // query even if the reindex thread swaps in a new one mid-search.
     if req.kind == QueryKind::ShareIndex && indexes.len() != 1 {
@@ -195,7 +203,7 @@ pub(super) fn handle_request(
                 .unwrap_or_else(|_| Query::PathTerms(Vec::new()))
         }
         QueryKind::ShareIndex => unreachable!(),
-        QueryKind::QueryStats => unreachable!(),
+        QueryKind::QueryStats | QueryKind::Status => unreachable!(),
     };
     let entries = search_indexes_with_cache_with_spans(
         indexes,
